@@ -1,0 +1,55 @@
+/* Copyright 2024 The Chromium Authors
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file. */
+
+.dark-medium-contrast {
+  --md-sys-color-primary: rgb(187 212 137);
+  --md-sys-color-surface-tint: rgb(183 208 133);
+  --md-sys-color-on-primary: rgb(16 25 0);
+  --md-sys-color-primary-container: rgb(130 153 84);
+  --md-sys-color-on-primary-container: rgb(0 0 0);
+  --md-sys-color-secondary: rgb(198 206 175);
+  --md-sys-color-on-secondary: rgb(18 25 5);
+  --md-sys-color-secondary-container: rgb(140 148 119);
+  --md-sys-color-on-secondary-container: rgb(0 0 0);
+  --md-sys-color-tertiary: rgb(165 212 204);
+  --md-sys-color-on-tertiary: rgb(0 26 23);
+  --md-sys-color-tertiary-container: rgb(107 153 147);
+  --md-sys-color-on-tertiary-container: rgb(0 0 0);
+  --md-sys-color-error: rgb(255 186 177);
+  --md-sys-color-on-error: rgb(55 0 1);
+  --md-sys-color-error-container: rgb(255 84 73);
+  --md-sys-color-on-error-container: rgb(0 0 0);
+  --md-sys-color-background: rgb(18 20 13);
+  --md-sys-color-on-background: rgb(227 227 216);
+  --md-sys-color-surface: rgb(18 20 13);
+  --md-sys-color-on-surface: rgb(251 251 239);
+  --md-sys-color-surface-variant: rgb(69 72 60);
+  --md-sys-color-on-surface-variant: rgb(202 204 189);
+  --md-sys-color-outline: rgb(162 164 150);
+  --md-sys-color-outline-variant: rgb(130 132 119);
+  --md-sys-color-shadow: rgb(0 0 0);
+  --md-sys-color-scrim: rgb(0 0 0);
+  --md-sys-color-inverse-surface: rgb(227 227 216);
+  --md-sys-color-inverse-on-surface: rgb(41 43 35);
+  --md-sys-color-inverse-primary: rgb(59 78 18);
+  --md-sys-color-primary-fixed: rgb(211 236 158);
+  --md-sys-color-on-primary-fixed: rgb(11 20 0);
+  --md-sys-color-primary-fixed-dim: rgb(183 208 133);
+  --md-sys-color-on-primary-fixed-variant: rgb(42 60 1);
+  --md-sys-color-secondary-fixed: rgb(222 230 197);
+  --md-sys-color-on-secondary-fixed: rgb(13 19 3);
+  --md-sys-color-secondary-fixed-dim: rgb(194 202 171);
+  --md-sys-color-on-secondary-fixed-variant: rgb(49 57 34);
+  --md-sys-color-tertiary-fixed: rgb(188 236 228);
+  --md-sys-color-on-tertiary-fixed: rgb(0 21 18);
+  --md-sys-color-tertiary-fixed-dim: rgb(160 208 200);
+  --md-sys-color-on-tertiary-fixed-variant: rgb(10 61 56);
+  --md-sys-color-surface-dim: rgb(18 20 13);
+  --md-sys-color-surface-bright: rgb(56 58 50);
+  --md-sys-color-surface-container-lowest: rgb(13 15 9);
+  --md-sys-color-surface-container-low: rgb(26 28 21);
+  --md-sys-color-surface-container: rgb(30 32 25);
+  --md-sys-color-surface-container-high: rgb(41 43 35);
+  --md-sys-color-surface-container-highest: rgb(52 54 46);
+}

@@ -1,0 +1,9 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule cxx
+  command = python3 ../../clang.py -c ${in} -o ${out}
+
+build phony/foo.inputdeps: phony ../../build/config/siso/main.star ../../afdo.prof
+build obj/foo.o: cxx ../../foo.cc | phony/foo.inputdeps

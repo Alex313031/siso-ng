@@ -1,0 +1,23 @@
+// Copyright 2023 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+syntax = "proto3";
+
+package siso.execute;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "go.chromium.org/build/siso/execute/proto";
+
+// resource usage of command execution to be stored
+// in ActionResult.execution_metadata.auxiliary_metatada.
+// https://github.com/bazelbuild/remote-apis/blob/6c32c3b917cc5d3cfee680c03179d7552832bb3f/build/bazel/remote/execution/v2/remote_execution.proto#L1016
+message Rusage {
+  int64 max_rss = 1;
+  int64 majflt = 2;
+  int64 inblock = 3;
+  int64 oublock = 4;
+  google.protobuf.Duration utime = 5;
+  google.protobuf.Duration stime = 6;
+}

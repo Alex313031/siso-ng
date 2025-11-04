@@ -1,0 +1,37 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# test to make sure it computes inputs even if
+# alink step was skipped in incremental build.
+
+rule gen
+  command = python3 ../../tools/gen.py ${in} ${out}
+  restat = 1
+
+rule stamp
+  command = python3 ../../tools/touch.py ${out}
+
+rule cxx
+  command = python3 ../../tools/clang.py -c ${in} -o ${out}
+
+rule alink
+  command = python3 ../../tools/ar.py -c ${out} ${in}
+
+rule solink
+  command = python3 ../../tools/link.py ${in} -o ${out}
+
+build gen/bar.cc gen/bar.h: gen ../../bar.txt
+
+build gen/bar.inputdeps.stamp: stamp gen/bar.h
+
+build obj/foo.o: cxx ../../foo.cc | gen/bar.inputdeps.stamp
+build obj/bar.o: cxx gen/bar.cc | gen/bar.inputdeps.stamp
+
+build obj/bar.a: alink obj/bar.o
+
+build obj/foo.so: solink obj/foo.o obj/bar.a
+
+build all: phony obj/foo.so
+
+build build.ninja: phony

@@ -1,0 +1,26 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule stamp
+  command = python3 ../../tools/touch.py ${out}
+
+rule copy
+  command = python3 ../../tools/copy.py ${in} ${out}
+
+rule copy_bundle_data
+  command = python3 ../../tools/copy.py -R ${in} ${out}
+
+build Foo$ Framework.framework/Versions/C/Resources/res.bin: copy ../../res.bin
+
+build obj/foo_framework.stamp: stamp Foo$ Framework.framework/Versions/C/Resources/res.bin
+
+build Foo$ Framework.framework: phony obj/foo_framework.stamp
+
+build Foo.app/Contents/Frameworks/Foo$ Framework.framework: copy_bundle_data Foo$ Framework.framework
+
+build all: phony Foo.app/Contents/Frameworks/Foo$ Framework.framework
+
+build build.ninja: phony
+
+default all

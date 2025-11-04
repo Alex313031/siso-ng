@@ -1,0 +1,13 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule fail
+  command = fail
+build out1: fail
+build out2: fail
+build out3: fail
+build all: phony out1 out2 out3
+
+build build.ninja: phony
+

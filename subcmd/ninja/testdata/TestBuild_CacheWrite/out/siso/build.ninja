@@ -1,0 +1,25 @@
+# Copyright 2025 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action
+  command = python3 ../../tools/action.py ${in} ${out}
+
+rule gcc
+  command = python3 ../../tools/deps-gcc.py -o ${out} -MF ${depfile} -c ${in}
+  deps = gcc
+  depfile = ${out}.d
+
+# This is a very basic test
+build obj/foo0.inputdeps.out: action ../../base/0.input
+build obj/foo1.inputdeps.out: action ../../base/1.input
+build obj/foo.inputdeps.out: phony obj/foo0.inputdeps.out obj/foo1.inputdeps.out
+build gen/asserts.out: action ../../base/assert.in
+
+# This is a more advance gcc deps test
+build obj/foo.o: gcc ../../base/foo.cc || ../../tools/deps-gcc.py
+
+# Defaults
+build all: phony gen/asserts.out obj/foo.inputdeps.out obj/foo.o
+build build.ninja: phony
+default all

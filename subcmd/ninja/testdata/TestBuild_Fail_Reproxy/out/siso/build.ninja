@@ -1,0 +1,18 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action
+  command = python3 ../../tools/action.py ${in} ${out}
+  restat = 1
+
+rule stamp
+  command = python3 ../../tools/stamp.py ${out}
+
+build gen/foo.srcjar: action ../../foo.txt
+
+build foo.stamp: stamp gen/foo.srcjar
+
+build all: phony foo.stamp
+
+build build.ninja: phony

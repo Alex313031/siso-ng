@@ -1,0 +1,15 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule objcxx
+  command = python3 ../../tools/clang++.py -MMD -MF ${out}.d -I ../.. -I gen -isysroot sdk/xcode_links/iPhoneSimulator.sdk -iframework sdk/xcode_links/iPhoneSimulator.sdk/Developer/Library/Frameworks -iframework sdk/xcode_links/iPhoneSimulator.platform/Developer/Library/Frameworks -c ${in} -o ${out}
+  deps = gcc
+  depfile = ${out}.d
+
+build obj/ios/foo.o: objcxx ../../ios/foo.mm
+
+
+build all: phony obj/ios/foo.o
+
+build build.ninja: phony

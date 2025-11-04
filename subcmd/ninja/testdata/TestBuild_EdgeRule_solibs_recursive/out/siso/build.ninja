@@ -1,0 +1,29 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# test to make sure it computes inputs (esp solibs) even if
+# link step was skipped in incremental build and solibs has other solibs.
+
+rule solink
+  command = python3 ../../tools/link.py ${in} -o ${out}
+
+rule link
+  command = python3 ../../tools/link.py ${in} -o ${out}
+
+rule do_generate_fontconfig_caches
+  command = python3 ../../build/gn_run_binary.py generate_fontconfig_caches
+
+build libthird_party_freetype_harfbuzz.so libthird_party_freetype_harfbuzz.so.TOC: solink ../../fontconfig/harfbuzz.in
+
+build libthird_party_fontconfig.so libthird_party_fontconfig.so.TOC: solink ../../fontconfig/lib.in | libthird_party_freetype_harfbuzz.so.TOC
+  solibs = libthird_party_freetype_harfbuzz.so libc++.so
+
+build generate_fontconfig_caches: link ../../fontconfig/gen.in | libthird_party_fontconfig.so.TOC
+  solibs = libthird_party_fontconfig.so libc++.so
+
+build fontconfig_caches/cache: do_generate_fontconfig_caches ../../test_fonts.ttf | ../../build/gn_run_binary.py generate_fontconfig_caches
+
+build all: phony fontconfig_caches/cache
+
+build build.ninja: phony

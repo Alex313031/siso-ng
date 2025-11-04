@@ -1,0 +1,21 @@
+# Copyright 2025 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import argparse
+import sys
+
+
+def main():
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--input', type=argparse.FileType(), help='input')
+  parser.add_argument('--output', type=argparse.FileType(mode='w'),
+                      help='output')
+  options = parser.parse_args()
+
+  options.output.write('input %s' % options.input.read())
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

@@ -1,0 +1,36 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+#
+# difference between biuld.ninja.0 and build.ninja.1
+#  build.ninja.0: build bar*
+#  bulid.ninja.1: build baz*, so bar* will be dead files.
+
+rule cxx
+  command = python3 ../../tools/clang++.py -MF ${out}.d -o${out} -c ${in}
+  deps = gcc
+  depfile = ${out}.d
+
+rule link
+  command = python3 ../../tools/clang++.py -o${out} ${in}
+
+rule gen
+  command = python3 ../../tools/gen.py ${in} ${out}
+
+rule copy
+  command = ln -f ${in} ${out} 2>/dev/null || (rm -rf ${out} && cp -af ${in} ${out})
+
+build gen/cache: copy ../../cache
+
+build gen/foo.h: gen ../../base/foo.h.in | gen/cache
+build gen/bar.h: gen ../../base/bar.h.in | gen/cache
+
+build obj/foo.o: cxx ../../base/foo.cc | gen/foo.h
+build obj/bar.o: cxx ../../base/bar.cc | gen/bar.h
+
+build target: link obj/foo.o obj/bar.o
+
+build all: phony target
+
+build build.ninja: phony
+

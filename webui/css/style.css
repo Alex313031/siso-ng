@@ -1,0 +1,666 @@
+/* Copyright 2024 The Chromium Authors
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file. */
+
+/* Page layout. */
+
+html, body {
+    margin: 0;
+    padding: 0;
+}
+
+#page {
+    display: grid;
+    grid-template-columns: 80px auto;
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+        "header header"
+        "navrail content";
+    min-height: 100vh;
+}
+
+#page .header {
+    grid-area: header;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 8px;
+    --md-text-button-container-height: 28px;
+    --md-icon-button-state-layer-height: 28px;
+}
+
+#page .header-title {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 0;
+}
+
+#page .header-title h1,
+#page .header-title .subtitle,
+#page .header-title .breadcrumbs,
+#page .header-title .breadcrumb {
+    margin: 0;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    font-size: var(--md-sys-typescale-title-medium-size);
+    font-weight: var(--md-sys-typescale-title-medium-weight);
+}
+
+#page .header-title .subtitle {
+    font-size: var(--md-sys-typescale-title-small-size);
+    font-weight: var(--md-sys-typescale-title-small-weight);
+}
+
+#page .breadcrumb::before {
+    content: "\203A"; /* › character */
+    padding: 0 4px;
+}
+
+#page .breadcrumb-menu-button {
+    /* default <md-text-button> color is --md-sys-color-primary which is the
+     * accent color, this stands out too much so use the same color that
+     * <md-icon-button> uses i.e. --md-sys-color-on-surface-variant. */
+    --md-text-button-icon-color: var(--md-sys-color-on-surface-variant);
+    --md-text-button-label-text-color: var(--md-sys-color-on-surface-variant);
+    --md-text-button-hover-icon-color: var(--md-sys-color-on-surface-variant);
+    --md-text-button-hover-label-text-color:
+        var(--md-sys-color-on-surface-variant);
+    --md-text-button-hover-state-layer-color:
+        var(--md-sys-color-on-surface-variant);
+    --md-text-button-focus-icon-color: var(--md-sys-color-on-surface-variant);
+    --md-text-button-focus-label-text-color:
+        var(--md-sys-color-on-surface-variant);
+    --md-text-button-focus-state-layer-color:
+        var(--md-sys-color-on-surface-variant);
+    --md-text-button-pressed-icon-color:
+        var(--md-sys-color-on-surface-variant);
+    --md-text-button-pressed-label-text-color:
+        var(--md-sys-color-on-surface-variant);
+    --md-text-button-pressed-state-layer-color:
+        var(--md-sys-color-on-surface-variant);
+}
+#page .breadcrumb-menu-button md-icon::before {
+    content: 'arrow_drop_down';
+}
+
+#page .mtime-status {
+    font-size: var(--md-sys-typescale-title-small-size);
+    font-weight: normal;
+    font-style: italic;
+}
+
+.light .toggle-dark-mode md-icon::before {
+    content: 'brightness_4';
+}
+.dark .toggle-dark-mode md-icon::before {
+    content: 'brightness_7';
+}
+
+#page-tabs {
+    grid-area: navrail;
+    align-self: start;
+    position: sticky;
+    top: 0;
+}
+#page-view {
+    background: var(--md-sys-color-surface);
+    border-radius: var(--md-sys-shape-corner-large);
+}
+#page-content {
+    padding: 16px;
+}
+#page-content:has(#page-sidebar) {
+    gap: 16px;
+    display: grid;
+    grid-template-columns:
+        300px
+        /* Prevent elements like <pre> horizontally overflowing
+        * https://css-tricks.com/preventing-a-grid-blowout/ */
+        minmax(0, 1fr);
+    grid-template-areas: "sidebar inner-content";
+}
+#page-sidebar {
+    grid-area: sidebar;
+    padding-top: 8px;
+    /* Even though this is part of the grid, it needs to be explicitly set for
+     * some reason, otherwise child elements won't wrap. TODO: why? */
+    width: 300px;
+}
+
+/* Simulated implementation of https://m3.material.io/components/navigation-rail/overview
+ * since Material Web is in maintenance mode and this component is missing at
+ * time of writing. */
+.page-tab {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+    text-align: center;
+    --page-tab-width: 80px;
+    --page-tab-icon-width: 56px;
+    --page-tab-icon-height: 32px;
+    width: var(--page-tab-width);
+    margin-bottom: 8px;
+    font-size: var(--md-sys-typescale-label-medium-size);
+    font-weight: var(--md-sys-typescale-label-medium-weight);
+    color: var(--md-sys-color-on-surface);
+}
+.page-tab:hover {
+    text-decoration: none;
+}
+.page-tab md-icon {
+    height: var(--page-tab-icon-height);
+    width: var(--page-tab-icon-width);
+    margin: 0 auto;
+}
+.page-tab.selected md-icon {
+    background: var(--md-sys-color-secondary-container);
+    border-radius: 999px;
+    font-variation-settings: 'FILL' 1;
+}
+.page-tab md-ripple {
+    position: absolute;
+    height: var(--page-tab-icon-height);
+    width: var(--page-tab-icon-width);
+    margin: 0 auto;
+    border-radius: 999px;
+}
+
+/* Steps page. */
+
+.revs-timeline {
+    list-style: none;
+    padding: 0;
+    --timeline-vertical-padding: 4px;
+    --timeline-horizontal-padding: 16px;
+    --timeline-vertical-spacing: 12px;
+    --timeline-dot-size: 10px;
+    --timeline-dot-indent: 4px;
+}
+.revs-timeline > li {
+    position: relative;
+}
+.revs-timeline .rev-label {
+    position: relative;
+    padding:
+        var(--timeline-vertical-padding)
+        var(--timeline-horizontal-padding)
+        var(--timeline-vertical-padding)
+        calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
+    border-radius: 999px;
+    text-decoration: none;
+    font-weight: var(--md-sys-typescale-label-medium-weight);
+}
+.revs-timeline .rev-label.disabled {
+    font-style: italic;
+}
+.revs-timeline .rev-label.disabled,
+.revs-timeline .rev-label .rev-label-note {
+    font-weight: var(--md-sys-typescale-body-medium-weight);
+}
+.revs-timeline .rev-info {
+    padding:
+        var(--timeline-vertical-padding)
+        var(--timeline-horizontal-padding)
+        var(--timeline-vertical-spacing)
+        calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
+    color: var(--md-sys-color-on-surface-variant);
+    font-weight: var(--md-sys-typescale-body-medium-weight);
+    font-size: var(--md-sys-typescale-body-medium-size);
+}
+.revs-timeline .rev-sublinks {
+    list-style: none;
+    padding: 0;
+}
+.revs-timeline .rev-sublinks li {
+    position: relative;
+    margin: 4px 0;
+}
+.revs-timeline .rev-sublinks li.selected {
+    font-weight: bold;
+}
+
+.revs-timeline > li:before {
+    /* Render the timeline dot. */
+    content: '';
+    width: var(--timeline-dot-size);
+    height: var(--timeline-dot-size);
+    border-radius: 50%;
+    background: var(--md-sys-color-outline);
+    position: absolute;
+    top: calc(var(--timeline-dot-size)/2);
+    left: var(--timeline-dot-indent);
+}
+.revs-timeline > li:after {
+    /* Render the timeline line. */
+    content: '';
+    width: 2px;
+    height: 100%;
+    background: var(--md-sys-color-outline);
+    position: absolute;
+    left: calc(var(--timeline-dot-indent) + var(--timeline-dot-size)/2 - 1px);
+    top: calc(var(--timeline-dot-size)/2);
+}
+.revs-timeline > li:last-child:after {
+    /* The end of the timeline should fade into blank. */
+    background: linear-gradient(var(--md-sys-color-outline), transparent);
+}
+
+.revs-timeline > li.selected .rev-label {
+    background: var(--md-sys-color-secondary-container);
+    color: var(--md-sys-color-on-secondary-container);
+    z-index: 1;
+}
+.revs-timeline > li.selected:before {
+    background: var(--md-sys-color-on-secondary-container);
+    z-index: 2;
+}
+
+.data-table-filter {
+    position: sticky;
+    top: 12px;
+}
+.step-views {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    /* Temporary hack to show unimplemented views */
+    --md-outlined-button-container-height: 32px;
+    --md-outlined-button-leading-space: 20px;
+    --md-outlined-button-trailing-space: 20px;
+}
+.step-views h3 {
+    margin: 0;
+    font-size: var(--md-sys-typescale-title-medium-size);
+    font-weight: var(--md-sys-typescale-title-medium-weight);
+}
+.step-views label {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    position: relative;
+    height: 32px;
+    padding: 0 20px;
+    border: 1px solid var(--md-sys-color-outline);
+    border-radius: 999px;
+    font-size: var(--md-sys-typescale-label-large-size);
+    font-weight: var(--md-sys-typescale-label-large-weight);
+    cursor: pointer;
+}
+.step-views input[type="radio"] {
+    display: none;
+}
+.step-views input[type="radio"]:checked + label {
+    background: var(--md-sys-color-secondary-container);
+    color: var(--md-sys-color-primary);
+}
+
+.step-paginator {
+    margin: 16px 0;
+}
+
+.page-controls {
+    display: flex;
+    margin: 8px 0;
+}
+
+.page-controls md-outlined-text-field {
+    width: 80px;
+    height: var(--md-icon-button-state-layer-height);
+    --md-outlined-field-bottom-space: 12px;
+    --md-outlined-field-top-space: 12px;
+    --md-outlined-field-trailing-space: 12px;
+    --md-outlined-field-leading-space: 12px;
+}
+
+.filter-controls {
+    margin: 8px 0;
+}
+
+.filter-controls h3 {
+    font-size: var(--md-sys-typescale-title-medium-size);
+    font-weight: var(--md-sys-typescale-title-medium-weight);
+}
+
+.filter-controls md-filter-chip {
+    --md-filter-chip-label-text-size: 13px;
+    --md-filter-chip-leading-space: 10px;
+    --md-filter-chip-trailing-space: 10px;
+    --md-filter-chip-container-height: 26px;
+}
+
+.filter-controls md-chip-set input[type=checkbox] {
+    display: none;
+}
+
+.filter-button {
+    position: relative;
+    background: none;
+    border: none;
+    border-radius: 999px;
+    font-family: var(--md-ref-typeface-plain);
+    font-size: var(--md-sys-typescale-label-large-size);
+    display: flex;
+    align-items: center;
+    margin-top: 6px;
+    padding: 0 12px;
+    gap: 8px;
+    height: 36px;
+}
+.filter-popover {
+    position-area: center right;
+    position-try-fallbacks: top right;
+    background: transparent;
+    border: none;
+    margin: 0 -16px;
+    padding: 16px;
+}
+.filter-popover .popover-content {
+    position: relative;
+    background: var(--md-sys-color-surface-container);
+    --md-elevation-level: 2;
+    padding: 8px 16px;
+}
+.filter-popover .popover-content ul {
+    list-style: none;
+    padding: 0;
+}
+.filter-popover .popover-content li {
+    padding: 4px 0;
+}
+
+.data-table-container {
+    overflow-x: scroll;
+}
+.data-table-container table {
+    position: relative;
+    border-collapse: collapse;
+    min-width: 1200px;
+    width: 100%;
+    line-height: var(--md-sys-typescale-body-small-line-height);
+    letter-spacing: 0.01rem;
+    table-layout: fixed;
+}
+
+.data-table-container thead {
+    position: sticky;
+    top: 0;
+    /* Blur the background when scrolling past the top. */
+    background:
+        color-mix(in srgb, var(--md-sys-color-surface), transparent 33%);
+    backdrop-filter: blur(10px);
+}
+.data-table-container table::before {
+    /* We don't want the blur when scrolled at the top.
+     * This is a hack that stops the blur only at the top. */
+    position: absolute;
+    left: 0; right: 0; bottom: 0; top: 0;
+    display: block;
+    content: ' ';
+    z-index: -1;
+}
+.data-table-container thead th.thin-column {
+    width: 60px;
+}
+.data-table-container thead th.timestamp-column {
+    width: 110px;
+}
+.data-table-container thead th.timeline-column {
+    width: 300px;
+}
+.data-table-container thead th {
+    font-size: var(--md-sys-typescale-body-medium-size);
+    font-weight: var(--md-ref-typeface-weight-medium);
+}
+.data-table-container thead th:has(md-text-button) {
+    /* Give padding responsibility to the button. */
+    padding-left: 0;
+    padding-right: 0;
+}
+.data-table-container thead md-text-button {
+    padding-left: 16px;
+    padding-right: 16px;
+}
+
+.data-table-container th {
+    text-align: start;
+}
+
+.data-table-container th,
+.data-table-container td {
+    padding: 6px 16px;
+}
+.data-table-container tbody tr {
+    border-top: 1px solid var(--md-sys-color-outline-variant);
+    border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+.data-table-container tbody th {
+    overflow-wrap: break-word;
+}
+
+.data-table-container .subrow {
+    color: var(--md-sys-color-on-surface-variant);
+    font-size: var(--md-sys-typescale-body-small-size);
+    font-weight: var(--md-sys-typescale-body-medium-weight);
+    letter-spacing: 0.02rem;
+}
+
+.data-table-container tbody tr:hover {
+    background: var(--md-sys-color-surface-container);
+}
+.data-table-container tbody th,
+.data-table-container tbody td {
+    font-size: var(--md-sys-typescale-body-medium-size);
+    font-weight: var(--md-sys-typescale-body-medium-weight);
+}
+
+th.remote-indicator {
+    text-align: right;
+}
+td.remote-indicator {
+    text-align: center;
+}
+.light .remote-indicator md-icon.icon-cache-hit {
+    color: rgb(0, 124, 0);
+    font-variation-settings: 'FILL' 1;
+}
+.dark .remote-indicator md-icon.icon-cache-hit {
+    color: rgb(171, 255, 171);
+    font-variation-settings: 'FILL' 1;
+}
+
+.data-table-container .timestamp {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.step-rule:not(:empty) {
+    background: var(--md-sys-color-surface-container);
+    color: var(--md-sys-color-on-surface-container);
+    padding: 2px 4px;
+    border-radius: var(--md-sys-shape-corner-large);
+}
+
+.step-timeline-bar {
+    outline: 1px solid var(--md-sys-color-outline);
+}
+
+/* Individual step page. */
+
+.step-page h2 {
+    font-weight: var(--md-sys-typescale-title-medium-weight);
+    font-size: var(--md-sys-typescale-title-medium-size);
+    line-height: var(--md-sys-typescale-title-medium-line-height);
+}
+
+.step-page dt {
+    font-weight: bold;
+}
+
+.step-page dd {
+    display: flex;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.step-details {
+    list-style: none;
+    padding: 0;
+}
+.step-details li {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.step-details li > md-icon {
+    margin-right: 10px;
+}
+
+.step-tools form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* Global styles. */
+
+body {
+    font-family: var(--md-ref-typeface-plain);
+    background-color: var(--md-sys-color-surface-container);
+    color: var(--md-sys-color-on-surface);
+}
+
+#progress-indicator {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 999;
+}
+
+#progress-indicator.htmx-request {
+    display: block;
+}
+
+a {
+    color: var(--md-sys-color-primary);
+    text-decoration: none;
+}
+
+a:focus-visible, a:hover {
+    text-decoration: underline;
+}
+
+/* Code blocks https://meyerweb.com/eric/thoughts/2022/12/29/styling-a-pre-that-contains-a-code/ */
+pre:has(> code) {
+    overflow-x: auto;
+    background: var(--md-sys-color-surface-container);
+    border: 1px solid var(--md-sys-color-outline);
+    padding: 8px;
+}
+
+:root {
+    /* Typeface */
+    --md-ref-typeface-weight-regular: 400;
+    --md-ref-typeface-weight-medium: 500;
+    --md-ref-typeface-weight-bold: 700;
+    --md-ref-typeface-brand: system-ui;
+    --md-ref-typeface-plain: system-ui;
+
+    /* Display */
+    --md-sys-typescale-display-small-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-display-small-size: 2.25rem;
+    --md-sys-typescale-display-small-line-height: 2.75rem;
+
+    --md-sys-typescale-display-medium-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-display-medium-size: 2.8125rem;
+    --md-sys-typescale-display-medium-line-height: 3.25rem;
+
+    --md-sys-typescale-display-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-display-large-size: 3.5625rem;
+    --md-sys-typescale-display-large-line-height: 4rem;
+
+    /* Headline */
+    --md-sys-typescale-headline-small-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-headline-small-size: 1.5rem;
+    --md-sys-typescale-headline-small-line-height: 2rem;
+
+    --md-sys-typescale-headline-medium-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-headline-medium-size: 1.75rem;
+    --md-sys-typescale-headline-medium-line-height: 2.25rem;
+
+    --md-sys-typescale-headline-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-headline-large-size: 2rem;
+    --md-sys-typescale-headline-large-line-height: 2.5rem;
+
+    /* Title */
+    --md-sys-typescale-title-small-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-title-small-size: 0.875rem;
+    --md-sys-typescale-title-small-line-height: 1.25rem;
+
+    --md-sys-typescale-title-medium-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-title-medium-size: 1rem;
+    --md-sys-typescale-title-medium-line-height: 1.5rem;
+
+    --md-sys-typescale-title-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-title-large-size: 1.375rem;
+    --md-sys-typescale-title-large-line-height: 1.75rem;
+
+    /* Body */
+    --md-sys-typescale-body-small-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-body-small-size: 0.75rem;
+    --md-sys-typescale-body-small-line-height: 1rem;
+
+    --md-sys-typescale-body-medium-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-body-medium-size: 0.875rem;
+    --md-sys-typescale-body-medium-line-height: 1.25rem;
+
+    --md-sys-typescale-body-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-body-large-size: 1rem;
+    --md-sys-typescale-body-large-line-height: 1.5rem;
+
+    /* Label */
+    --md-sys-typescale-label-small-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-label-small-size: 0.6875rem;
+    --md-sys-typescale-label-small-line-height: 1rem;
+
+    --md-sys-typescale-label-medium-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-label-medium-size: 0.75rem;
+    --md-sys-typescale-label-medium-line-height: 1rem;
+    --md-sys-typescale-label-medium-weight-prominent:
+        var(--md-ref-typeface-weight-bold);
+
+    --md-sys-typescale-label-large-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-label-large-size: 0.875rem;
+    --md-sys-typescale-label-large-line-height: 1.25rem;
+    --md-sys-typescale-label-large-weight-prominent:
+        var(--md-ref-typeface-weight-bold);
+
+    /* Shapes */
+    --md-sys-shape-corner-small: 8px;
+    --md-sys-shape-corner-medium: 12px;
+    --md-sys-shape-corner-large: 16px;
+
+    /* Misc */
+    --md-icon-button-state-layer-height: 40px;
+}

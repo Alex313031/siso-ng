@@ -1,0 +1,38 @@
+// Binary rusage is a simple wrapper to get resource usage of the process.
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"syscall"
+	"time"
+)
+
+func main() {
+	cmd := exec.Command(os.Args[1], os.Args[2:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	started := time.Now()
+	err := cmd.Run()
+	dur := time.Since(started)
+	if err != nil {
+		fmt.Println(err)
+	}
+	if cmd.ProcessState == nil {
+		os.Exit(1)
+	}
+	if ru, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
+		fmt.Printf("user:    %s\n", time.Duration(ru.Utime.Nano()))
+		fmt.Printf("sys:     %s\n", time.Duration(ru.Stime.Nano()))
+		fmt.Printf("total:   %s\n", dur)
+		fmt.Printf("maxrss:  %d\n", ru.Maxrss)
+		fmt.Printf("minflt:  %d\n", ru.Minflt)
+		fmt.Printf("majflt:  %d\n", ru.Majflt)
+		fmt.Printf("nswap:   %d\n", ru.Nswap)
+		fmt.Printf("inblock: %d\n", ru.Inblock)
+		fmt.Printf("oublock: %d\n", ru.Oublock)
+	}
+	os.Exit(cmd.ProcessState.ExitCode())
+}

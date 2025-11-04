@@ -1,0 +1,31 @@
+// Copyright 2024 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// proto matches with http://shortn/_50RcABcSN9
+
+syntax = "proto3";
+
+package devtools_foundry_api_remote_execution_extensions;
+
+option go_package = "go.chromium.org/build/siso/reapi/proto";
+
+
+message Versions {
+  string vm_image = 1;
+  string bot_code_version = 2;
+  string docker_root_image = 3;
+}
+
+message ResourceUsage {
+  double cpu_percentage_peak = 1;
+  double cpu_percentage_average = 2;
+  double memory_percentage_peak = 3;
+  double memory_percentage_average = 4;
+}
+
+message AuxiliaryMetadata {
+  Versions versions = 1;
+  string pool = 2;
+  ResourceUsage usage = 3;
+}

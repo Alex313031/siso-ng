@@ -1,0 +1,222 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "content"}}
+{{$outdirRel:=.outdirRel}}
+{{$outdirRevBaseURL:=.outdirRevBaseURL}}
+{{$currentURL:=.currentURL}}
+{{$currentRev:=.currentRev}}
+{{$buildDuration:=.buildDuration}}
+<aside id="page-sidebar">
+<form class="data-table-filter"
+    {{/* Need to add ?sort= to the URL manually if set because sort is handled outside of this form. */}}
+    action="{{$outdirRevBaseURL}}/steps/{{if urlParamIsSet $currentURL "sort"}}?sort={{urlParamGet $currentURL "sort"}}{{end}}"
+    method="GET"
+    hx-trigger="change,submit">
+  <div>
+    {{/* TODO: deduplicate this with timeline on individual step and raw logs pages? */}}
+    <ul class="revs-timeline">
+      {{range $r := .revs}}
+      <li{{if eq $r.Rev $currentRev}} class="selected"{{end}}>
+        <a class="rev-label" href="{{$outdirRevBaseURL}}/../{{.Rev}}/steps/">
+          {{buildTimeHumanReadable $r}}
+          <md-ripple></md-ripple>
+        </a>
+        <div class="rev-info">
+          {{len $r.StepMetrics}} steps <relative-time datetime="{{timeRFC3339 .Mtime}}"></relative-time>
+        </div>
+      </li>
+      {{end}}
+    </ul>
+    <div class="step-views">
+      <h3 id="view-label">View</h3>
+      <input type="radio" id="view-all" name="view" value=""{{if urlHasParam $currentURL "view" ""}} checked{{end}}>
+      <label for="view-all">All<md-ripple></md-ripple></label>
+      <md-outlined-button disabled>Running</md-outlined-button>
+      <md-outlined-button disabled>Failed</md-outlined-button>
+      <input type="radio" id="view-local-only" name="view" value="localOnly"{{if urlHasParam $currentURL "view" "localOnly"}} checked{{end}}>
+      <label for="view-local-only">Local<md-ripple></md-ripple></label>
+      <input type="radio" id="view-critical-path" name="view" value="criticalPath"{{if urlHasParam $currentURL "view" "criticalPath"}} checked{{end}}>
+      <label for="view-critical-path">Critical Path<md-ripple></md-ripple></label>
+    </div>
+    <div class="step-paginator">
+      Showing {{.itemFirstLogical}}-{{.itemLastLogical}} of {{.itemsLen}}
+    </div>
+    <div class="page-controls">
+      <md-outlined-text-field class="page-number" type="number" name="page" aria-label="Page"
+          value="{{.page}}" min="0" max="{{.pageLast}}"></md-outlined-text-field>
+      <md-icon-button onclick="this.parentElement.querySelector('.page-number').value = {{.pageFirst}}">
+        <md-icon>first_page</md-icon>
+      </md-icon-button>
+      <md-icon-button onclick="this.parentElement.querySelector('.page-number').stepDown()">
+        <md-icon>chevron_left</md-icon>
+      </md-icon-button>
+      <md-icon-button onclick="this.parentElement.querySelector('.page-number').stepUp()">
+        <md-icon>chevron_right</md-icon>
+      </md-icon-button>
+      <md-icon-button onclick="this.parentElement.querySelector('.page-number').value = {{.pageLast}}">
+        <md-icon>last_page</md-icon>
+      </md-icon-button>
+    </div>
+  </div>
+  <div class="filter-controls"
+      {{/* Ensure state doesn't go out of sync with the backend by swapping this form whenever we see it in a fetched page. */}}
+      id="step-filter-controls">
+    <md-filled-text-field name="q" type="search" value="{{.outputSearch}}" placeholder="Search outputs"
+        oninput="this.querySelector('md-icon-button').style.display = this.value ? 'flex' : 'none'">
+      <md-icon slot="leading-icon">search</md-icon>
+      <md-icon-button class="clear-text-field" slot="trailing-icon"
+          {{if not .output_search}} style="display: none"{{end}} onclick="this.closest('md-filled-text-field').value = ''; this.style.display = 'none'">
+        <md-icon>close</md-icon>
+      </md-icon-button>
+    </md-filled-text-field>
+    <div>
+      <button type="button" class="filter-button" popovertarget="action-filter-popover"
+          style="anchor-name: --action-filter-anchor">
+        <md-icon>filter_alt</md-icon>
+        Ninja rules
+        <md-ripple></md-ripple>
+      </button>
+      <div popover class="filter-popover" id="action-filter-popover"
+          style="position-anchor: --action-filter-anchor">
+        <div class="popover-content">
+          <ul>
+            {{range .actionCounts}}
+            {{if gt .Count 1}}
+            <li>
+              <md-checkbox id="action-{{.Key}}"
+                  name="action" value="{{.Key}}" {{if urlHasParam $currentURL "action" .Key}}checked{{end}}></md-checkbox>
+              <label for="action-{{.Key}}">
+                {{.Key}} ({{.Count}})
+              </label>
+            </li>
+            {{end}}
+            {{end}}
+          </ul>
+          <md-elevation></md-elevation>
+        </div>
+      </div>
+    </div>
+    <div>
+      <button type="button" class="filter-button" popovertarget="rule-filter-popover"
+          style="anchor-name: --rule-filter-anchor">
+        <md-icon>filter_alt</md-icon>
+        Siso configs
+        <md-ripple></md-ripple>
+      </button>
+      <div popover class="filter-popover" id="rule-filter-popover"
+          style="position-anchor: --rule-filter-anchor">
+        <div class="popover-content">
+          <ul>
+            {{range .ruleCounts}}
+            <li>
+              <md-checkbox id="rule-{{.Key}}"
+                  name="rule" value="{{.Key}}" {{if urlHasParam $currentURL "rule" .Key}}checked{{end}}></md-checkbox>
+              <label for="rule-{{.Key}}">
+                {{.Key}} ({{.Count}})
+              </label>
+            </li>
+            {{end}}
+          </ul>
+          <md-elevation></md-elevation>
+        </div>
+      </div>
+    </div>
+  </div>
+</form>
+</aside>
+<div class="data-table-container">
+  <table>
+    <thead>
+      <tr hx-push-url="true">
+        <th scope="col">
+          Output
+          <div class="subrow">Rule</div>
+        </th>
+        <th class="thin-column" scope="col" class="remote-indicator">Remote</th>
+        {{if .sortSupported}}
+          {{$sortReadyAsc := or (urlParamEq $currentURL "sort" "readyAsc") (not (urlParamIsSet $currentURL "sort"))}}
+          {{$sortReadyDsc := urlParamEq $currentURL "sort" "readyDsc"}}
+          {{$sortDurationAsc := urlParamEq $currentURL "sort" "durationAsc"}}
+          {{$sortDurationDsc := urlParamEq $currentURL "sort" "durationDsc"}}
+          {{$sortCompletionAsc := urlParamEq $currentURL "sort" "completionAsc"}}
+          {{$sortCompletionDsc := urlParamEq $currentURL "sort" "completionDsc"}}
+          <th class="timestamp-column" scope="col">
+            <md-text-button class="sort-header" trailing-icon
+                hx-get="{{if $sortReadyAsc}}{{urlParamReplace $currentURL "sort" "readyDsc"}}{{else}}{{urlParamReplace $currentURL "sort" "readyAsc"}}{{end}}">
+              Ready
+              {{if $sortReadyAsc}}<md-icon slot="icon">arrow_upward</md-icon>{{else if $sortReadyDsc}}<md-icon slot="icon">arrow_downward</md-icon>{{end}}
+            </md-text-button>
+          </th>
+          <th class="timestamp-column" scope="col">
+            <md-text-button class="sort-header" trailing-icon
+                hx-get="{{if $sortDurationAsc}}{{urlParamReplace $currentURL "sort" "durationDsc"}}{{else}}{{urlParamReplace $currentURL "sort" "durationAsc"}}{{end}}">
+              Duration
+              {{if $sortDurationAsc}}<md-icon slot="icon">arrow_upward</md-icon>{{else if $sortDurationDsc}}<md-icon slot="icon">arrow_downward</md-icon>{{end}}
+            </md-text-button>
+          </th>
+          <th class="timestamp-column" scope="col">
+            <md-text-button class="sort-header" trailing-icon
+                hx-get="{{if $sortCompletionAsc}}{{urlParamReplace $currentURL "sort" "completionDsc"}}{{else}}{{urlParamReplace $currentURL "sort" "completionAsc"}}{{end}}">
+              Completion
+              {{if $sortCompletionAsc}}<md-icon slot="icon">arrow_upward</md-icon>{{else if $sortCompletionDsc}}<md-icon slot="icon">arrow_downward</md-icon>{{end}}
+            </md-text-button>
+          </th>
+        {{else}}
+          <th scope="col">Ready</th>
+          <th scope="col">Duration</th>
+          <th scope="col">Completion</th>
+        {{end}}
+        <th class="timeline-column" scope="col">Timeline</th>
+      </tr>
+    </thead>
+    <tbody id="data-table-body">
+      {{range .subset}}
+      <tr>
+        <th scope="row">
+          <a href="{{$outdirRevBaseURL}}/steps/{{.StepID}}/">{{trimPrefix .Output (printf "%s/" $outdirRel)}}</a>
+          <div class="subrow">
+            <span class="step-rule">{{.Rule}}</span>
+            <span class="step-action">{{.Action}}</span>
+          </div>
+        </th>
+        <td class="remote-indicator">
+          {{if .IsLocal}}
+            {{/* Keep this empty branch. It's easier to read than multiple AND conditions. */}}
+          {{else if and (not .Cached) (not .NoExec)}}
+            <md-icon class="icon-cache-miss" title="Remote Execution">cloud</md-icon>
+          {{else if .Cached}}
+            <md-icon class="icon-cache-hit" title="Cache Hit">cloud_done</md-icon>
+          {{end}}
+        </td>
+        <td class="timestamp">{{formatIntervalMetricTimestamp .Ready}}</td>
+        <td class="timestamp">{{formatIntervalMetricHuman .Duration}}</td>
+        <td class="timestamp">{{formatIntervalMetricTimestamp (addIntervals .Ready .Duration)}}</td>
+        <td>
+          <svg height="20" class="step-timeline-bar">
+            <rect x="{{divIntervalsScaled .Ready $buildDuration 100}}%" y="0"
+                width="{{divIntervalsScaled .Start $buildDuration 100}}%" height="20"
+                style="fill: rgb(50, 176, 73)" />
+            <rect x="{{divIntervalsScaled (addIntervals .Ready .Start) $buildDuration 100}}%" y="0"
+                width="{{divIntervalsScaled .Duration $buildDuration 100}}%" height="20"
+                style="fill: rgb(48, 48, 48)" />
+            <rect x="{{divIntervalsScaled .ActionStartTime $buildDuration 100}}%" y="0"
+                width="{{divIntervalsScaled (subIntervals .ActionEndTime .ActionStartTime) $buildDuration 100}}%" height="20"
+                style="fill: rgb(251, 255, 0)" />
+            <rect x="{{divIntervalsScaled .ActionStartTime $buildDuration 100}}%" y="0"
+                width="{{divIntervalsScaled .RunTime $buildDuration 100}}%" height="20"
+                style="fill: rgb(223, 134, 30)" />
+            {{if .ExecStartTime}}
+            <rect x="{{divIntervalsScaled .ExecStartTime $buildDuration 100}}%" y="0"
+                width="{{divIntervalsScaled .ExecTime $buildDuration 100}}%" height="20"
+                style="fill: rgb(134, 39, 222)" />
+            {{end}}
+          </svg>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

@@ -1,0 +1,23 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule codesign
+  command = python3 ../../codesign.py --provision xcuitests_module.xctest
+
+rule copy_bundle_data
+  command = rm -rf ${out} && /bin/cp -Rc ${in} ${out}
+
+build xcuitests_module.xctest/Info.plist: copy_bundle_data ../../Info.plist
+
+build phony/xcuitests_module_module.postprocessing.inputdeps: phony xcuitests_module.xctest/Info.plist $
+
+build xcuitests_module.xctest/xcuitests_module: codesign || phony/xcuitests_module_module.postprocessing.inputdeps
+
+build phony/xcuitests_module_module: phony xcuitests_module.xctest/xcuitests_module
+build xcuitests_module.xctest: phony phony/xcuitests_module_module
+
+build module-Runner.app/Plugins/xcuitests_module.xctest: copy_bundle_data xcuitests_module.xctest
+
+build all: phony module-Runner.app/Plugins/xcuitests_module.xctest
+

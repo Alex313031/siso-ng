@@ -1,0 +1,38 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "content"}}
+<h2><code>{{.target}}</code></h2>
+{{$outdirBaseURL:=.outdirBaseURL}}
+{{$inputType:=.inputType}}
+{{if .rule}}
+    <div style="display: grid; grid-template-columns: repeat(2, minmax(100px, 1fr));">
+        <div>
+            <p>target is built using rule <code>{{.rule}}</code> of</p>
+            <ul>
+                {{range .inputs}}
+                    <li>
+                        <a href="{{$outdirBaseURL}}/targets/{{pathEscape .}}/"><code style="word-break: break-all;">{{.}}</code></a>
+                        {{if index $inputType .}}({{index $inputType .}}){{end}}
+                    </li>
+                {{end}}
+            </ul>
+        </div>
+        {{if .outputs}}
+        <div>
+            <p>dependent edges build:</p>
+            <ul>
+                {{range .outputs}}
+                    <li>
+                        <a href="{{$outdirBaseURL}}/targets/{{pathEscape .}}/"><code style="word-break: break-all;">{{.}}</code></a>
+                    </li>
+                {{end}}
+            </ul>
+        </div>
+        {{end}}
+    </div>
+{{else}}
+    <p>no rule to build <code>{{.target}}</code></p>
+{{end}}
+{{end}}

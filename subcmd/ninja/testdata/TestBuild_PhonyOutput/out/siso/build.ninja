@@ -1,0 +1,9 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule phony_out
+  description = Successfully read the makefiles.
+  command = python3 ../../nop.py
+build nothing: phony_out
+  phony_output = true

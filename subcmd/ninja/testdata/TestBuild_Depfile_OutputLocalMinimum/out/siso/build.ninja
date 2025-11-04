@@ -1,0 +1,13 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule nasm
+  command = nasm -o ${out} ${in} -MF ${depfile}
+
+build obj/foo.o: nasm ../../foo.s
+   depfile = obj/foo.o.d
+
+build all: phony obj/foo.o
+
+build build.ninja: phony

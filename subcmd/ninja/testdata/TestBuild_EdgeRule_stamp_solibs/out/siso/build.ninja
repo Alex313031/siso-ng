@@ -1,0 +1,26 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# test to make sure it computes inputs (esp solibs) even if
+# link step was skipped in incremental build.
+
+rule stamp
+  command = touch ${out}
+
+rule link
+  command = python3 ../../tools/link.py ${in} -o ${out}
+
+rule gen_flatc
+  command = python3 ../../build/gn_run_binary.py ./flatc ${in} ${out}
+
+build flatc: link ../../flatc.in
+  solibs = libc++.so
+
+build obj/inputdeps.stamp: stamp ../../build/gn_run_binary.py flatc
+
+build gen/generated.h: gen_flatc ../../include.fbs | obj/inputdeps.stamp
+
+build all: phony gen/generated.h
+
+build build.ninja: phony

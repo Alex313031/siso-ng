@@ -1,0 +1,17 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action
+  command = python3 ../../tools/action.py ${in} ${out}
+
+rule copy
+  command = ln -f ${in} ${out} 2>/dev/null || (rm -rf ${out} && cp -af ${in} ${out})
+
+build gen/snapshot.bin: action ../../snapshot.in || ../../tools/action.py
+build Foo$ Framework.framework/Versions/C/Resource/snapshot.bin: copy gen/snapshot.bin
+
+build all: phony Foo$ Framework.framework/Versions/C/Resource/snapshot.bin
+
+build build.ninja: phony
+

@@ -1,0 +1,225 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "base"}}
+{{$outroot:=.outroot}}
+{{$outdirRevBaseURL:=.outdirRevBaseURL}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Siso Web UI</title>
+  <script src="https://unpkg.com/htmx.org@2.0.0" integrity="sha512-Cpedvic0/Mgc3uRJ5apQ/ZYroPCZpatYEXGJayRaRNjKLaFualFxfxn97LJymznV+nC7y0/Hp/apHNwGpMimuw==" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" integrity="sha384-fw+eTlCc7suMV/1w/7fr2/PmwElUIt5i82bi+qTiLXvjRXZ2/FkiTNA/w0MhXnGI" crossorigin="anonymous"></script>
+  <script type="module" src="https://unpkg.com/@github/clipboard-copy-element@1.3.0/dist/bundle.js" integrity="sha512-CA8FL6M22IbBkRz2ISw1hUCXYP2BcJl/Blepvhc0DgBD9iftu4K0mqrTxdzRf346jmxqKKQvsE1NHUIjT/S7lw==" crossorigin="anonymous"></script>
+  <script type="module" src="https://unpkg.com/@github/relative-time-element@4.4.2/dist/bundle.js" integrity="sha512-ifMrdUvZ6TAfn25Mphz2etXTxuuZYjy+1BDcEO6u2XVM2GBrdnsCexdIfn1FOQVmO7lQYQeotN0xU3WGSuT14A==" crossorigin="anonymous"></script>
+  <script type="module" src="/third_party/@material/web/all.js"></script>
+  <script>
+    const showErrorModal = (titleText, contentHTML) => {
+      const dialog = document.createElement('md-dialog');
+      dialog.setAttribute('type', 'alert');
+      dialog.setAttribute('open', 'open');
+      // Get a unique number for identifying the form for <md-dialog>.
+      let nowNumeric = new Date().valueOf();
+      dialog.innerHTML = `
+        <form id="md-dialog-errorform${nowNumeric}" method="dialog" slot="headline">
+          ${titleText}
+        </form>
+        <div slot="content">${contentHTML}</div>
+        <div slot="actions">
+          <md-text-button form="md-dialog-errorform${nowNumeric}" value="ok">OK</md-text-button>
+        </div>`;
+      document.body.appendChild(dialog);
+    };
+    // HTMX send failures.
+    document.addEventListener('htmx:sendError', e => {
+      showErrorModal(
+        `Couldn't send request`,
+        `<p>Is <code>siso webui</code> still running?</p>
+        <p>Please <a href="https://issues.chromium.org/issues/new?component=1456832" target="_blank">file an issue</a> if this seems unexpected.</p>`);
+    });
+    // HTMX response failures.
+    document.addEventListener('htmx:responseError', e => {
+      let responseURL = e?.detail?.xhr?.responseURL;
+      // Extract the pathname of the URL. We don't care about the domain.
+      if (responseURL && 'parse' in URL) {
+        const parsedURL = URL.parse(responseURL);
+        if (parsedURL) {
+          responseURL = parsedURL.pathname;
+        }
+      }
+      let response = e?.detail?.xhr?.response;
+      let errorTitle = 'Unknown error';
+      let errorMessage = '';
+      // XHR response may be a string, so attempt to parse it if so.
+      if (typeof response === 'string') {
+        errorMessage = response;
+        const parser = new DOMParser();
+        const parsedResponse = parser.parseFromString(response, 'text/html')
+        const errorNode = parsedResponse.querySelector('parsererror');
+        if (!errorNode) {
+          response = parsedResponse;
+        }
+      }
+      // If XHR response can be a Document, try extract the known title/message portions.
+      // If this fails, fall back on the defaults defined above.
+      if (response instanceof Document) {
+        const title = response.getElementById('page-error-title');
+        if (title) {
+          errorTitle = title.textContent;
+        }
+        const message = response.getElementById('page-error-message');
+        if (message) {
+          errorMessage = message.textContent;
+        }
+      }
+      // Use a helper element to HTML escape the log.
+      let helper = document.createElement('div');
+      helper.textContent = `URL: ${responseURL}\nTitle: ${errorTitle}\nMessage: ${errorMessage}`;
+      // Get a unique number for identifying the log to copy to clipboard.
+      let nowNumeric = new Date().valueOf();
+      showErrorModal(
+        'Failed to process request',
+        `Error log:
+          <clipboard-copy for="copy-error${nowNumeric}">
+            <md-icon-button>
+              <md-icon>content_copy</md-icon>
+            </md-icon-button>
+          </clipboard-copy>
+          <pre><code id="copy-error${nowNumeric}" class="error-log">${helper.innerHTML}</code></pre>
+          <p>Please <a href="https://issues.chromium.org/issues/new?component=1456832" target="_blank">file an issue</a> if this seems unexpected.</p>`);
+    });
+    // Dark mode.
+    window.toggleDarkMode = () => {
+      const bodyEl = document.querySelector('body');
+      const isDark = bodyEl.classList.contains('dark');
+      if (isDark) {
+        bodyEl.classList.remove('dark');
+        bodyEl.classList.add('light');
+      } else {
+        bodyEl.classList.remove('light');
+        bodyEl.classList.add('dark');
+      }
+    };
+    // Open in Perfetto.
+    const PERFETTO_ORIGIN = 'https://ui.perfetto.dev';
+    const TRACE_URL = new URL('{{.outdirRevBaseURL}}/logs/siso_trace.json?raw=true', document.baseURI).href;
+    window.openInPerfetto = async () => {
+      // TODO: check for and present errors.
+      const resp = await fetch(TRACE_URL);
+      const blob = await resp.blob();
+      const arrayBuffer = await blob.arrayBuffer();
+      // Technique to deep-link to Perfetto documented in:
+      // https://github.com/google/perfetto/blob/7accba4e26bffa6b5a129cd73e3330d85301cf71/docs/visualization/deep-linking-to-perfetto-ui.md
+      let handle = window.open('https://ui.perfetto.dev');
+      const timer = setInterval(() => handle.postMessage('PING', PERFETTO_ORIGIN), 50);
+      const onMessageHandler = (evt) => {
+        if (evt.data !== 'PONG') return;
+        window.clearInterval(timer);
+        window.removeEventListener('message', onMessageHandler);
+        const reopenUrl = new URL(location.href);
+        reopenUrl.hash = `#reopen=${TRACE_URL}`;
+        handle.postMessage({
+          perfetto: {
+            buffer: arrayBuffer,
+            title: 'siso_trace.json',
+            url: reopenUrl.toString(),
+        }}, PERFETTO_ORIGIN);
+      };
+      window.addEventListener('message', onMessageHandler);
+    };
+  </script>
+
+  {{/* Styles. */}}
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200">
+  <link rel="stylesheet" href="/css/light.css">
+  <link rel="stylesheet" href="/css/light-hc.css">
+  <link rel="stylesheet" href="/css/light-mc.css">
+  <link rel="stylesheet" href="/css/dark.css">
+  <link rel="stylesheet" href="/css/dark-hc.css">
+  <link rel="stylesheet" href="/css/dark-mc.css">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body class="light"
+  hx-ext="ext-md-filter-chip-as-checkbox"
+  {{/* Use HTMX's boost so even normal links and forms are intercepted and feel like AJAX requests. */}}
+  hx-boost="true"
+  {{/* Tell HTMX by default to use this element as a progress indicator. (It will attach the class "htmx-request" when active.) */}}
+  hx-indicator="#progress-indicator"
+  {{/* Always swap the #page-view section by default, i.e. don't swap the header and navbar by default. */}}
+  hx-select="#page-view" hx-target="#page-view"
+  {{/* The #page-view section is underneath the header but don't scroll away the header on page navigations. */}}
+  hx-swap="show:unset">
+  <md-linear-progress id="progress-indicator" indeterminate></md-linear-progress>
+  <div id="page">
+    <header class="header">
+      <div class="header-title">
+        <h1>sisoweb</h1>
+        <p class="subtitle">{{.versionID}}</p>
+        <div class="breadcrumbs">
+          <div class="breadcrumb">
+            <md-text-button id="outdir-menu-button" class="breadcrumb-menu-button" trailing-icon
+                onclick="document.getElementById('outdir-menu').open = !document.getElementById('outdir-menu').open">
+              {{if .outdirAbbrev}}
+                {{.outdirAbbrev}}
+              {{else if .viewingUploaded}}
+                <em>uploaded</em>
+              {{else}}
+                <em>unknown</em>
+              {{end}}
+              <md-icon slot="icon"></md-icon>
+            </md-text-button>
+            <md-menu id="outdir-menu" anchor="outdir-menu-button" positioning="popover">
+              {{range $outsubs := .outsubs}}
+              <md-menu-item href="/{{$outroot}}/{{pathEscape $outsubs}}/">
+                <div slot="headline">{{$outsubs}}</div>
+              </md-menu-item>
+              {{end}}
+            </md-menu>
+          </div>
+          <md-icon-button href="{{.outdirBaseURL}}/reload">
+            <md-icon>refresh</md-icon>
+          </md-icon-button>
+        </div>
+      </div>
+      <div class="header-controls">
+        <md-text-button trailing-icon onclick="openInPerfetto()">
+          Open in Perfetto
+          <md-icon slot="icon">open_in_new</md-icon>
+        </md-text-button>
+        <md-icon-button class="toggle-dark-mode" onclick="toggleDarkMode()">
+          <md-icon></md-icon>
+        </md-icon-button>
+      </div>
+    </header>
+    <nav id="page-tabs" hx-push-url="true" hx-swap-oob="true">
+      {{/* TODO: maybe we need some sort of "route generator" functions, because this is brittle. */}}
+      <a href="{{.outdirBaseURL}}/runbuild/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/runbuild/" .outdirBaseURL)}}selected{{end}}">
+        <md-icon>build</md-icon><md-ripple></md-ripple>
+        <span>Run Build</span>
+      </a>
+      <a href="{{.outdirRevBaseURL}}/steps/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/builds/%s/steps/" .outdirBaseURL .currentRev)}}selected{{end}}">
+        <md-icon>footprint</md-icon><md-ripple></md-ripple>
+        <span>Build Steps</span>
+      </a>
+      <a href="{{.outdirRevBaseURL}}/aggregates/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/builds/%s/aggregates/" .outdirBaseURL .currentRev)}}selected{{end}}">
+        <md-icon>calculate</md-icon><md-ripple></md-ripple>
+        <span>Aggregates</span>
+      </a>
+      <a href="{{.outdirRevBaseURL}}/logs/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/builds/%s/logs/" .outdirBaseURL .currentRev)}}selected{{end}}">
+        <md-icon>description</md-icon><md-ripple></md-ripple>
+        <span>Raw Logs</span>
+      </a>
+      <a href="{{.outdirBaseURL}}/targets/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/targets/" .outdirBaseURL)}}selected{{end}}">
+        <md-icon>target</md-icon><md-ripple></md-ripple>
+        <span>Targets</span>
+      </a>
+    </nav>
+    <div id="page-view">
+      <div id="page-content" class="content">{{template "content" .}}</div>
+    </div>
+  </div>
+</body>
+</html>
+{{end}}

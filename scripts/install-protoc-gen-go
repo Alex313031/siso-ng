@@ -1,0 +1,24 @@
+#!/bin/sh
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+
+# This script sets up the necessary tools that we use to generate *.pb.go
+# files from *.proto files safely into its own directory.
+#
+# The rest of the arguments are the command to be run.
+#
+# It is intended to be used in `//go:generate` to be invoked
+# by `go generate` to run protoc.
+
+die() { 1>&2 printf '%s\n' "$@"; exit 1; }
+
+mydir="$(realpath "$(dirname "$0")")"
+test -d "$mydir" || die 'cannot find myself'
+
+test -d "$mydir/cipd" || cipd init "$mydir/cipd" || die 'cannot install'
+cipd install -root "$mydir/cipd" 'infra/3pp/tools/protoc/${platform}' 'version:3@33.0' > /dev/null || die 'cannot install'
+
+export PATH="${mydir}/cipd/bin:${mydir}:${PATH}"
+exec "$@"

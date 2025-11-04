@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package manifest;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = "go.chromium.org/build/siso/toolsupport/artfsutil/proto/manifest";
+
+message Manifest {
+	// Map of all files from filepath to FileManifest.
+	map<string, FileManifest> files = 1;
+}
+
+// This proto is intended to match with the tree.TreeOutput struct in the
+// remote-apis-sdks, so that we can reuse some of the functions for downloading.
+message FileManifest {
+	// The digest of the file's content.
+	Digest digest = 1;
+
+	// The path of the file.
+	string path = 2;
+
+	// True if this file is executable, false otherwise.
+	bool is_executable = 3;
+
+	// True if path is an empty directory.
+	bool is_empty_directory = 4;
+
+	// If it is a symlink, then its target path.
+	string symlink_target = 5;
+
+	// Properties for each FileManifest entry.
+	NodeProperties node_properties = 6;
+}
+
+// A copy of NodeProperties from https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto
+// to avoid importing it as a proto dependency.
+message NodeProperties {
+	// A list of string-based
+	// [NodeProperties][build.bazel.remote.execution.v2.NodeProperty].
+	repeated NodeProperty properties = 1;
+
+	// The file's last modification timestamp.
+	google.protobuf.Timestamp mtime = 2;
+
+	// The UNIX file mode, e.g., 0755.
+	google.protobuf.UInt32Value unix_mode = 3;
+}
+
+// A copy of NodeProperty from https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto
+// to avoid importing it as a proto dependency.
+message NodeProperty {
+	// The property name.
+	string name = 1;
+
+	// The property value.
+	string value = 2;
+}
+
+// A copy of Digest from https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto
+// to avoid importing it as a proto dependency.
+message Digest {
+	// The hash, represented as a lowercase hexadecimal string, padded with
+	// leading zeroes up to the hash function length.
+	string hash = 1;
+
+	// The size of the blob, in bytes.
+	int64 size_bytes = 2;
+}

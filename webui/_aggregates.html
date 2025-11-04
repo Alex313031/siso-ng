@@ -1,0 +1,27 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "content"}}
+<h2>Aggregates prototype</h2>
+<table>
+  <thead>
+    <th>Aggregate By</th>
+    <th>Count</th>
+    <th>Total Utime</th>
+    <th>Total Duration</th>
+    <th>Total Weighted Duration</th>
+  </thead>
+  <tbody>
+    {{range $_, $aggregate := .aggregates}}
+      <tr>
+        <td>{{$aggregate.AggregateBy}}</td>
+        <td>{{$aggregate.Count}}</td>
+        <td>{{$aggregate.TotalUtime}}</td>
+        <td>{{$aggregate.TotalDuration}}</td>
+        <td>{{$aggregate.TotalWeightedDuration}}</td>
+      </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}

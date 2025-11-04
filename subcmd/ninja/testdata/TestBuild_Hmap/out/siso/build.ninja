@@ -1,0 +1,20 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule gen_hmap
+  command = python3 ../../build/config/ios/write_framework_hmap.py gen/ios/AppFramework.headers.hmap AppFramework.framework ../../ios/AppFramework/Action.h ../../ios/AppFramework/App.h
+  restat = 1
+
+build gen/ios/AppFramework.headers.hmap: gen_hmap | ../../build/config/ios/write_framework_hmap.py ../../ios/AppFramework/Action.h ../../ios/AppFramework/App.h
+
+rule objcxx
+  command = python3 ../../tools/clang++.py -MMD -MF ${out}.d -I ../.. -I gen -Igen/ios/AppFramework.headers.hmap -c ${in} -o ${out}
+  deps = gcc
+  depfile = ${out}.d
+
+build obj/ios/foo.o: objcxx ../../ios/foo.mm | gen/ios/AppFramework.headers.hmap
+
+build all: phony obj/ios/foo.o
+
+build build.ninja: phony

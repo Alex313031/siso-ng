@@ -1,0 +1,11 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action
+  command = python3 ../../action.py --dependency_out obj/foo.d obj/foo.rs ${in}
+
+build obj/foo.d obj/foo.rs: action ../../foo.proto
+   deps = gcc
+   depfile = obj/foo.d
+

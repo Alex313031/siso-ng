@@ -1,0 +1,14 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule copy
+  command = ln -f ${in} ${out} 2>/dev/null || (rm -rf ${out} && cp -af ${in} ${out})
+
+build gen/file: copy ../../file
+build gen/cache: copy ../../cache
+
+build all: phony gen/file gen/cache
+
+build build.ninja: phony
+
