@@ -22,6 +22,7 @@ import (
 
 	"go.chromium.org/build/siso/auth/cred"
 	"go.chromium.org/build/siso/hashfs/osfs"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/subcmd/auth"
 	"go.chromium.org/build/siso/subcmd/fetch"
 	"go.chromium.org/build/siso/subcmd/fscmd"
@@ -55,6 +56,7 @@ var (
 
 const versionID = "v1.4.17"
 const versionStr = "siso " + versionID
+const versionNGStr = "siso-ng " + versionID
 
 func main() {
 	// Wraps sisoMain() because os.Exit() doesn't wait defers.
@@ -64,13 +66,23 @@ func main() {
 func sisoMain() int {
 	flag.CommandLine.Usage = func() {
 		w := flag.CommandLine.Output()
-		fmt.Fprint(w, `
+		if alex313031.IsNG() {
+			fmt.Fprint(w, `
+Usage: siso-ng [flags] [command] [arguments]
+
+e.g.
+ $ siso-ng ninja -C out/Default
+
+`)
+		} else {
+			fmt.Fprint(w, `
 Usage: siso [flags] [command] [arguments]
 
 e.g.
  $ siso ninja -C out/Default
 
 `)
+		}
 		fmt.Fprintf(w, "important flags of %s:\n", os.Args[0])
 
 		f := flag.Lookup("credential_helper")
@@ -82,11 +94,19 @@ e.g.
 		fmt.Fprintf(w, `  -version
    %s
 `, f.Usage)
-		fmt.Fprintf(flag.CommandLine.Output(), `
+		if alex313031.IsNG() {
+			fmt.Fprintf(flag.CommandLine.Output(), `
+Use "siso-ng help" to display commands.
+Use "siso-ng help [command]" for more information about a command.
+Use "siso-ng flags" to display all flags.
+`)
+		} else {
+			fmt.Fprintf(flag.CommandLine.Output(), `
 Use "siso help" to display commands.
 Use "siso help [command]" for more information about a command.
 Use "siso flags" to display all flags.
 `)
+		}
 	}
 
 	flag.StringVar(&pprofAddr, "pprof_addr", "", `listen address for "go tool pprof". e.g. "localhost:6060"`)
@@ -129,7 +149,11 @@ Use "siso flags" to display all flags.
 	}()
 
 	if printVersion {
-		return int(version.Cmd(versionStr).Execute(ctx, flag.CommandLine))
+		if alex313031.IsNG() {
+			return int(version.Cmd(versionNGStr).Execute(ctx, flag.CommandLine))
+		} else {
+			return int(version.Cmd(versionStr).Execute(ctx, flag.CommandLine))
+		}
 	}
 	if blockprofile != "" && blockprofRate == 0 {
 		blockprofRate = 1
@@ -269,7 +293,11 @@ Use "siso flags" to display all flags.
 
 	subcommands.Register(subcommands.FlagsCommand(), "command-help")
 	subcommands.Register(subcommands.HelpCommand(), "command-help")
-	subcommands.Register(version.Cmd(versionStr), "command-help")
+	if alex313031.IsNG() {
+		subcommands.Register(version.Cmd(versionNGStr), "command-help")
+	} else {
+		subcommands.Register(version.Cmd(versionStr), "command-help")
+	}
 
 	return int(subcommands.Execute(ctx))
 }

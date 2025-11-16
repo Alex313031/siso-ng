@@ -54,6 +54,7 @@ import (
 	"go.chromium.org/build/siso/build/buildconfig"
 	"go.chromium.org/build/siso/build/cachestore"
 	"go.chromium.org/build/siso/build/ninjabuild"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/monitoring"
@@ -516,8 +517,8 @@ func (c *Command) run(ctx context.Context) (stats build.Stats, err error) {
 		return stats, flagError{err: fmt.Errorf("unknown tool %q", c.subtool)}
 	}
 
-	if c.ninjaJobs >= 0 {
-		ui.Default.Warningf("-j is not supported. use -remote_jobs and -local_jobs instead\n")
+	if c.ninjaJobs > 0 {
+		ui.Default.Warningf("-j is deprecated. use -remote_jobs and -local_jobs instead\n")
 	}
 	if c.ninjaLoadLimit >= 0 {
 		ui.Default.Warningf("-l is not supported.\n")
@@ -533,8 +534,14 @@ func (c *Command) run(ctx context.Context) (stats build.Stats, err error) {
 		ui.Default.Warningf("-w is specified. but not supported. b/288807840\n")
 	}
 
+	var is_local_compile bool = false
 	if c.offline {
-		ui.Default.Warningf(ui.SGR(ui.Red, "offline mode\n"))
+		is_local_compile = true;
+		if alex313031.IsNG() {
+			ui.Default.Infof(ui.SGR(ui.Reset, "Offline mode\n"))
+		} else {
+			ui.Default.Warningf(ui.SGR(ui.Red, "offline mode\n"))
+		}
 		clog.Warningf(ctx, "offline mode")
 		c.reopt = new(reapi.Option)
 		c.reopt.Insecure = true
@@ -545,6 +552,14 @@ func (c *Command) run(ctx context.Context) (stats build.Stats, err error) {
 		c.enableCloudTrace = false
 		c.enableCloudMonitoring = false
 		c.reproxyAddr = ""
+	} else {
+		if (alex313031.IsNG()) {
+			ui.Default.Infof(ui.SGR(ui.Bold, "Online Mode\n"))
+		}
+	}
+
+	if (alex313031.IsNG()) {
+		ui.Default.Infof(ui.SGR(ui.Blue, "\"NG\" build config\n"))
 	}
 
 	execRoot, err := c.initWorkdirs(ctx)
@@ -622,16 +637,31 @@ func (c *Command) run(ctx context.Context) (stats build.Stats, err error) {
 	// compute default limits based on fstype of work dir (e.g. artfs),
 	// not of exec root.
 	limits := build.DefaultLimits(ctx)
-	if c.localJobs > 0 {
-		limits.Local = c.localJobs
+	if c.localJobs > 0 || c.ninjaJobs > 0 {
+		if c.ninjaJobs > 0 {
+			limits.Local = c.ninjaJobs
+		} else {
+			limits.Local = c.localJobs
+		}
+		ui.Default.Infof("local_jobs = %d\n", limits.Local)
 	}
-	if c.remoteJobs > 0 {
+	if c.remoteJobs == 0 && limits.Remote == 0 {
+		is_local_compile = true
+	}
+	if c.remoteJobs > 0 && c.ninjaJobs == 0 {
 		limits.Remote = c.remoteJobs
 		limits.REWrap = c.remoteJobs
+		ui.Default.Infof("remote_jobs = %d\n", limits.Remote)
 	}
 	if !c.fastLocal {
 		limits.FastLocal = 0
 		limits.StartLocal = 0
+	}
+
+	if is_local_compile {
+		if alex313031.IsNG() {
+			ui.Default.Infof(ui.SGR(ui.Reset, "is_local_compile = true\n"))
+		}
 	}
 
 	if err = uuid.Validate(c.buildID); err != nil {
@@ -1247,7 +1277,7 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 	flagSet.IntVar(&c.failuresAllowed, "k", 1, "keep going until N jobs fail (0 means inifinity)")
 	flagSet.StringVar(&c.actionSalt, "action_salt", "", "action salt")
 
-	flagSet.IntVar(&c.ninjaJobs, "j", -1, "not supported. use -remote_jobs and -local_jobs instead")
+	flagSet.IntVar(&c.ninjaJobs, "j", 0, "Deprecated. use -remote_jobs and -local_jobs instead")
 	flagSet.IntVar(&c.ninjaLoadLimit, "l", -1, "not supported.")
 	flagSet.IntVar(&c.localJobs, "local_jobs", 0, "run N local jobs in parallel. when the value is no positive, the default will be computed based on # of CPUs.")
 	flagSet.IntVar(&c.remoteJobs, "remote_jobs", 0, "run N remote jobs in parallel. when the value is no positive, the default will be computed based on # of CPUs.")
