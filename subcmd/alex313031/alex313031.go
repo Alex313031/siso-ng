@@ -12,5 +12,9 @@ func init() {
 }
 
 func GetCustomizations() (string) {
-  return "first"
+  if IsNG() {
+    return "siso-ng"
+  } else {
+    return "siso"
+  }
 }
