@@ -103,10 +103,7 @@ func (b *ExponentialBackoff) Next(ctx context.Context, err error) (time.Duration
 		backoff = maxDelay
 	}
 	backoff -= backoff * backoffRange * rand.Float64()
-	b.delay = time.Duration(backoff)
-	if b.delay < baseDelay {
-		b.delay = baseDelay
-	}
+	b.delay = max(time.Duration(backoff), baseDelay)
 	return b.delay, err
 }
 

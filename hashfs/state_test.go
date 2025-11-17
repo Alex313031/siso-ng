@@ -602,8 +602,8 @@ func BenchmarkSetState(b *testing.B) {
 	ctx := b.Context()
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		hashFS, err := hashfs.New(ctx, hashfs.Option{})
 		if err != nil {
 			b.Fatal(err)
@@ -634,8 +634,8 @@ func BenchmarkLoadState(b *testing.B) {
 	}
 	origState := st
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		st, err := hashfs.Load(ctx, opts)
 		if err != nil {
 			b.Fatal(err)

@@ -197,7 +197,8 @@ func New(ctx context.Context, uri string, opts Options) (Cred, error) {
 		} else {
 			switch opts.Type {
 			case "luci-auth", "gcloud", "":
-				return Cred{Type: opts.Type}, fmt.Errorf("need to run `siso login`: %w", err)
+				clog.Warningf(ctx, "auth %s: %v", opts.Type, err)
+				return Cred{Type: opts.Type}, fmt.Errorf("need to run `siso login`")
 			default:
 				return Cred{Type: opts.Type}, err
 			}

@@ -54,7 +54,7 @@ var (
 	traceFile     string
 )
 
-const versionID = "v1.4.17"
+const versionID = "v1.4.19"
 var versionStr = alex313031.GetExecutableName() + " " + versionID
 
 func main() {

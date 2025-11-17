@@ -356,7 +356,7 @@ func edgeSolibs(edge *ninjautil.Edge) []string {
 		return nil
 	}
 	var solibs []string
-	for _, in := range strings.Split(solibsStr, " ") {
+	for in := range strings.SplitSeq(solibsStr, " ") {
 		in = strings.TrimSpace(in)
 		if in == "" {
 			continue

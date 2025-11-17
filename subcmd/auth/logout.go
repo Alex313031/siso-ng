@@ -43,7 +43,7 @@ func (*LogoutCommand) SetFlags(flagSet *flag.FlagSet) {}
 
 func (c *LogoutCommand) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	fmt.Printf("using %s for auth\n", c.authOpts.Type)
-	err := c.authOpts.Login(ctx)
+	err := c.authOpts.Logout(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return subcommands.ExitFailure

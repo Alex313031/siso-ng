@@ -217,7 +217,7 @@ func (*Command) Usage() string {
 	return ninjaUsage
 }
 
-func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	c.Flags = flagSet
 	c.started = time.Now()
 	err := parseFlagsFully(flagSet)
@@ -686,11 +686,13 @@ func (c *Command) run(ctx context.Context) (stats build.Stats, err error) {
 		spin.Stop(nil)
 	}
 	if c.enableCloudLogging {
+		spin := ui.Default.NewSpinner()
+		spin.Start("init cloud logging")
 		logCtx, loggerURL, done, err := c.initCloudLogging(ctx, projectID, execRoot, credential)
+		spin.Stop(err)
 		if err != nil {
 			// b/335295396 Compile step hitting write requests quota
 			// rather than build fails, fallback to glog.
-			ui.Default.Errorf("cloud logging: %v\n", err)
 			ui.Default.Warningf("fallback to glog\n")
 			c.enableCloudLogging = false
 		} else {
@@ -772,7 +774,7 @@ func (c *Command) run(ctx context.Context) (stats build.Stats, err error) {
 		c.initCloudProfiler(ctx, projectID, credential)
 	}
 	metricsLabels := make(map[string]string)
-	for _, l := range strings.Split(c.metricsLabels, ",") {
+	for l := range strings.SplitSeq(c.metricsLabels, ",") {
 		kv := strings.Split(l, "=")
 		if len(kv) != 2 {
 			clog.Warningf(ctx, "metrics label must be in the form key=value. got %q", l)
@@ -2304,7 +2306,7 @@ func checkTargets(ctx context.Context, lastTargetsFilename string, targets []str
 }
 
 func argsGN(args, key string) string {
-	for _, line := range strings.Split(args, "\n") {
+	for line := range strings.SplitSeq(args, "\n") {
 		i := strings.Index(line, "#")
 		if i >= 0 {
 			line = line[:i]

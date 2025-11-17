@@ -89,7 +89,7 @@ func DefaultLimits(ctx context.Context) Limits {
 		if overrides == "" {
 			return
 		}
-		for _, ov := range strings.Split(overrides, ",") {
+		for ov := range strings.SplitSeq(overrides, ",") {
 			ov = strings.TrimSpace(ov)
 			clog.Infof(ctx, "apply SISO_LIMITS=%s", ov)
 			k, v, ok := strings.Cut(ov, "=")

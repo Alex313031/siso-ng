@@ -1201,6 +1201,7 @@ func (b *Builder) progressStepCacheWrite(step *Step) {
 }
 
 var errNotRelocatable = errors.New("request is not relocatable")
+var errNotUnderExecRoot = errors.New("inputs are not under exec root")
 
 func (b *Builder) updateDeps(ctx context.Context, step *Step) error {
 	ctx, span := trace.NewSpan(ctx, "update-deps")

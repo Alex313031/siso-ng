@@ -97,7 +97,7 @@ func (nm *nodeMap) node(h uint64, key []byte, lm *localNodeMap) *Node {
 
 // lookup returns *Node for key if exists.
 func (nm *nodeMap) lookup(key string) (*Node, bool) {
-	h := maphash.Bytes(nm.seed, []byte(key))
+	h := maphash.String(nm.seed, key)
 	node := nm.nodes[h&(nodeMapArraySize-1)].Load()
 	for node != nil {
 		if node.path == key {

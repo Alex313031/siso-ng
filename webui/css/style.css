@@ -17,78 +17,78 @@ html, body {
         "header header"
         "navrail content";
     min-height: 100vh;
-}
 
-#page .header {
-    grid-area: header;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 0 8px;
-    --md-text-button-container-height: 28px;
-    --md-icon-button-state-layer-height: 28px;
-}
+    .header {
+        grid-area: header;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0 8px;
+        --md-text-button-container-height: 28px;
+        --md-icon-button-state-layer-height: 28px;
+    }
 
-#page .header-title {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 0;
-}
+    .header-title {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 0;
+    }
 
-#page .header-title h1,
-#page .header-title .subtitle,
-#page .header-title .breadcrumbs,
-#page .header-title .breadcrumb {
-    margin: 0;
-    padding: 0;
-    display: flex;
-    align-items: center;
-    font-size: var(--md-sys-typescale-title-medium-size);
-    font-weight: var(--md-sys-typescale-title-medium-weight);
-}
+    .header-title h1,
+    .header-title .subtitle,
+    .header-title .breadcrumbs,
+    .header-title .breadcrumb {
+        margin: 0;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        font-size: var(--md-sys-typescale-title-medium-size);
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+    }
 
-#page .header-title .subtitle {
-    font-size: var(--md-sys-typescale-title-small-size);
-    font-weight: var(--md-sys-typescale-title-small-weight);
-}
+    .header-title .subtitle {
+        font-size: var(--md-sys-typescale-title-small-size);
+        font-weight: var(--md-sys-typescale-title-small-weight);
+    }
 
-#page .breadcrumb::before {
-    content: "\203A"; /* › character */
-    padding: 0 4px;
-}
+    .breadcrumb::before {
+        content: "\203A"; /* › character */
+        padding: 0 4px;
+    }
 
-#page .breadcrumb-menu-button {
-    /* default <md-text-button> color is --md-sys-color-primary which is the
-     * accent color, this stands out too much so use the same color that
-     * <md-icon-button> uses i.e. --md-sys-color-on-surface-variant. */
-    --md-text-button-icon-color: var(--md-sys-color-on-surface-variant);
-    --md-text-button-label-text-color: var(--md-sys-color-on-surface-variant);
-    --md-text-button-hover-icon-color: var(--md-sys-color-on-surface-variant);
-    --md-text-button-hover-label-text-color:
-        var(--md-sys-color-on-surface-variant);
-    --md-text-button-hover-state-layer-color:
-        var(--md-sys-color-on-surface-variant);
-    --md-text-button-focus-icon-color: var(--md-sys-color-on-surface-variant);
-    --md-text-button-focus-label-text-color:
-        var(--md-sys-color-on-surface-variant);
-    --md-text-button-focus-state-layer-color:
-        var(--md-sys-color-on-surface-variant);
-    --md-text-button-pressed-icon-color:
-        var(--md-sys-color-on-surface-variant);
-    --md-text-button-pressed-label-text-color:
-        var(--md-sys-color-on-surface-variant);
-    --md-text-button-pressed-state-layer-color:
-        var(--md-sys-color-on-surface-variant);
-}
-#page .breadcrumb-menu-button md-icon::before {
-    content: 'arrow_drop_down';
-}
+    .breadcrumb-menu-button {
+        /* default <md-text-button> color is --md-sys-color-primary which is the
+        * accent color, this stands out too much so use the same color that
+        * <md-icon-button> uses i.e. --md-sys-color-on-surface-variant. */
+        --md-text-button-icon-color: var(--md-sys-color-on-surface-variant);
+        --md-text-button-label-text-color: var(--md-sys-color-on-surface-variant);
+        --md-text-button-hover-icon-color: var(--md-sys-color-on-surface-variant);
+        --md-text-button-hover-label-text-color:
+            var(--md-sys-color-on-surface-variant);
+        --md-text-button-hover-state-layer-color:
+            var(--md-sys-color-on-surface-variant);
+        --md-text-button-focus-icon-color: var(--md-sys-color-on-surface-variant);
+        --md-text-button-focus-label-text-color:
+            var(--md-sys-color-on-surface-variant);
+        --md-text-button-focus-state-layer-color:
+            var(--md-sys-color-on-surface-variant);
+        --md-text-button-pressed-icon-color:
+            var(--md-sys-color-on-surface-variant);
+        --md-text-button-pressed-label-text-color:
+            var(--md-sys-color-on-surface-variant);
+        --md-text-button-pressed-state-layer-color:
+            var(--md-sys-color-on-surface-variant);
+    }
+    .breadcrumb-menu-button md-icon::before {
+        content: 'arrow_drop_down';
+    }
 
-#page .mtime-status {
-    font-size: var(--md-sys-typescale-title-small-size);
-    font-weight: normal;
-    font-style: italic;
+    .mtime-status {
+        font-size: var(--md-sys-typescale-title-small-size);
+        font-weight: normal;
+        font-style: italic;
+    }
 }
 
 .light .toggle-dark-mode md-icon::before {
@@ -129,10 +129,10 @@ html, body {
     width: 300px;
 }
 
-/* Simulated implementation of https://m3.material.io/components/navigation-rail/overview
- * since Material Web is in maintenance mode and this component is missing at
- * time of writing. */
 .page-tab {
+    /* Simulation of https://m3.material.io/components/navigation-rail/overview
+    * since Material Web is in maintenance mode and this component is missing
+    * at time of writing. */
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -146,26 +146,28 @@ html, body {
     font-size: var(--md-sys-typescale-label-medium-size);
     font-weight: var(--md-sys-typescale-label-medium-weight);
     color: var(--md-sys-color-on-surface);
-}
-.page-tab:hover {
-    text-decoration: none;
-}
-.page-tab md-icon {
-    height: var(--page-tab-icon-height);
-    width: var(--page-tab-icon-width);
-    margin: 0 auto;
-}
-.page-tab.selected md-icon {
-    background: var(--md-sys-color-secondary-container);
-    border-radius: 999px;
-    font-variation-settings: 'FILL' 1;
-}
-.page-tab md-ripple {
-    position: absolute;
-    height: var(--page-tab-icon-height);
-    width: var(--page-tab-icon-width);
-    margin: 0 auto;
-    border-radius: 999px;
+    &:hover {
+        text-decoration: none;
+    }
+
+    md-icon {
+        height: var(--page-tab-icon-height);
+        width: var(--page-tab-icon-width);
+        margin: 0 auto;
+    }
+    &.selected md-icon {
+        background: var(--md-sys-color-secondary-container);
+        border-radius: 999px;
+        font-variation-settings: 'FILL' 1;
+    }
+
+    md-ripple {
+        position: absolute;
+        height: var(--page-tab-icon-height);
+        width: var(--page-tab-icon-width);
+        margin: 0 auto;
+        border-radius: 999px;
+    }
 }
 
 /* Steps page. */
@@ -178,84 +180,87 @@ html, body {
     --timeline-vertical-spacing: 12px;
     --timeline-dot-size: 10px;
     --timeline-dot-indent: 4px;
-}
-.revs-timeline > li {
-    position: relative;
-}
-.revs-timeline .rev-label {
-    position: relative;
-    padding:
-        var(--timeline-vertical-padding)
-        var(--timeline-horizontal-padding)
-        var(--timeline-vertical-padding)
-        calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
-    border-radius: 999px;
-    text-decoration: none;
-    font-weight: var(--md-sys-typescale-label-medium-weight);
-}
-.revs-timeline .rev-label.disabled {
-    font-style: italic;
-}
-.revs-timeline .rev-label.disabled,
-.revs-timeline .rev-label .rev-label-note {
-    font-weight: var(--md-sys-typescale-body-medium-weight);
-}
-.revs-timeline .rev-info {
-    padding:
-        var(--timeline-vertical-padding)
-        var(--timeline-horizontal-padding)
-        var(--timeline-vertical-spacing)
-        calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
-    color: var(--md-sys-color-on-surface-variant);
-    font-weight: var(--md-sys-typescale-body-medium-weight);
-    font-size: var(--md-sys-typescale-body-medium-size);
-}
-.revs-timeline .rev-sublinks {
-    list-style: none;
-    padding: 0;
-}
-.revs-timeline .rev-sublinks li {
-    position: relative;
-    margin: 4px 0;
-}
-.revs-timeline .rev-sublinks li.selected {
-    font-weight: bold;
-}
 
-.revs-timeline > li:before {
-    /* Render the timeline dot. */
-    content: '';
-    width: var(--timeline-dot-size);
-    height: var(--timeline-dot-size);
-    border-radius: 50%;
-    background: var(--md-sys-color-outline);
-    position: absolute;
-    top: calc(var(--timeline-dot-size)/2);
-    left: var(--timeline-dot-indent);
-}
-.revs-timeline > li:after {
-    /* Render the timeline line. */
-    content: '';
-    width: 2px;
-    height: 100%;
-    background: var(--md-sys-color-outline);
-    position: absolute;
-    left: calc(var(--timeline-dot-indent) + var(--timeline-dot-size)/2 - 1px);
-    top: calc(var(--timeline-dot-size)/2);
-}
-.revs-timeline > li:last-child:after {
-    /* The end of the timeline should fade into blank. */
-    background: linear-gradient(var(--md-sys-color-outline), transparent);
-}
+    > li {
+        position: relative;
+        padding: 0 0 var(--timeline-vertical-spacing) 0;
+        --md-icon-size: 20px;
+    }
+    .rev-label {
+        position: relative;
+        padding:
+            var(--timeline-vertical-padding)
+            var(--timeline-horizontal-padding)
+            var(--timeline-vertical-padding)
+            calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
+        border-radius: 999px;
+        text-decoration: none;
+        font-weight: var(--md-sys-typescale-label-medium-weight);
+    }
+    .rev-label.disabled {
+        font-style: italic;
+    }
+    .rev-label.disabled,
+    .rev-label .rev-label-note {
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+    }
+    .rev-info {
+        padding:
+            var(--timeline-vertical-padding)
+            var(--timeline-horizontal-padding)
+            0
+            calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
+        color: var(--md-sys-color-on-surface-variant);
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+        font-size: var(--md-sys-typescale-body-medium-size);
+    }
+    .rev-sublinks {
+        list-style: none;
+        padding: 0;
+    }
+    .rev-sublinks li {
+        position: relative;
+        margin: 4px 0;
+    }
+    .rev-sublinks li.selected {
+        font-weight: bold;
+    }
 
-.revs-timeline > li.selected .rev-label {
-    background: var(--md-sys-color-secondary-container);
-    color: var(--md-sys-color-on-secondary-container);
-    z-index: 1;
-}
-.revs-timeline > li.selected:before {
-    background: var(--md-sys-color-on-secondary-container);
-    z-index: 2;
+    > li:before {
+        /* Render the timeline dot. */
+        content: '';
+        width: var(--timeline-dot-size);
+        height: var(--timeline-dot-size);
+        border-radius: 50%;
+        background: var(--md-sys-color-outline);
+        position: absolute;
+        top: calc(var(--timeline-dot-size)/2);
+        left: var(--timeline-dot-indent);
+    }
+    > li:after {
+        /* Render the timeline line. */
+        content: '';
+        width: 2px;
+        height: 100%;
+        background: var(--md-sys-color-outline);
+        position: absolute;
+        left: calc(var(--timeline-dot-indent) + var(--timeline-dot-size)/2 - 1px);
+        top: calc(var(--timeline-dot-size)/2);
+    }
+    > li:last-child:after {
+        /* The end of the timeline should fade into blank. */
+        background: linear-gradient(var(--md-sys-color-outline), transparent);
+    }
+
+    > li.selected .rev-label {
+        background: var(--md-sys-color-secondary-container);
+        color: var(--md-sys-color-on-secondary-container);
+        z-index: 1;
+    }
+    > li.selected:before {
+        background: var(--md-sys-color-on-secondary-container);
+        z-index: 2;
+    }
 }
 
 .data-table-filter {
@@ -271,31 +276,32 @@ html, body {
     --md-outlined-button-container-height: 32px;
     --md-outlined-button-leading-space: 20px;
     --md-outlined-button-trailing-space: 20px;
-}
-.step-views h3 {
-    margin: 0;
-    font-size: var(--md-sys-typescale-title-medium-size);
-    font-weight: var(--md-sys-typescale-title-medium-weight);
-}
-.step-views label {
-    box-sizing: border-box;
-    display: inline-flex;
-    align-items: center;
-    position: relative;
-    height: 32px;
-    padding: 0 20px;
-    border: 1px solid var(--md-sys-color-outline);
-    border-radius: 999px;
-    font-size: var(--md-sys-typescale-label-large-size);
-    font-weight: var(--md-sys-typescale-label-large-weight);
-    cursor: pointer;
-}
-.step-views input[type="radio"] {
-    display: none;
-}
-.step-views input[type="radio"]:checked + label {
-    background: var(--md-sys-color-secondary-container);
-    color: var(--md-sys-color-primary);
+
+    h3 {
+        margin: 0;
+        font-size: var(--md-sys-typescale-title-medium-size);
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+    }
+    label {
+        box-sizing: border-box;
+        display: inline-flex;
+        align-items: center;
+        position: relative;
+        height: 32px;
+        padding: 0 20px;
+        border: 1px solid var(--md-sys-color-outline);
+        border-radius: 999px;
+        font-size: var(--md-sys-typescale-label-large-size);
+        font-weight: var(--md-sys-typescale-label-large-weight);
+        cursor: pointer;
+    }
+    input[type="radio"] {
+        display: none;
+    }
+    input[type="radio"]:checked + label {
+        background: var(--md-sys-color-secondary-container);
+        color: var(--md-sys-color-primary);
+    }
 }
 
 .step-paginator {
@@ -305,35 +311,35 @@ html, body {
 .page-controls {
     display: flex;
     margin: 8px 0;
-}
 
-.page-controls md-outlined-text-field {
-    width: 80px;
-    height: var(--md-icon-button-state-layer-height);
-    --md-outlined-field-bottom-space: 12px;
-    --md-outlined-field-top-space: 12px;
-    --md-outlined-field-trailing-space: 12px;
-    --md-outlined-field-leading-space: 12px;
+    md-outlined-text-field {
+        width: 80px;
+        height: var(--md-icon-button-state-layer-height);
+        --md-outlined-field-bottom-space: 12px;
+        --md-outlined-field-top-space: 12px;
+        --md-outlined-field-trailing-space: 12px;
+        --md-outlined-field-leading-space: 12px;
+    }
 }
 
 .filter-controls {
     margin: 8px 0;
-}
 
-.filter-controls h3 {
-    font-size: var(--md-sys-typescale-title-medium-size);
-    font-weight: var(--md-sys-typescale-title-medium-weight);
-}
+    h3 {
+        font-size: var(--md-sys-typescale-title-medium-size);
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+    }
 
-.filter-controls md-filter-chip {
-    --md-filter-chip-label-text-size: 13px;
-    --md-filter-chip-leading-space: 10px;
-    --md-filter-chip-trailing-space: 10px;
-    --md-filter-chip-container-height: 26px;
-}
+    md-filter-chip {
+        --md-filter-chip-label-text-size: 13px;
+        --md-filter-chip-leading-space: 10px;
+        --md-filter-chip-trailing-space: 10px;
+        --md-filter-chip-container-height: 26px;
+    }
 
-.filter-controls md-chip-set input[type=checkbox] {
-    display: none;
+    md-chip-set input[type=checkbox] {
+        display: none;
+    }
 }
 
 .filter-button {
@@ -357,104 +363,111 @@ html, body {
     border: none;
     margin: 0 -16px;
     padding: 16px;
-}
-.filter-popover .popover-content {
-    position: relative;
-    background: var(--md-sys-color-surface-container);
-    --md-elevation-level: 2;
-    padding: 8px 16px;
-}
-.filter-popover .popover-content ul {
-    list-style: none;
-    padding: 0;
-}
-.filter-popover .popover-content li {
-    padding: 4px 0;
+
+    .popover-content {
+        position: relative;
+        background: var(--md-sys-color-surface-container);
+        --md-elevation-level: 2;
+        padding: 8px 16px;
+    }
+    .popover-content ul {
+        list-style: none;
+        padding: 0;
+    }
+    .popover-content li {
+        padding: 4px 0;
+    }
 }
 
 .data-table-container {
     overflow-x: scroll;
-}
-.data-table-container table {
-    position: relative;
-    border-collapse: collapse;
-    min-width: 1200px;
-    width: 100%;
-    line-height: var(--md-sys-typescale-body-small-line-height);
-    letter-spacing: 0.01rem;
-    table-layout: fixed;
-}
 
-.data-table-container thead {
-    position: sticky;
-    top: 0;
-    /* Blur the background when scrolling past the top. */
-    background:
-        color-mix(in srgb, var(--md-sys-color-surface), transparent 33%);
-    backdrop-filter: blur(10px);
-}
-.data-table-container table::before {
-    /* We don't want the blur when scrolled at the top.
-     * This is a hack that stops the blur only at the top. */
-    position: absolute;
-    left: 0; right: 0; bottom: 0; top: 0;
-    display: block;
-    content: ' ';
-    z-index: -1;
-}
-.data-table-container thead th.thin-column {
-    width: 60px;
-}
-.data-table-container thead th.timestamp-column {
-    width: 110px;
-}
-.data-table-container thead th.timeline-column {
-    width: 300px;
-}
-.data-table-container thead th {
-    font-size: var(--md-sys-typescale-body-medium-size);
-    font-weight: var(--md-ref-typeface-weight-medium);
-}
-.data-table-container thead th:has(md-text-button) {
-    /* Give padding responsibility to the button. */
-    padding-left: 0;
-    padding-right: 0;
-}
-.data-table-container thead md-text-button {
-    padding-left: 16px;
-    padding-right: 16px;
-}
+    table {
+        position: relative;
+        border-collapse: collapse;
+        min-width: 1200px;
+        width: 100%;
+        line-height: var(--md-sys-typescale-body-small-line-height);
+        letter-spacing: 0.01rem;
+        table-layout: fixed;
+    }
 
-.data-table-container th {
-    text-align: start;
-}
+    thead {
+        position: sticky;
+        top: 0;
+        /* Blur the background when scrolling past the top. */
+        background:
+            color-mix(in srgb, var(--md-sys-color-surface), transparent 33%);
+        backdrop-filter: blur(10px);
+    }
+    table::before {
+        /* We don't want the blur when scrolled at the top.
+        * This is a hack that stops the blur only at the top. */
+        position: absolute;
+        left: 0; right: 0; bottom: 0; top: 0;
+        display: block;
+        content: ' ';
+        z-index: -1;
+    }
+    thead th.thin-column {
+        width: 60px;
+    }
+    thead th.timestamp-column {
+        width: 110px;
+    }
+    thead th.timeline-column {
+        width: 300px;
+    }
+    thead th {
+        font-size: var(--md-sys-typescale-body-medium-size);
+        font-weight: var(--md-ref-typeface-weight-medium);
+    }
+    thead th:has(md-text-button) {
+        /* Give padding responsibility to the button. */
+        padding-left: 0;
+        padding-right: 0;
+    }
+    thead md-text-button {
+        padding-left: 16px;
+        padding-right: 16px;
+    }
 
-.data-table-container th,
-.data-table-container td {
-    padding: 6px 16px;
-}
-.data-table-container tbody tr {
-    border-top: 1px solid var(--md-sys-color-outline-variant);
-    border-bottom: 1px solid var(--md-sys-color-outline-variant);
-}
-.data-table-container tbody th {
-    overflow-wrap: break-word;
-}
+    th {
+        text-align: start;
+    }
 
-.data-table-container .subrow {
-    color: var(--md-sys-color-on-surface-variant);
-    font-size: var(--md-sys-typescale-body-small-size);
-    font-weight: var(--md-sys-typescale-body-medium-weight);
-    letter-spacing: 0.02rem;
-}
+    th,
+    td {
+        padding: 6px 16px;
+    }
+    tbody tr {
+        border-top: 1px solid var(--md-sys-color-outline-variant);
+        border-bottom: 1px solid var(--md-sys-color-outline-variant);
+    }
+    tbody th {
+        overflow-wrap: break-word;
+    }
 
-.data-table-container tbody tr:hover {
-    background: var(--md-sys-color-surface-container);
-}
-.data-table-container tbody th,
-.data-table-container tbody td {
-    font-size: var(--md-sys-typescale-body-medium-size);
-    font-weight: var(--md-sys-typescale-body-medium-weight);
+    .subrow {
+        color: var(--md-sys-color-on-surface-variant);
+        font-size: var(--md-sys-typescale-body-small-size);
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+        letter-spacing: 0.02rem;
+    }
+
+    tbody tr:hover {
+        background: var(--md-sys-color-surface-container);
+    }
+    tbody th,
+    tbody td {
+        font-size: var(--md-sys-typescale-body-medium-size);
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+    }
+
+    .timestamp {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+    }
 }
 
 th.remote-indicator {
@@ -472,11 +485,6 @@ td.remote-indicator {
     font-variation-settings: 'FILL' 1;
 }
 
-.data-table-container .timestamp {
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-}
-
 .step-rule:not(:empty) {
     background: var(--md-sys-color-surface-container);
     color: var(--md-sys-color-on-surface-container);
@@ -490,34 +498,37 @@ td.remote-indicator {
 
 /* Individual step page. */
 
-.step-page h2 {
-    font-weight: var(--md-sys-typescale-title-medium-weight);
-    font-size: var(--md-sys-typescale-title-medium-size);
-    line-height: var(--md-sys-typescale-title-medium-line-height);
-}
+.step-page {
+    h2 {
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+        font-size: var(--md-sys-typescale-title-medium-size);
+        line-height: var(--md-sys-typescale-title-medium-line-height);
+    }
 
-.step-page dt {
-    font-weight: bold;
-}
+    dt {
+        font-weight: bold;
+    }
 
-.step-page dd {
-    display: flex;
-    align-items: center;
-    margin-bottom: 4px;
+    dd {
+        display: flex;
+        align-items: center;
+        margin-bottom: 4px;
+    }
 }
 
 .step-details {
     list-style: none;
     padding: 0;
-}
-.step-details li {
-    height: 40px;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-}
-.step-details li > md-icon {
-    margin-right: 10px;
+
+    li {
+        height: 40px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+    li > md-icon {
+        margin-right: 10px;
+    }
 }
 
 .step-tools form {
@@ -541,19 +552,69 @@ body {
     left: 0;
     right: 0;
     z-index: 999;
-}
-
-#progress-indicator.htmx-request {
-    display: block;
+    &.htmx-request {
+        display: block;
+    }
 }
 
 a {
     color: var(--md-sys-color-primary);
     text-decoration: none;
+    &:focus-visible, &:hover {
+        text-decoration: underline;
+    }
 }
 
-a:focus-visible, a:hover {
-    text-decoration: underline;
+/* Link buttons.
+ *
+ * Use this to style a <button> to look like a hyperlink.
+ * This is useful for situations where a deemphasized appearance is desired.
+ *
+ * Consider using <md-text-button> instead if the significantly enlarged
+ * touch-friendly target and Material Design ripple behavior are acceptable.
+ *
+ * For context on why <button> is preferred over <a>, even if a text-like
+ * appearance is desired:
+ * https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/a#onclick_events
+ *
+ * Adding a Material Design icon is supported, but text must be wrapped in
+ * an item with class="text" in order to display underlines correctly.
+ *
+ * Examples:
+ *
+ *     <button class="link-button">Hello world</button>
+ *
+ *     <button class="link-button">
+ *         <md-icon>check</md-icon>
+ *         <span class="text">Done</span>
+ *     </button>
+ */
+.link-button {
+    /* This is the part to style it like a link. */
+    border: 0;
+    background: transparent;
+    color: var(--md-sys-color-primary);
+    font-family: inherit;
+    font-weight: var(--md-ref-typeface-weight-regular);
+    cursor: pointer;
+    &:hover {
+        text-decoration: underline;
+    }
+    /* Vertically center everything, since you're most likely going to
+     * just have an icon and text here at most. */
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+.link-button:has(md-icon):has(.text) {
+    /* If the link button has both an md-icon and .text element,
+     * then disable underline on the md-icon and only enable on .text */
+    &:hover {
+        text-decoration: none;
+    }
+    &:hover .text {
+        text-decoration: underline;
+    }
 }
 
 /* Code blocks https://meyerweb.com/eric/thoughts/2022/12/29/styling-a-pre-that-contains-a-code/ */

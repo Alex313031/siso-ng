@@ -17,9 +17,9 @@ found in the LICENSE file. */}}
       <tr>
         <td>{{$aggregate.AggregateBy}}</td>
         <td>{{$aggregate.Count}}</td>
-        <td>{{$aggregate.TotalUtime}}</td>
-        <td>{{$aggregate.TotalDuration}}</td>
-        <td>{{$aggregate.TotalWeightedDuration}}</td>
+        <td>{{formatIntervalMetricTimestamp $aggregate.TotalUtime}}</td>
+        <td>{{formatIntervalMetricTimestamp $aggregate.TotalDuration}}</td>
+        <td>{{formatIntervalMetricTimestamp $aggregate.TotalWeightedDuration}}</td>
       </tr>
     {{end}}
   </tbody>

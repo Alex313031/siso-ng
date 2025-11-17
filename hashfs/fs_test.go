@@ -434,7 +434,7 @@ func TestStatAllocs(t *testing.T) {
 	allocBase := 0.0
 	if runtime.GOOS == "windows" {
 		// TODO(ukai): why it has allocations on windows only?
-		allocBase = 7.0
+		allocBase = 4.0
 	}
 
 	ctx := t.Context()
@@ -454,7 +454,7 @@ func TestStatAllocs(t *testing.T) {
 			t.Fatalf("hfs.Close=%v", err)
 		}
 	}()
-	fname := "out/siso/gen/base/base/base.o.d"
+	fname := "base.o.d"
 	t.Run("not_exist", func(t *testing.T) {
 		num := 1000
 		if log.V(1) {

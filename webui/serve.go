@@ -9,6 +9,8 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"io/fs"
 	"math"
 	"net/http"
@@ -26,11 +28,17 @@ import (
 	mwc "go.chromium.org/build/siso/third_party/material_web_components"
 )
 
-//go:embed *.html css/*.css
+//go:embed templates/*.html css/*.css
 var content embed.FS
 
 var (
-	templates     = make(map[string]*template.Template)
+	// templates is a map for caching HTML template files when local development is false.
+	templates = make(map[string]*template.Template)
+	// combinedCSS is a string for caching the global stylesheet when local development is false.
+	combinedCSS         = ""
+	combinedCSSChecksum = uint32(0)
+	combinedCSSPathRe   = regexp.MustCompile(`/combined.(\d+).css`)
+	// baseFunctions provides global functions to the HTML template files.
 	baseFunctions = template.FuncMap{
 		"pathEscape": func(s string) string {
 			return url.PathEscape(s)
@@ -135,7 +143,7 @@ type WebuiServer struct {
 	sisoVersion       string
 	localDevelopment  bool
 	port              int
-	templatesFS       fs.FS
+	staticFS          fs.FS
 	sseServer         *sseServer
 	execRoot          string
 	defaultOutdir     string
@@ -183,7 +191,11 @@ func (s *WebuiServer) loadView(view string) (*template.Template, error) {
 	if template, ok := templates[view]; ok {
 		return template, nil
 	}
-	template, err := template.New("").Funcs(baseFunctions).ParseFS(s.templatesFS, "base.html", view)
+	templatesFS, err := fs.Sub(s.staticFS, "templates")
+	if err != nil {
+		return nil, fmt.Errorf("templates not found: %w", err)
+	}
+	template, err := template.New("").Funcs(baseFunctions).ParseFS(templatesFS, "webui_base.html", view)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse view: %w", err)
 	}
@@ -191,6 +203,37 @@ func (s *WebuiServer) loadView(view string) (*template.Template, error) {
 		templates[view] = template
 	}
 	return template, nil
+}
+
+// ensureCSS lazy-loads the global stylesheet, or loads every time if in local development mode.
+func (s *WebuiServer) ensureCSS() error {
+	if !s.localDevelopment && combinedCSS != "" {
+		return nil
+	}
+	sb := strings.Builder{}
+	for _, stylesheet := range []string{
+		"css/light.css",
+		"css/light-hc.css",
+		"css/light-mc.css",
+		"css/dark.css",
+		"css/dark-hc.css",
+		"css/dark-mc.css",
+		"css/style.css",
+	} {
+		f, err := s.staticFS.Open(stylesheet)
+		if err != nil {
+			return fmt.Errorf("failed to open %q: %w", stylesheet, err)
+		}
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return fmt.Errorf("failed to read %q: %w", stylesheet, err)
+		}
+		sb.Write(data)
+		sb.WriteByte('\n')
+	}
+	combinedCSS = sb.String()
+	combinedCSSChecksum = crc32.ChecksumIEEE([]byte(combinedCSS))
+	return nil
 }
 
 func didRequestUploadedMetrics(r *http.Request) bool {
@@ -233,7 +276,13 @@ func (s *WebuiServer) renderBuildView(wr http.ResponseWriter, r *http.Request, t
 	if rev != "" {
 		data["outdirRevBaseURL"] = fmt.Sprintf("%s/builds/%s", data["outdirBaseURL"], rev)
 	}
-	err := tmpl.ExecuteTemplate(wr, "base", data)
+	err := s.ensureCSS()
+	if err != nil {
+		return fmt.Errorf("failed to ensure CSS: %w", err)
+	}
+	// Use checksum for CSS for cache busting.
+	data["combinedCSSPath"] = fmt.Sprintf("/combined.%d.css", combinedCSSChecksum)
+	err = tmpl.ExecuteTemplate(wr, "base", data)
 	if err != nil {
 		return fmt.Errorf("failed to execute template: %w", err)
 	}
@@ -262,14 +311,14 @@ func NewServer(version string, localDevelopment bool, port int, defaultOutdir, c
 	s := WebuiServer{
 		sisoVersion:      version,
 		localDevelopment: localDevelopment,
-		templatesFS:      fs.FS(content),
+		staticFS:         fs.FS(content),
 		sseServer:        newSseServer(),
 		defaultOutdir:    defaultOutdir,
 		outdirMetrics:    make(map[string]*outdirInfo),
 		port:             port,
 	}
 	if localDevelopment {
-		s.templatesFS = os.DirFS("webui/")
+		s.staticFS = os.DirFS("webui/")
 	}
 
 	// Get execroot.
@@ -390,11 +439,22 @@ func (s *WebuiServer) Serve() int {
 			return
 		}
 
+		// Serve the combined CSS via the catch-all handler.
+		// The http.Handle wildcards that were introduced in go1.22
+		// https://go.dev/blog/routing-enhancements unfortunately don't
+		// support "/combined.{foo}.css" which is preferable over "/combined.css?v=123"
+		// https://css-tricks.com/strategies-for-cache-busting-css/
+		// (We don't actually validate the checksum, it's only for cache busting)
+		if combinedCSSPathRe.MatchString(r.URL.Path) {
+			w.Header().Add("Content-Type", "text/css; charset=UTF-8")
+			w.Header().Add("Cache-Control", "max-age=86400, private") // 1 day
+			w.Write([]byte(combinedCSS))
+			return
+		}
+
 		// Delegate all other requests to the outdir subrouter.
 		outdirRouter.ServeHTTP(w, r)
 	})
-
-	http.Handle("/css/", s.staticFileHandler(http.FileServerFS(s.templatesFS)))
 
 	// Serve third party JS. No other third party libraries right now, so just serve Material Design node_modules root.
 	http.Handle("/third_party/", http.StripPrefix("/third_party/", s.staticFileHandler(http.FileServerFS(mwc.NodeModulesFS))))

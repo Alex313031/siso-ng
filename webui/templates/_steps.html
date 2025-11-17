@@ -25,6 +25,16 @@ found in the LICENSE file. */}}
         </a>
         <div class="rev-info">
           {{len $r.StepMetrics}} steps <relative-time datetime="{{timeRFC3339 .Mtime}}"></relative-time>
+          {{if eq $r.Rev $currentRev}}
+            <ul class="rev-sublinks">
+              <li>
+                <button class="link-button" onclick="openInPerfetto('{{$outdirRevBaseURL}}/logs/siso_trace.json?raw=true')">
+                  <md-icon>speed</md-icon>
+                  <span class="text">Open in Perfetto...</span>
+                </button>
+              </li>
+            </ul>
+          {{end}}
         </div>
       </li>
       {{end}}

@@ -485,10 +485,9 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 		ToolInputs:     stepDef.ToolInputs(ctx),
 		Outputs:        stepManifest.outputs,
 		EdgeHash:       stepManifest.edgeHash,
-		// TODO(b/266518906): enable UseSystemInput
-		// UseSystemInput: stepDef.Binding("use_system_input") != "",
-		Deps:    stepDef.Binding("deps"),
-		Depfile: stepDef.Depfile(ctx),
+		UseSystemInput: stepDef.Binding("use_system_input") != "",
+		Deps:           stepDef.Binding("deps"),
+		Depfile:        stepDef.Depfile(ctx),
 
 		Restat:        stepDef.Binding("restat") != "",
 		RestatContent: stepDef.Binding("restat_content") != "",

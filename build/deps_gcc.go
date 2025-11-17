@@ -104,8 +104,8 @@ func (depsGCC) fixForSplitDwarf(ctx context.Context, cmd *execute.Cmd) {
 	}
 	dwo := ""
 	for _, out := range cmd.Outputs {
-		if strings.HasSuffix(out, ".o") { // TODO: or ".obj" for win?
-			dwo = strings.TrimSuffix(out, ".o") + ".dwo"
+		if before, ok := strings.CutSuffix(out, ".o"); ok { // TODO: or ".obj" for win?
+			dwo = before + ".dwo"
 			continue
 		}
 	}
@@ -250,11 +250,11 @@ func (depsGCC) scandeps(ctx context.Context, b *Builder, step *Step) ([]string, 
 			}
 		}
 		execRoot := b.path.ExecRoot
-		if len(externals) > 0 {
+		if !step.cmd.UseSystemInput && len(externals) > 0 {
 			if !step.cmd.RemoteChroot() {
 				n := len(externals)
 				v := externals[:min(len(externals), 5)]
-				return fmt.Errorf("inputs are not under exec root %d %q...: platform=%q", n, v, step.cmd.Platform)
+				return fmt.Errorf("%w %d %q...: platform=%q", errNotUnderExecRoot, n, v, step.cmd.Platform)
 			}
 			// Convert paths from relative to exec root to relative to /
 			// e.g.

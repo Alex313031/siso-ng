@@ -79,7 +79,7 @@ func (e *Experiments) init() {
 
 func (e *Experiments) set(env string) {
 	e.m = make(map[string]*experimentFeature)
-	for _, v := range strings.Split(env, ",") {
+	for v := range strings.SplitSeq(env, ",") {
 		if _, ok := knownExperiments[v]; !ok {
 			log.Warningf("unknown experiment %q. ignored", v)
 			continue

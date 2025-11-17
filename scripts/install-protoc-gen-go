@@ -18,7 +18,7 @@ mydir="$(realpath "$(dirname "$0")")"
 test -d "$mydir" || die 'cannot find myself'
 
 test -d "$mydir/cipd" || cipd init "$mydir/cipd" || die 'cannot install'
-cipd install -root "$mydir/cipd" 'infra/3pp/tools/protoc/${platform}' 'version:3@33.0' > /dev/null || die 'cannot install'
+cipd install -root "$mydir/cipd" 'infra/3pp/tools/protoc/${platform}' 'version:3@33.1' > /dev/null || die 'cannot install'
 
 export PATH="${mydir}/cipd/bin:${mydir}:${PATH}"
 exec "$@"

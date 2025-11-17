@@ -22,6 +22,7 @@ import (
 
 // scanner is a C++ dependency scanner per request.
 type scanner struct {
+	pt     *PathTable
 	fsview *fsview
 
 	// dir stack for #include "...".
@@ -42,8 +43,8 @@ type scanner struct {
 	//  MACRO -> [X, Y]
 	macros map[string][]string
 
-	// name -> dir -> visited
-	included map[string]map[string]struct{}
+	// name -> dirIndex -> visited
+	included map[string]map[int]struct{}
 
 	// macro name -> value -> used?
 	macroUsed map[string]map[string]bool
@@ -88,6 +89,7 @@ type scanResult struct {
 
 func (fsys *filesystem) scanner(ctx context.Context, execRoot string, inputDeps map[string][]string, precomputedTrees []string) *scanner {
 	s := &scanner{
+		pt: NewPathTable(),
 		fsview: &fsview{
 			fs:               fsys,
 			execRoot:         execRoot,
@@ -99,7 +101,7 @@ func (fsys *filesystem) scanner(ctx context.Context, execRoot string, inputDeps 
 			topEnts:          make(map[string]*sync.Map),
 		},
 		macros:       make(map[string][]string),
-		included:     make(map[string]map[string]struct{}),
+		included:     make(map[string]map[int]struct{}),
 		macroUsed:    make(map[string]map[string]bool),
 		macroInclude: make(map[string]bool),
 		macroDirs:    make(map[string][]string),
@@ -246,7 +248,7 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 	name = name[1 : len(name)-1]
 	included, ok := s.included[name]
 	if !ok {
-		included = make(map[string]struct{})
+		included = make(map[int]struct{})
 		s.included[name] = included
 	}
 	if filepath.IsAbs(name) {
@@ -261,7 +263,7 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		s.macroCheck(ctx, ".", rel, incpath, sr.includes)
+		s.macroCheck(ctx, s.pt.GetIndex("."), rel, incpath, sr.includes)
 		dir := path.Dir(incpath)
 		s.pushDir(ctx, dir)
 		s.updateMacros(sr.defines)
@@ -287,10 +289,11 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 		// TODO: lookup hmap appropriately.
 		s.ds = ds
 		for i, dir := range ds {
-			if _, ok := included[dir]; ok {
+			dirIndex := s.pt.GetIndex(dir)
+			if _, ok := included[dirIndex]; ok {
 				continue
 			}
-			included[dir] = struct{}{}
+			included[dirIndex] = struct{}{}
 			if log.V(1) {
 				clog.Infof(ctx, "find check %s/%s", dir, name)
 			}
@@ -301,7 +304,7 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 			if err != nil {
 				continue
 			}
-			s.macroCheck(ctx, dir, name, incpath, sr.includes)
+			s.macroCheck(ctx, dirIndex, name, incpath, sr.includes)
 
 			// `#include "xx"` in incpath may include "xx"
 			// from the dir of incpath.
@@ -334,10 +337,11 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 				clog.Infof(ctx, "check framework %s -> %s : %s", name, fwname, s.fsview.frameworkPaths)
 			}
 			for _, dir := range s.fsview.frameworkPaths {
-				if _, ok := included[dir]; ok {
+				dirIndex := s.pt.GetIndex(dir)
+				if _, ok := included[dirIndex]; ok {
 					continue
 				}
-				included[dir] = struct{}{}
+				included[dirIndex] = struct{}{}
 				if log.V(1) {
 					clog.Infof(ctx, "find check %s/%s", dir, fwname)
 				}
@@ -348,7 +352,7 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 				if err != nil {
 					continue
 				}
-				s.macroCheck(ctx, dir, name, incpath, sr.includes)
+				s.macroCheck(ctx, dirIndex, name, incpath, sr.includes)
 
 				// `#include "xx"` in incpath may include "xx"
 				// from the dir of incpath.
@@ -371,17 +375,22 @@ func (s *scanner) find(ctx context.Context, name string) (string, error) {
 	return "", fs.ErrNotExist
 }
 
-func (s *scanner) macroCheck(ctx context.Context, dir, name, incpath string, incnames []string) {
+func (s *scanner) macroCheck(ctx context.Context, dirIndex int, name, incpath string, incnames []string) {
 	for _, iname := range incnames {
 		if isMacro(iname) && !s.macroAllUsed(ctx, iname) {
 			// incname uses macro.
 			// need to try include again
 			// because macro value may have been changed.
 			if !s.macroInclude[incpath] {
+				dir, err := s.pt.GetPath(dirIndex)
+				if err != nil {
+					clog.Warningf(ctx, "failed to get path for index %d: %v", dirIndex, err)
+					return
+				}
 				s.macroDirs[name] = append(s.macroDirs[name], dir)
 			}
 			s.macroInclude[incpath] = true
-			delete(s.included[name], dir)
+			delete(s.included[name], dirIndex)
 			return
 		}
 	}

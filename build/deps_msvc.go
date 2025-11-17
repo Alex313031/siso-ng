@@ -217,6 +217,8 @@ func (depsMSVC) scandeps(ctx context.Context, b *Builder, step *Step) ([]string,
 		if err != nil {
 			return err
 		}
+		// externals stores non local paths.
+		var externals []string
 		if len(params.Sources) == 0 {
 			// If ExtractScanDepsParams doesn't return Sources, such action uses inputs from ninja build file directly, as the action doesn't need include scanning.
 			// e.g. clang modules, rust and etc.
@@ -225,17 +227,34 @@ func (depsMSVC) scandeps(ctx context.Context, b *Builder, step *Step) ([]string,
 
 		for i := range params.Sources {
 			params.Sources[i] = b.path.MaybeFromWD(ctx, params.Sources[i])
+			if !filepath.IsLocal(params.Sources[i]) {
+				externals = append(externals, params.Sources[i])
+			}
 		}
 		// no need to canonicalize path for Includes.
 		// it should be used as is for `#include "pathname.h"`
 		for i := range params.Files {
 			params.Files[i] = b.path.MaybeFromWD(ctx, params.Files[i])
+			if !filepath.IsLocal(params.Files[i]) {
+				externals = append(externals, params.Files[i])
+			}
 		}
 		for i := range params.Dirs {
 			params.Dirs[i] = b.path.MaybeFromWD(ctx, params.Dirs[i])
+			if !filepath.IsLocal(params.Dirs[i]) {
+				externals = append(externals, params.Dirs[i])
+			}
 		}
 		for i := range params.Sysroots {
 			params.Sysroots[i] = b.path.MaybeFromWD(ctx, params.Sysroots[i])
+			if !filepath.IsLocal(params.Sysroots[i]) {
+				externals = append(externals, params.Sysroots[i])
+			}
+		}
+		if !step.cmd.UseSystemInput && len(externals) > 0 {
+			n := len(externals)
+			v := externals[:min(len(externals), 5)]
+			return fmt.Errorf("%w %d %q...: platform=%q", errNotUnderExecRoot, n, v, step.cmd.Platform)
 		}
 		req := scandeps.Request{
 			Defines:  params.Defines,

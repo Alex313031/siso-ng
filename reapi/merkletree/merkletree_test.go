@@ -927,8 +927,8 @@ func BenchmarkSetDir(b *testing.B) {
 	ds := digest.NewStore()
 	m := New(ds)
 	cur := dirstate{name: ".", dir: m.m[""]}
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		m.setDir(cur, "subdir")
 	}
 }

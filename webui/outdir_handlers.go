@@ -354,9 +354,12 @@ func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request
 		}
 		// Use n returned from file.Read so that we don't read more than the actual file.
 		if strings.Contains(string(buffer[:n]), revID) {
-			basename := filepath.Base(match)
-			buildSuffix = strings.TrimPrefix(basename, "siso_metrics.")
-			buildSuffix = strings.TrimSuffix(buildSuffix, ".json")
+			withoutExt := strings.TrimSuffix(filepath.Base(match), ".json")
+			if withoutExt == "siso_metrics" {
+				buildSuffix = ""
+				break
+			}
+			buildSuffix = strings.TrimPrefix(withoutExt, "siso_metrics.")
 			break
 		}
 	}

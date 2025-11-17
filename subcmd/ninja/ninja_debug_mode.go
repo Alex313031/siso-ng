@@ -57,7 +57,7 @@ func (m *debugMode) String() string {
 
 // Set sets flag value for each flag present.
 func (m *debugMode) Set(v string) error {
-	for _, s := range strings.Split(v, ",") {
+	for s := range strings.SplitSeq(v, ",") {
 		switch s {
 		case "stats":
 			m.Stats = true

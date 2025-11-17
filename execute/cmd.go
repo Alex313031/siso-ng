@@ -310,8 +310,12 @@ func (c *Cmd) RemoteArgs() ([]string, error) {
 	}
 	// Cross-compile Windows builds on Linux workers.
 	if runtime.GOOS == "windows" && c.Platform["OSFamily"] != "Windows" {
+		// Clone the args to avoid mutating original args that may cause
+		// local exec to fail.
+		args = slices.Clone(c.Args)
 		args[0] = filepath.ToSlash(args[0])
 		args[0] = strings.TrimPrefix(args[0], filepath.VolumeName(args[0]))
+		// Platform is not used in local exec, ok to mutate here.
 		if rootPath, ok := c.Platform["InputRootAbsolutePath"]; ok {
 			rootPath = filepath.ToSlash(rootPath)
 			rootPath = strings.TrimPrefix(rootPath, filepath.VolumeName(rootPath))

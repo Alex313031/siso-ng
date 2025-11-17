@@ -5,7 +5,7 @@ module go.chromium.org/build/siso
 //
 // Go release history: https://go.dev/doc/devel/release
 // Some siso user OS version is listed in http://shortn/_R9N9PLz4sg
-go 1.24.9
+go 1.24.10
 
 require (
 	cloud.google.com/go/compute/metadata v0.8.0

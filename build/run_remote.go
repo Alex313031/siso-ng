@@ -116,6 +116,10 @@ func (b *Builder) runRemote(ctx context.Context, step *Step) error {
 			clog.Errorf(ctx, "not relocatable: %v", err)
 			return err
 		}
+		if errors.Is(err, errNotUnderExecRoot) {
+			clog.Errorf(ctx, "not remote executable: %v\nUse `use_system_inputs` or put them under exec_root", err)
+			return err
+		}
 		var eerr execute.ExitError
 		if errors.As(err, &eerr) && len(step.cmd.Stdout())+len(step.cmd.Stderr()) > 0 && b.failures.allowed == 1 {
 			var output string

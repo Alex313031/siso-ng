@@ -145,10 +145,7 @@ func (w *Writer) Write(buf []byte) (int, error) {
 	p := 0
 	const streamBufSize = 2 * 1024 * 1024 // 2MB, since grpc default max recv size is 4MB.
 	for p < n {
-		bufsize := len(buf[p:])
-		if bufsize > streamBufSize {
-			bufsize = streamBufSize
-		}
+		bufsize := min(len(buf[p:]), streamBufSize)
 		err := w.wr.Send(&pb.WriteRequest{
 			ResourceName: w.resname,
 			WriteOffset:  w.offset,

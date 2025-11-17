@@ -206,7 +206,7 @@ func (t InputTree) LookupFileNode(ctx context.Context, name string) (*rpb.FileNo
 	}
 	var elems []string
 pathElements:
-	for _, elem := range strings.Split(path.Dir(name), "/") {
+	for elem := range strings.SplitSeq(path.Dir(name), "/") {
 		if elem == "." {
 			continue
 		}
@@ -242,7 +242,7 @@ func (t InputTree) LookupSymlinkNode(ctx context.Context, name string) (*rpb.Sym
 	}
 	var elems []string
 pathElements:
-	for _, elem := range strings.Split(path.Dir(name), "/") {
+	for elem := range strings.SplitSeq(path.Dir(name), "/") {
 		if elem == "." {
 			continue
 		}
@@ -279,7 +279,7 @@ func (t InputTree) LookupDirectoryNode(ctx context.Context, name string) (*rpb.D
 	}
 	var elems []string
 pathElements:
-	for _, elem := range strings.Split(strings.Trim(name, "/"), "/") {
+	for elem := range strings.SplitSeq(strings.Trim(name, "/"), "/") {
 		if elem == "." {
 			continue
 		}
