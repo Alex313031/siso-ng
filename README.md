@@ -21,7 +21,7 @@ Siso is named after shiso, a herb commonly used in Japan. It's a reference to ba
 
 ## Building
 
-See [Building](./docs/development.md#build-the-code).
+See [Building](./docs/development.md#how-to-get-the-code).
 
 ## Documents
 
