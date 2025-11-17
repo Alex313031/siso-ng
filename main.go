@@ -55,8 +55,7 @@ var (
 )
 
 const versionID = "v1.4.17"
-const versionStr = "siso " + versionID
-const versionNGStr = "siso-ng " + versionID
+var versionStr = alex313031.GetExecutableName() + " " + versionID
 
 func main() {
 	// Wraps sisoMain() because os.Exit() doesn't wait defers.
@@ -66,8 +65,10 @@ func main() {
 func sisoMain() int {
 	flag.CommandLine.Usage = func() {
 		w := flag.CommandLine.Output()
+		fmt.Fprint(w, versionStr)
 		if alex313031.IsNG() {
 			fmt.Fprint(w, `
+
 Usage: siso-ng [flags] [command] [arguments]
 
 e.g.
@@ -149,11 +150,7 @@ Use "siso flags" to display all flags.
 	}()
 
 	if printVersion {
-		if alex313031.IsNG() {
-			return int(version.Cmd(versionNGStr).Execute(ctx, flag.CommandLine))
-		} else {
-			return int(version.Cmd(versionStr).Execute(ctx, flag.CommandLine))
-		}
+		return int(version.Cmd(versionStr).Execute(ctx, flag.CommandLine))
 	}
 	if blockprofile != "" && blockprofRate == 0 {
 		blockprofRate = 1
@@ -293,11 +290,7 @@ Use "siso flags" to display all flags.
 
 	subcommands.Register(subcommands.FlagsCommand(), "command-help")
 	subcommands.Register(subcommands.HelpCommand(), "command-help")
-	if alex313031.IsNG() {
-		subcommands.Register(version.Cmd(versionNGStr), "command-help")
-	} else {
-		subcommands.Register(version.Cmd(versionStr), "command-help")
-	}
+	subcommands.Register(version.Cmd(versionStr), "command-help")
 
 	return int(subcommands.Execute(ctx))
 }

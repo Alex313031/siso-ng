@@ -11,7 +11,7 @@ func init() {
   IsNG()
 }
 
-func GetCustomizations() (string) {
+func GetExecutableName() (string) {
   if IsNG() {
     return "siso-ng"
   } else {
