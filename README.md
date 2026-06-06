@@ -1,7 +1,7 @@
 # Siso-ng
 
 Siso-ng is a fork of [Chromium's Siso](https://chromium.googlesource.com/build/+/refs/heads/main/siso/README.md),
-with enhancements.
+with support for [Ninja's](https://ninja-build.org/) `-j` flag and logging enhancements.
 
 Siso is a build tool that aims to significantly speed up Chromium and Android's
 build.
