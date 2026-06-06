@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/ui"
 )
 
@@ -125,7 +126,12 @@ func DefaultLimits(ctx context.Context) Limits {
 				clog.Warningf(ctx, "unknown limits name %q", k)
 				continue
 			}
-			ui.Default.PrintLines(ui.SGR(ui.Yellow, fmt.Sprintf("use SISO_LIMITS=%s=%d\n", k, n)))
+			if (!alex313031.IsNG()) {
+				ui.Default.Infof(ui.SGR(ui.Yellow, fmt.Sprintf("Env variable SISO_LIMITS = %s=%d\n", k, n)))
+			}
+		}
+		if (alex313031.IsNG()) {
+			ui.Default.Infof("SISO_LIMITS = %s\n", overrides)
 		}
 	})
 	return defaultLimits
@@ -180,6 +186,9 @@ func limitForRemote(numCPU int) int {
 	// https://chromium.googlesource.com/chromium/tools/depot_tools.git/+/e13840bd9a04f464e3bef22afac1976fc15a96a0/reclient_helper.py#138
 	if v := os.Getenv("RBE_server_address"); v != "" {
 		return min(reproxyLimitCap, limit)
+	}
+	if alex313031.IsNG() {
+		ui.Default.Infof("limitForRemote = %d\n", limit)
 	}
 	return limit
 }

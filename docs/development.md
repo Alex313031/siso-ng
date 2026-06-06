@@ -7,17 +7,23 @@ Also check [go/siso-development](http://go/siso-development) (internal).
 ## How to get the code
 
 ```
-$ git clone https://chromium.googlesource.com/build
-$ cd build/siso
+$ git clone --recurse-submodules https://github.com/Alex313031/siso-ng.git
+$ cd siso-ng
 ```
 
-## How to build the code
+## Install prerequisite libraries
 
 ```
 $ go install .
 ```
 
-## How to test the Siso
+## Build the Code
+
+```
+$ go build -v .
+```
+
+## Testing Siso
 
 ```
 $ go test ./...

@@ -183,6 +183,7 @@ const (
 	Bold SGRCode = iota
 	Red
 	Green
+	Blue
 	Yellow
 	BackgroundRed
 	Reset
@@ -190,8 +191,9 @@ const (
 
 var sgrEscSeq = map[SGRCode]string{
 	Bold:          "\033[1m",
-	Red:           "\033[31;1m",
+	Red:           "\033[1,31m",
 	Green:         "\033[32m",
+	Blue:          "\033[96m",
 	Yellow:        "\033[33m",
 	BackgroundRed: "\033[41;37m",
 	Reset:         "\033[0m",
