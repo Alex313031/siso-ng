@@ -6,6 +6,8 @@ HERE="`dirname "$THIS_FILE_PATH"`" &&
 
 echo $HERE &&
 
+export CGO_ENABLED=0
+
 forceRebuild() {
   go build -C $HERE -o siso-ng -ldflags '-s -w -extldflags "-static"' -a -v "$@"
 }
