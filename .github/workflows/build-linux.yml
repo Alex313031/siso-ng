@@ -1,12 +1,16 @@
-name: Build Linux
+name: Build Siso-ng Linux
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
+    name: Build Linux x64
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     env:
+      GOOS: linux
+      GOARCH: amd64
       CGO_ENABLED: 0
     steps:
       - name: Checkout
@@ -20,9 +24,9 @@ jobs:
       - name: Build siso-ng
         run: ./buildrelease.sh
 
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: siso-ng-linux
+          name: siso-ng_linux
           path: siso-ng
           if-no-files-found: error

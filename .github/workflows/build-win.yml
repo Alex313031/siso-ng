@@ -1,11 +1,13 @@
-name: Build Windows
+name: Build Siso-ng Windows
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
+    name: Build Win64
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     env:
       GOOS: windows
       GOARCH: amd64
@@ -24,9 +26,9 @@ jobs:
           ./buildrelease.sh
           mv siso-ng siso-ng.exe
 
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: siso-ng-windows
+          name: siso-ng_win
           path: siso-ng.exe
           if-no-files-found: error
