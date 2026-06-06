@@ -1,0 +1,28 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule solink
+   command = python3 ../../tools/solink.py --input=${in} --output=${out}
+
+rule __input_files
+   command = python3 ../../tools/input_files.py --output=${out} ${in}
+   restat =1
+   
+rule __installer_archive
+   command = python3 ../../tools/create_installer_archive.py --staging_dir=gen/installer --resource_file_path=${out} ${in}
+   restat = 1
+
+rule rc
+   command = python3 ../../tools/rc.py --out=${out} --inputs=${in}
+   deps = msvc
+
+build obj/foo/base.dll: solink ../../base.dll
+build obj/bar/base.dll: solink ../../base.dll
+build gen/installer.list: __input_files obj/foo/base.dll obj/bar/base.dll
+build gen/installer/packed_files.rc: __installer_archive gen/installer.list
+build gen/installer/packed_files.res: rc gen/installer/packed_files.rc
+build all: phony gen/installer/packed_files.res
+
+build build.ninja: phony
+

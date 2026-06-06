@@ -1,0 +1,14 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule cxx
+  command = python3 ../../tools/clang.py -I../.. -o ${out} -MF ${depfile} -c ${in}
+  deps = gcc
+  depfile = ${out}.d
+
+build phony/base/base.inputs: phony ../../build/config/plugin_input.txt
+build phony/base/base.inputdeps: phony ../../build/config/header_is_ready
+
+build obj/base/base.o: cxx ../../base/base.cc | phony/base/base.inputs || phony/base/base.inputdeps
+

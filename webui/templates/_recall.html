@@ -1,0 +1,20 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "content"}}
+{{if .digest}}
+  <p>You can perform this recall with:</p>
+  <div class="code-block">
+    <pre id="recall-{{.stepID}}"><code>siso recall -project="{{.project}}" -reapi_instance="{{.reapiInstance}}" &lt;output_directory&gt; {{.digest}}</code></pre>
+    <clipboard-copy for="recall-{{.stepID}}">
+      <md-icon-button>
+        <md-icon>content_copy</md-icon>
+      </md-icon-button>
+    </clipboard-copy>
+  </div>
+  <p>Native recall in this webui is still TODO.</p>
+{{else}}
+  <p>This step has no digest, so it can't be recalled.</p>
+{{end}}
+{{end}}

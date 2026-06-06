@@ -1,0 +1,13 @@
+# Copyright 2025 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action0
+  command = python3 ../../tools/action.py --out-dir gen ../../test/input0
+
+rule action1
+  command = python3 ../../tools/action.py --out-dir gen ../../test/input1 ../../test/input2
+
+build gen/test/input0: action0 ../../test/input0
+build phony/test: phony gen/test/input0
+build gen/test/input1 gen/test/input2: action1 | phony/test ../../test/input1 ../../test/input2

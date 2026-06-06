@@ -1,0 +1,32 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule stamp
+  command = python3 ../../tools/stamp.py ${out}
+
+rule protoc
+  command = python3 ./protoc.py ${in}
+
+rule protoc_py
+  command = python3 ./protoc.py --python ${in}
+
+rule cxx
+  command = python3 ../../tools/clang.py -c ${in} -o ${out}
+
+rule genprotoc
+  command = python3 ../../tools/genprotoc.py
+
+build foo.o: cxx ../../foo/foo.cc | foo.stamp bar.stamp
+
+build foo.stamp: stamp gen/foo_pb.py
+build gen/foo_pb.py: protoc_py ../../foo/foo.proto | protoc.py
+
+build bar.stamp: stamp  gen/bar.pb.h gen/bar.pb.cc
+build gen/bar.pb.h gen/bar.pb.cc: protoc ../../bar/bar.proto | protoc.py
+
+build protoc.py: genprotoc
+
+build all: phony foo.o
+
+build build.ninja: phony

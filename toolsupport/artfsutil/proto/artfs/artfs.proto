@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+import "manifest/manifest.proto";
+
+package artfs;
+
+option go_package = "go.chromium.org/build/siso/toolsupport/artfsutil/proto/artfs";
+
+service Artfs {
+
+    // Stream a bunch of files that are backed by CAS to Artfs.
+    rpc AddCasFiles(stream manifest.FileManifest) returns (AddCasFilesReply) {}
+}
+
+message AddCasFilesReply {
+    // Total number of files added.  Should be equal to the number of files
+    // sent via the stream of FileManifests.
+    int64 total = 1;
+}

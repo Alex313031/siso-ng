@@ -1,0 +1,206 @@
+{
+  "connectors": null,
+  "exporters": {
+    "googlecloud": {
+      "destination_project_quota": false,
+      "impersonate": {
+        "delegates": null,
+        "subject": "",
+        "target_principal": ""
+      },
+      "log": {
+        "compression": "",
+        "default_log_name": "opentelemetry.io/collector-exported-log",
+        "endpoint": "",
+        "error_reporting_type": false,
+        "grpc_pool_size": 0,
+        "resource_filters": null,
+        "service_resource_labels": true,
+        "universe_domain": "",
+        "use_insecure": false
+      },
+      "metric": {
+        "compression": "",
+        "create_metric_descriptor_buffer_size": 10,
+        "create_service_timeseries": false,
+        "cumulative_normalization": true,
+        "endpoint": "",
+        "experimental_wal_config": null,
+        "grpc_pool_size": 0,
+        "instrumentation_library_labels": true,
+        "known_domains": [
+          "googleapis.com",
+          "kubernetes.io",
+          "istio.io",
+          "knative.dev"
+        ],
+        "prefix": "workload.googleapis.com/siso",
+        "resource_filters": null,
+        "service_resource_labels": true,
+        "skip_create_descriptor": false,
+        "sum_of_squared_deviation": false,
+        "universe_domain": "",
+        "use_insecure": false
+      },
+      "project": "test",
+      "sending_queue": {
+        "batch": null,
+        "block_on_overflow": false,
+        "num_consumers": 10,
+        "queue_size": 1000,
+        "sizer": {},
+        "storage": null,
+        "wait_for_result": false
+      },
+      "timeout": 12000000000,
+      "trace": {
+        "attribute_mappings": null,
+        "compression": "",
+        "endpoint": "",
+        "grpc_pool_size": 0,
+        "universe_domain": "",
+        "use_insecure": false
+      },
+      "user_agent": ""
+    }
+  },
+  "extensions": {
+    "healthcheckv2": {
+      "check_collector_pipeline": null,
+      "component_health": {
+        "include_permanent_errors": false,
+        "include_recoverable_errors": true,
+        "recovery_duration": 300000000000
+      },
+      "cors": null,
+      "endpoint": "localhost:13133",
+      "grpc": {
+        "endpoint": "localhost:13132",
+        "keepalive": {
+          "enforcement_policy": {},
+          "server_parameters": {}
+        },
+        "transport": "tcp"
+      },
+      "http": {
+        "config": {
+          "enabled": true,
+          "include_attributes": false,
+          "path": "/health/config"
+        },
+        "cors": null,
+        "endpoint": "localhost:13133",
+        "idle_timeout": 0,
+        "keep_alives_enabled": true,
+        "read_header_timeout": 0,
+        "status": {
+          "enabled": true,
+          "include_attributes": false,
+          "path": "/health/status"
+        },
+        "tls": null,
+        "transport": "tcp",
+        "write_timeout": 0
+      },
+      "idle_timeout": 0,
+      "keep_alives_enabled": true,
+      "path": "/",
+      "read_header_timeout": 0,
+      "response_body": null,
+      "tls": null,
+      "transport": "tcp",
+      "use_v2": true,
+      "write_timeout": 0
+    }
+  },
+  "processors": null,
+  "receivers": {
+    "otlp": {
+      "protocols": {
+        "grpc": {
+          "endpoint": "localhost:4317",
+          "keepalive": {
+            "enforcement_policy": {},
+            "server_parameters": {}
+          },
+          "read_buffer_size": 524288,
+          "transport": "tcp"
+        },
+        "http": null
+      }
+    }
+  },
+  "service": {
+    "extensions": [
+      "healthcheckv2"
+    ],
+    "pipelines": {
+      "logs": {
+        "exporters": [
+          "googlecloud"
+        ],
+        "processors": [],
+        "receivers": [
+          "otlp"
+        ]
+      },
+      "metrics": {
+        "exporters": [
+          "googlecloud"
+        ],
+        "processors": [],
+        "receivers": [
+          "otlp"
+        ]
+      },
+      "traces": {
+        "exporters": [
+          "googlecloud"
+        ],
+        "processors": [],
+        "receivers": [
+          "otlp"
+        ]
+      }
+    },
+    "telemetry": {
+      "logs": {
+        "encoding": "console",
+        "error_output_paths": [
+          "stderr"
+        ],
+        "level": "info",
+        "output_paths": [
+          "stderr"
+        ],
+        "sampling": {
+          "enabled": true,
+          "initial": 10,
+          "thereafter": 100,
+          "tick": 10000000000
+        }
+      },
+      "metrics": {
+        "level": "Normal",
+        "readers": [
+          {
+            "pull": {
+              "exporter": {
+                "prometheus": {
+                  "host": "localhost",
+                  "port": 15154,
+                  "without_scope_info": true,
+                  "without_type_suffix": true,
+                  "without_units": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "resource": {
+        "schema_url": "https://opentelemetry.io/schemas/1.40.0"
+      }
+    }
+  }
+}

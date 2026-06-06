@@ -1,0 +1,73 @@
+{{/* Copyright 2026 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "content"}}
+{{$outdirRel:=.outdirRel}}
+{{$outdirRevBaseURL:=.outdirRevBaseURL}}
+{{$currentURL:=.currentURL}}
+
+<aside id="page-sidebar">
+  <div>
+    <ul class="revs-timeline">
+      <li class="selected">
+        <a class="rev-label" href="#">
+          Live Build
+          <md-ripple></md-ripple>
+        </a>
+        <div class="rev-info">
+          Watching active build...
+        </div>
+      </li>
+    </ul>
+    <div class="step-views">
+      <h3 id="view-label">View</h3>
+      <input type="radio" id="view-active" name="view" value="active" checked>
+      <label for="view-active">Active Tasks<md-ripple></md-ripple></label>
+
+      <input type="radio" id="view-finished" name="view" value="finished">
+      <label for="view-finished">Finished Tasks<md-ripple></md-ripple></label>
+
+      <input type="radio" id="view-failed" name="view" value="failed">
+      <label for="view-failed">Failed Tasks<md-ripple></md-ripple></label>
+    </div>
+  </div>
+</aside>
+
+<div class="data-table-container">
+  {{if .watchErr}}
+    <div class="error-message" style="padding: 20px; color: var(--md-sys-color-error);">
+      {{.watchErr}}
+    </div>
+  {{end}}
+
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Duration</th>
+        <th scope="col">Status (Phase)</th>
+        <th scope="col">Command</th>
+      </tr>
+    </thead>
+    <tbody id="data-table-body">
+      {{if .activeSteps}}
+        {{range .activeSteps}}
+        <tr>
+          <td>{{.ID}}</td>
+          <td>{{.Dur}}</td>
+          <td>{{.Phase}}</td>
+          <td>{{.Desc}}</td>
+        </tr>
+        {{end}}
+      {{else}}
+        <tr>
+          <td colspan="4" style="text-align: center; padding: 20px;">
+            No active tasks found.
+          </td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

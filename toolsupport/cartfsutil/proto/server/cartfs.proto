@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package cartfs;
+
+import "proto/server/tap.proto";
+
+option go_package = "go.chromium.org/build/siso/toolsupport/cartfsutil/proto/server";
+
+service Cartfs {
+    // Copy a directory and its contents.
+    rpc CopyDirectory(CopyDirectoryRequest) returns (CopyDirectoryResponse) {}
+
+    // Get the audit log string for a given inode.
+    rpc AuditLog(AuditLogRequest) returns (AuditLogResponse) {}
+
+    // Get the current state of the cartfs instance.
+    rpc GetState(GetStateRequest) returns (GetStateResponse) {}
+
+    // Get the status of the local cas.
+    rpc LocalCASStatus(LocalCASStatusRequest) returns (LocalCASStatusResponse) {}
+
+    // Get the digest of a file.
+    rpc GetDigest(GetDigestRequest) returns (GetDigestResponse) {}
+
+    // Registers a set of files.  Used to register files locally that
+    // exist in the RBE CAS.
+    rpc RegisterFiles(RegisterFilesRequest) returns (RegisterFilesResponse) {}
+
+    // Starts a Tap session.  Part of the StartTapSessionRequest includes the
+    // process group id to watch.  Returns a stream of tap events as they occur.
+    rpc StartTapSession(StartTapSessionRequest) returns (stream TapEventBatch) {}
+
+    // Notifies CartFS that a tap session should be closed.  This usually means
+    // the process group has completed so there will be no more file system
+    // access from any process within that group.
+    // This will result in the stream of TapEventBatch messages from a
+    // StartTapSession to be closed after all remaining TapEventBatch messages
+    // have been sent.
+    rpc FinishTapSession(FinishTapSessionRequest) returns (FinishTapSessionResponse) {}
+
+    // Excludes a process group from having tap events created for it.
+    rpc ExcludeProcessGroupFromTaps(ExcludeProcessGroupFromTapsRequest) returns (ExcludeProcessGroupFromTapsResponse) {}
+}
+
+enum CartfsState {
+  STATE_UNSPECIFIED = 0;
+  STATE_STARTING_UP = 1;
+  STATE_RUNNING = 2;
+  STATE_SHUTTING_DOWN = 3;
+  STATE_ERROR = 4;
+}
+
+message CopyDirectoryResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message CopyDirectoryRequest {
+    string from_path = 1;
+    string to_path = 2;
+}
+
+message AuditLogRequest {
+    uint64 inode = 1;
+}
+
+message AuditLogResponse {
+    string message = 1;
+}
+
+message GetStateRequest {
+}
+
+message GetStateResponse {
+    CartfsState state = 1;
+    string mount_point = 2;
+}
+
+message LocalCASStatusRequest {
+}
+
+message LocalCASStatusResponse {
+    uint64 total_orphaned_files = 1;
+    uint64 total_orphaned_file_size = 2;
+}
+
+// Requests the digest of a file, either by the inode or the path.  If possible,
+// the inode is preferred as it is more efficient.
+message GetDigestRequest {
+    oneof identifier {
+        uint64 inode = 1;
+        string path = 2;
+    }
+}
+
+message GetDigestResponse {
+    string hash = 1;
+    uint64 size = 2;
+}
+
+// The urgency with which content should be pulled from the remote CAS.
+// IMMEDIATE: The content should be pulled as soon as possible.
+// QUEUED: The content should be pulled when there is capacity.
+// ON_ACCESS: The content should be pulled when it is accessed.
+enum ContentPullUrgency {
+  CONTENT_PULL_URGENCY_UNSPECIFIED = 0;
+  CONTENT_PULL_URGENCY_IMMEDIATE = 1;
+  CONTENT_PULL_URGENCY_QUEUED = 2;
+  CONTENT_PULL_URGENCY_ON_ACCESS = 3;
+}
+
+message FileRegistrationInfo {
+    // The full path of the file from the root of the cartfs mount.
+    string path = 1;
+    // The hash of the file.  Currently this is a sha256 hash.
+    string hash = 2;
+    // The size of the file in bytes.
+    uint64 size = 3;
+    // The urgency with which the content should be pulled from the remote CAS.
+    ContentPullUrgency urgency = 4;
+}
+
+message RegisterFilesRequest {
+    repeated FileRegistrationInfo registrations = 1;
+}
+
+message RegistrationError {
+    string path = 1;
+    string error_message = 2;
+}
+
+message RegisterFilesResponse {
+    repeated RegistrationError errors = 1;
+}

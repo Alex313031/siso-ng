@@ -1,0 +1,18 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action
+   command = python3 ../../tools/action.py --output=${out} ${in}
+   restat = 1
+
+rule action2
+   command = python3 ../../tools/action2.py --output="${out}" ${in}
+   restat = 1
+
+build foo.out foo.out2: action2 ../../base/foo.in
+build bar.out: action ../../base/bar.in foo.out foo.out2
+build all: phony bar.out
+
+build build.ninja: phony
+

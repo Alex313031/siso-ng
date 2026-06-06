@@ -1,0 +1,13 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule cc
+  command = python3 ../../tools/clang-cl.py /c ../../third_party/ffmpeg/m.c -I../../third_party/ffmpeg /FIcompat/msvcrt/snprintf.h /Foobj/third_party/ffmpeg/m.obj
+  deps = msvc
+
+build obj/third_party/ffmpeg/m.obj: cc ../../third_party/ffmpeg/m.c
+
+build all: phony obj/third_party/ffmpeg/m.obj
+
+build build.ninja: phony

@@ -1,0 +1,16 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule remote_action
+  command = python3 ../../tools/action.py ${in} ${out}
+
+rule local_action
+  command = python3 ../../tools/action.py ${in} ${out}
+
+build gen/remote/foo.out: remote_action ../../foo.in
+build gen/local/foo.out: local_action ../../foo.in
+
+build all: phony gen/remote/foo.out gen/local/foo.out
+
+build build.ninja: phony

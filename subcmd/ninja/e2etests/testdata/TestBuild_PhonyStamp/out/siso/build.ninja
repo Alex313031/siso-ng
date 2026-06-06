@@ -1,0 +1,20 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule stamp
+  command = python3 ../../tools/touch.py ${out}
+
+rule action
+  command = python3 ../../tools/action.py ${in} ${out}
+
+build obj/foo0.inputdeps.stamp: stamp ../../foo/0.input
+build obj/foo1.inputdeps.stamp: stamp ../../foo/1.input
+build obj/foo.inputdeps.stamp: phony obj/foo0.inputdeps.stamp obj/foo1.inputdeps.stamp
+build gen/asserts.car: action ../../foo/assert.in | obj/foo.inputdeps.stamp
+
+build all: phony gen/asserts.car
+
+build build.ninja: phony
+
+default all

@@ -1,0 +1,28 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule foo_mojom_parser
+  command = python3 ../../mojom_parser.py foo
+
+rule absl_status_mojom_parser
+  command = python3 ../../mojom_parser.py absl_status
+
+rule cp
+  command = python3 ../../cp.py ${in} ${out}
+
+build foo.mojom-module: foo_mojom_parser | ../../mojom_parser.py phony/base_parser
+
+build phony/base_parser: phony gen/absl_status.mojom-module
+
+build gen/absl_status.mojom-module: absl_status_mojom_parser | ../../mojom_parser.py phony/base__build_metadata
+
+build phony/base__build_metadata: phony gen/base.build_metadata
+
+build gen/base.build_metadata: cp ../../base.build_metadata
+
+build all: phony foo.mojom-module
+
+build build.ninja: phony
+
+

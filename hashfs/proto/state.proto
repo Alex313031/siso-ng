@@ -1,0 +1,61 @@
+// Copyright 2023 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+syntax = "proto3";
+
+package siso.hashfs;
+
+option go_package = "go.chromium.org/build/siso/hashfs/proto";
+
+message FileID {
+  int64 mod_time = 1;  // unix nano sec.
+}
+
+message Digest {
+  string hash = 1;
+  int64 size_bytes = 2;
+}
+
+message Entry {
+  FileID id = 1;
+  string name = 2;
+  Digest digest = 3;
+  bool is_executable = 4;
+
+  // target is symlink target.
+  string target = 5;
+
+  // action, cmd, edge (inputs/outputs paths) that generated this file.
+  bytes cmd_hash = 6;
+  bytes edge_hash = 9;
+  Digest action = 7;
+
+  int64 updated_time = 8; // unix nano sec.
+
+  bool local = 10; // local generated. not in RBE-CAS.
+}
+
+message BuildTargets {
+  repeated string targets = 1;
+}
+
+message State {
+  repeated Entry entries = 1;
+
+  // last checked token for fsmonitor (e.g. watchman)
+  string last_checked = 2;
+
+  // build targets that are used to update fs entries.
+  // only set when the build was succeeded.
+  // It is used to check no-op build.
+  // i.e. if all entries are clean and build_targets are the same,
+  // everything is up-to-date.
+  BuildTargets build_targets = 3;
+
+  // files that are used as outputs, but doesn't exist.
+  repeated string missing_outputs = 4;
+
+  // files that are used as inputs, but digest is still unknown.
+  repeated string missing_digests = 5;
+}

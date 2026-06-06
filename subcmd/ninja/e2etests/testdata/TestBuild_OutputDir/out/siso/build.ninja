@@ -1,0 +1,20 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule archive
+  command = python3 ../../tools/archive.py ${out} ${in}
+
+rule extract
+  command = python3 ../../tools/extract.py ${in} obj/frameworks/foo.framework
+
+rule copy_bundle_data
+  command = rm -rf ${out} && cp -a ${in} ${out}
+
+build obj/framework.zip: archive ../../framework/Foo.h ../../framework/Foo2.h
+build obj/frameworks/foo.framework/Foo.h obj/frameworks/foo.framework: extract obj/framework.zip
+build test.app/Frameworks/frameworks: copy_bundle_data obj/frameworks/foo.framework
+
+build all: phony test.app/Frameworks/frameworks
+
+build build.ninja: phony

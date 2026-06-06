@@ -1,0 +1,14 @@
+# Copyright 2025 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule codesign
+  command = python3 ../../tool/codesign.py ../../appex appex
+
+rule copy_bundle_data
+  command = rm -rf appex && cp -Rc ${in} ${out}
+
+build appex: codesign ../../appex/input
+build plugins/appex: copy_bundle_data appex
+build all: phony plugins/appex
+default all

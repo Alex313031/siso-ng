@@ -1,0 +1,22 @@
+# Copyright 2025 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule gcc
+   command = python3 ../../tools/deps-gcc.py -o ${out} -MF ${depfile} -c ${in}
+   deps = gcc
+   depfile = ${out}.d
+
+rule cl
+   command = python3 ../../tools/deps-msvc.py -o ${out} -c ${in}
+   deps = msvc
+
+rule action
+   command = python3 ../../tools/depfile.py -o ${out} -d ${depfile} -i ${in}
+   depfile = ${out}.d
+
+build foo.o: gcc ../../base/foo.cc || ../../tools/deps-gcc.py
+build foo.obj: cl ../../base/foo.cc || ../../tools/deps-msvc.py
+build foo.out: action ../../base/foo.cc || ../../tools/depfile.py
+
+build all: phony foo.o foo.obj foo.out

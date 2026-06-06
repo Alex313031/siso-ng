@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package cartfs;
+
+option go_package = "go.chromium.org/build/siso/toolsupport/cartfsutil/proto/server";
+
+message StartTapSessionRequest {
+  // The process group id to provide file tap events for.
+  int64 process_group_id = 1;
+}
+
+message FinishTapSessionRequest {
+  // The process group id to stop providing tap events for.  There should be
+  // one active TapEvent stream with a matching process_group_id when this
+  // is called.
+  int64 process_group_id = 1;
+}
+
+message FinishTapSessionResponse {
+  // Empty, but defined for possible future expansion.
+}
+
+message ExcludeProcessGroupFromTapsRequest {
+  // The process group id to exclude from tap events.
+  int64 process_group_id = 1;
+}
+
+message ExcludeProcessGroupFromTapsResponse {
+  // Empty, but defined for possible future expansion.
+}
+
+// TapEvent messages are based on the Tap Event design from ABFS (see
+// go/abfs-casfs-doc)
+enum TapEventType {
+  TAP_UNSPECIFIED = 0;
+  TAP_MKDIR = 1;
+  TAP_SYMLINK = 2;
+  TAP_LINK = 3;
+  TAP_UNLINK = 4;
+  TAP_RENAME = 5;
+  TAP_READDIR = 6;
+  TAP_OPEN_WRITE = 7;
+  TAP_OPEN_READ = 8;
+  TAP_OPEN_RDWR = 9;
+  TAP_CLOSE = 10;
+  TAP_SYMLINK_READ = 11;
+  TAP_STAT = 12;
+  TAP_ATTR_CHANGE = 13;
+}
+
+message TapEventBatch {
+  // A batch of TapEvents
+  repeated TapEvent tap_event = 1;
+}
+
+message TapEvent {
+  // The type of tap event.
+  TapEventType type = 1;
+
+  // The file path in the CartFS mount where the event happened.
+  string path = 2;
+
+  // An optional second path that the event is related to, valid for
+  // TAP_RENAME or TAP_LINK events.
+  // For TAP_RENAME and TAP_LINK, this is the source path.
+  string second_path = 3;
+
+  // Filemode field of the inode.
+  uint32 unix_file_mode = 4;
+
+  // Digest of the file (hash and size).  Hash will be sha256 for now, but
+  // but could be sha1 or others later.  If the digest isn't set, then the
+  // node is considered not snapshotted at this point.
+  string hash = 5;
+  uint64 size = 6;
+}

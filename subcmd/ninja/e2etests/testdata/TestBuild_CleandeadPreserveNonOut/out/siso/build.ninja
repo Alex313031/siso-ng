@@ -1,0 +1,17 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+#
+
+rule stamp
+  command = python3 ../../tools/touch.py ${out}
+
+rule noop
+  command = python3 ../../tools/noop.py
+
+build sdk/xcode_links/info.plist: noop
+build obj/copy.stamp: stamp sdk/xcode_links/info.plist
+
+build all: phony obj/copy.stamp
+
+build build.ninja: phony

@@ -1,0 +1,13 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule cxx
+   command = python3 ../../third_party/llvm-build/Release+Asserts/bin/clang-cl.py /showIncludes:user /TP ${in} /Fo${out}
+   deps = msvc
+
+build foo.o: cxx ../../base/foo.cc
+build all: phony foo.o
+
+build build.ninja: phony
+

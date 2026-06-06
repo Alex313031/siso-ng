@@ -1,0 +1,11 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule phony_out
+  command = python3 ../../nop.py
+  phony_output = true
+rule touch
+  command = python3 ../../touch.py ${out}
+build foo: phony_out
+build bar: touch foo

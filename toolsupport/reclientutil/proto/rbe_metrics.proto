@@ -1,0 +1,94 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// This is a subset of http://shortn/_cN8D8d0puv for the compatibility with
+// the existing Android's RBE metric pipeline/dashboards.
+
+syntax = "proto3";
+
+package reclient;
+option go_package = "go.chromium.org/build/siso/toolsupport/reclientutil/proto";
+
+// The full aggregated build stats and properties.
+message RbeBuildMetrics {
+  // Number of actions in the build.
+  int64 num_records = 1;
+
+  // Aggregated build stats.
+  repeated Stat stats = 2;
+
+  // Verification verification = 4;
+  // Siso doesn't provide verification information.
+  reserved 4;
+
+  // RBE tooling version.
+  string tool_version = 5;
+
+  // Unique invocation IDs of the aggregated actions.
+  repeated string invocation_ids = 6;
+
+  // Information about the build machine.
+  MachineInfo machine_info = 7;
+
+  // repeated ProxyInfo proxy_info = 9;
+  // Siso doesn't provide reproxy information.
+  reserved 9;
+
+  // The number of cache hits divided by the number of actions. 0 if there are
+  // no actions.
+  double build_cache_hit_ratio = 10;
+
+  // Total seconds between start of first build action and end of last build
+  // action. 0 if there are no actions.
+  double build_latency = 11;
+
+  // Whether FATAL log files were found in the log directory when reproxy was
+  // shutdown by bootstrap.
+  // bool fatal_exit = 12;
+  // Siso doesn't have this failure mode.
+  reserved 12;
+
+  reserved 3, 8;
+}
+
+message Stat {
+  // The metric/stat name.
+  string name = 1;
+
+  // The number of all the true values for booleans, the sum of all the
+  // values for ints.
+  int64 count = 2;
+
+  message Value {
+    string name = 1;
+    int64 count = 2;
+  }
+
+  // For enum stats, the count of each value.
+  repeated Value counts_by_value = 3;
+
+  // A list of commands that have the highest values.
+  // repeated Outlier outliers = 4;
+  // int64 median = 5;
+  // int64 percentile75 = 6;
+  // int64 percentile85 = 7;
+  // int64 percentile95 = 8;
+  // double average = 9;
+  // Siso provides only count stats for now.
+  reserved 4, 5, 6, 7, 8, 9;
+}
+
+message MachineInfo {
+  // Number of CPU cores that the machine has.
+  int64 num_cpu = 1;
+
+  // Amount of RAM that the machine has in megabytes.
+  int64 ram_mbs = 2;
+
+  // Type of operating system of the build machine.
+  string os_family = 3;
+
+  // The architecture of the machine's CPU.
+  string arch = 4;
+}
