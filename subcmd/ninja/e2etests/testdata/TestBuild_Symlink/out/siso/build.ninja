@@ -1,0 +1,17 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule action
+   command = python3 ../../tools/action.py ${out}
+
+rule symlink
+   command = python3 ../../tools/symlink.py ${in} ${out}
+   restat = 1
+
+build out1: action | ../../tools/action.py
+build out2: symlink out1 | ../../tools/symlink.py
+build all: phony out1 out2
+
+build build.ninja: phony
+

@@ -1,0 +1,105 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "base"}}
+{{$outroot:=.outroot}}
+{{$outdirRevBaseURL:=.outdirRevBaseURL}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Siso Web UI</title>
+  <script src="https://unpkg.com/htmx.org@2.0.0" integrity="sha512-Cpedvic0/Mgc3uRJ5apQ/ZYroPCZpatYEXGJayRaRNjKLaFualFxfxn97LJymznV+nC7y0/Hp/apHNwGpMimuw==" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" integrity="sha384-fw+eTlCc7suMV/1w/7fr2/PmwElUIt5i82bi+qTiLXvjRXZ2/FkiTNA/w0MhXnGI" crossorigin="anonymous"></script>
+  <script type="module" src="https://unpkg.com/@github/clipboard-copy-element@1.3.0/dist/bundle.js" integrity="sha512-CA8FL6M22IbBkRz2ISw1hUCXYP2BcJl/Blepvhc0DgBD9iftu4K0mqrTxdzRf346jmxqKKQvsE1NHUIjT/S7lw==" crossorigin="anonymous"></script>
+  <script type="module" src="https://unpkg.com/@github/relative-time-element@4.4.2/dist/bundle.js" integrity="sha512-ifMrdUvZ6TAfn25Mphz2etXTxuuZYjy+1BDcEO6u2XVM2GBrdnsCexdIfn1FOQVmO7lQYQeotN0xU3WGSuT14A==" crossorigin="anonymous"></script>
+  <script type="module" src="/third_party/@material/web/all.js"></script>
+  <script type="module">
+    import '/js/htmx-errors.js';
+    import {toggleDarkMode, openInPerfetto} from '/js/main.js';
+    window.toggleDarkMode = toggleDarkMode;
+    window.openInPerfetto = openInPerfetto;
+  </script>
+  {{/* Styles. */}}
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200">
+  <link rel="stylesheet" href="{{.combinedCSSPath}}">
+</head>
+<body class="light"
+  hx-ext="ext-md-filter-chip-as-checkbox"
+  {{/* Use HTMX's boost so even normal links and forms are intercepted and feel like AJAX requests. */}}
+  hx-boost="true"
+  {{/* Tell HTMX by default to use this element as a progress indicator. (It will attach the class "htmx-request" when active.) */}}
+  hx-indicator="#progress-indicator"
+  {{/* Always swap the #page-view section by default, i.e. don't swap the header and navbar by default. */}}
+  hx-select="#page-view" hx-target="#page-view"
+  {{/* The #page-view section is underneath the header but don't scroll away the header on page navigations. */}}
+  hx-swap="show:unset">
+  <md-linear-progress id="progress-indicator" indeterminate></md-linear-progress>
+  <div id="page">
+    <header class="header">
+      <div class="header-title">
+        <h1>sisoweb</h1>
+        <p class="subtitle">{{.versionID}}</p>
+        <div class="breadcrumbs">
+          <div class="breadcrumb">
+            <md-text-button id="outdir-menu-button" class="breadcrumb-menu-button" trailing-icon
+                onclick="document.getElementById('outdir-menu').open = !document.getElementById('outdir-menu').open">
+              {{if .outdirAbbrev}}
+                {{.outdirAbbrev}}
+              {{else if .viewingUploaded}}
+                <em>uploaded</em>
+              {{else}}
+                <em>unknown</em>
+              {{end}}
+              <md-icon slot="icon"></md-icon>
+            </md-text-button>
+            <md-menu id="outdir-menu" anchor="outdir-menu-button" positioning="popover">
+              {{range $outsubs := .outsubs}}
+              <md-menu-item href="/{{$outroot}}/{{pathEscape $outsubs}}/">
+                <div slot="headline">{{$outsubs}}</div>
+              </md-menu-item>
+              {{end}}
+            </md-menu>
+          </div>
+          <md-icon-button href="{{.outdirBaseURL}}/reload">
+            <md-icon>refresh</md-icon>
+          </md-icon-button>
+        </div>
+      </div>
+      <div class="header-controls">
+        <md-icon-button class="toggle-dark-mode" onclick="toggleDarkMode()">
+          <md-icon></md-icon>
+        </md-icon-button>
+      </div>
+    </header>
+    <nav id="page-tabs" hx-push-url="true" hx-swap-oob="true">
+      {{/* TODO: maybe we need some sort of "route generator" functions, because this is brittle. */}}
+      <a href="{{.outdirBaseURL}}/runbuild/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/runbuild/" .outdirBaseURL)}}selected{{end}}">
+        <md-icon>build</md-icon><md-ripple></md-ripple>
+        <span>Run Build</span>
+      </a>
+      <a href="{{.outdirRevBaseURL}}/steps/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/builds/%s/steps/" .outdirBaseURL .currentRev)}}selected{{end}}">
+        <md-icon>footprint</md-icon><md-ripple></md-ripple>
+        <span>Build Steps</span>
+      </a>
+      <a href="{{.outdirRevBaseURL}}/aggregates/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/builds/%s/aggregates/" .outdirBaseURL .currentRev)}}selected{{end}}">
+        <md-icon>calculate</md-icon><md-ripple></md-ripple>
+        <span>Aggregates</span>
+      </a>
+      <a href="{{.outdirRevBaseURL}}/logs/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/builds/%s/logs/" .outdirBaseURL .currentRev)}}selected{{end}}">
+        <md-icon>description</md-icon><md-ripple></md-ripple>
+        <span>Raw Logs</span>
+      </a>
+      <a href="{{.outdirBaseURL}}/targets/" class="page-tab {{if urlPathHasPrefix .currentURL (printf "%s/targets/" .outdirBaseURL)}}selected{{end}}">
+        <md-icon>target</md-icon><md-ripple></md-ripple>
+        <span>Targets</span>
+      </a>
+    </nav>
+    <div id="page-view">
+      <div id="page-content" class="content">{{template "content" .}}</div>
+    </div>
+  </div>
+</body>
+</html>
+{{end}}

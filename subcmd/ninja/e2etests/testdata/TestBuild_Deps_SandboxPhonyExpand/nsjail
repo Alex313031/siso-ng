@@ -1,0 +1,18 @@
+#!/bin/sh
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# it is invoked as
+# ../../nsjail -C $nsjail_workdir/nsjail.$sandboxid/nsjail.config
+# so leave nsjail.config in . to inspect the sandbox settings in test.
+# This is used for `./toybox touch $out.d $out` where out is `a.cc`,
+# so generate `a.cc` and `a.cc.d`
+
+outdir=$(sed -ne 's|.*src: "\(.*nsjail_workdir.*/src/out/siso\)".*|\1|p' $2)
+cp $2 nsjail.config
+# toybox
+echo "// generated a.cc" > "${outdir}/a.cc"
+echo "a.cc: ../../in ../../in.1" > "${outdir}/a.cc.d"
+exit 0
+

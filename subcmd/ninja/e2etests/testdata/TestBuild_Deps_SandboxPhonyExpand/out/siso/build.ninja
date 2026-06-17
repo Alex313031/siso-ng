@@ -1,0 +1,13 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule myrule
+    command = ../../toybox touch $out.d $out
+    deps = gcc
+    depfile = $out.d
+
+build toybox_phony: phony ../../toybox
+build toybox_inputs_deps: phony ../../in.1 ../../in.2
+
+build a.cc: myrule toybox_phony ../../in || toybox_inputs_deps

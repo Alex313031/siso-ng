@@ -1,0 +1,64 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This is collector config for siso.
+# See https://opentelemetry.io/docs/collector/configuration/ for more details.
+#
+# The health-check and internal-metrics listen addresses default to fixed ports
+# but can be overridden via environment variables so that multiple collectors
+# (e.g. parallel e2e tests) can run on one host without port collisions.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+exporters:
+  googlecloud:
+    # project is set in "siso collector"
+    log:
+      default_log_name: opentelemetry.io/collector-exported-log
+    metric:
+      prefix: workload.googleapis.com/siso
+service:
+  extensions: [healthcheckv2]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: "localhost"
+                port: ${env:SISO_COLLECTOR_METRICS_PORT:-15154}
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: []
+      exporters: [googlecloud]
+    metrics:
+      receivers: [otlp]
+      processors: []
+      exporters: [googlecloud]
+    logs:
+      receivers: [otlp]
+      processors: []
+      exporters: [googlecloud]
+extensions:
+  # Docs for healthcheckv2 extension:
+  # https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/extension/healthcheckv2extension/README.md#v2
+  healthcheckv2:
+    use_v2: true
+    component_health:
+      include_permanent_errors: false
+      include_recoverable_errors: true
+      recovery_duration: 5m
+    http:
+      endpoint: "${env:SISO_COLLECTOR_HEALTH_ENDPOINT:-localhost:13133}"
+      status:
+        enabled: true
+        path: "/health/status"
+      config:
+        enabled: true
+        path: "/health/config"
+    grpc:
+      endpoint: "${env:SISO_COLLECTOR_HEALTH_GRPC_ENDPOINT:-localhost:13132}"
+      transport: "tcp"

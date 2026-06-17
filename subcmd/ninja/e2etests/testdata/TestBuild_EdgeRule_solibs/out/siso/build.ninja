@@ -1,0 +1,21 @@
+# Copyright 2024 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# test to make sure it computes inputs (esp solibs) even if
+# link step was skipped in incremental build.
+
+rule link
+  command = python3 ../../tools/link.py ${in} -o ${out}
+
+rule protoc_rule
+  command = python3 ../../protobuf/protoc_wrapper.py ./protoc ${in} ${out}
+
+build protoc: link ../../protobuf/protoc.in
+  solibs = libc++.so
+
+build gen/foo.pb.cc gen/foo.pb.h: protoc_rule ../../protobuf/foo.proto | ../../protobuf/protoc_wrapper.py protoc
+
+build all: phony gen/foo.pb.cc gen/foo.pb.h
+
+build build.ninja: phony

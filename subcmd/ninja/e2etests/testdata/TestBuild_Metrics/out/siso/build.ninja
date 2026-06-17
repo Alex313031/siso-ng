@@ -1,0 +1,9 @@
+rule stamp
+  command = python3 -c "import time; import sys; time.sleep(0.1); open(sys.argv[1], 'w').close()" ${out}
+
+rule remote_action
+  command = python3 -c "import time; import sys; time.sleep(0.1); open(sys.argv[1], 'w').close()" ${out}
+
+build local: stamp
+build remote: remote_action
+build all: phony local remote

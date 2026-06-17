@@ -1,0 +1,53 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+syntax = "proto3";
+
+package siso.execute;
+
+import "google/protobuf/any.proto";
+
+option go_package = "go.chromium.org/build/siso/execute/proto";
+
+// SpawnMessage is one framed message on the spawn helper's control socket. Each
+// message is written length-delimited (a varint byte-length prefix followed by
+// the serialized message, like protobuf-java's writeDelimitedTo) and
+// demultiplexed by id, so many concurrent actions share one socketpair.
+message SpawnMessage {
+  uint64 id = 1;
+  oneof payload {
+    SpawnRequest start = 2;  // client -> helper: command to fork+exec
+    SpawnCancel cancel = 3;  // client -> helper: cancel the action with this id
+    SpawnResult result = 4;  // helper -> client: the finished action's result
+    SpawnError error = 5;    // helper -> client: the action could not be run
+  }
+}
+
+// SpawnRequest is the command the helper should fork+exec. args/env are proto3
+// strings like in REAPI. We accept that non-UTF-8 argv/env are not preserved
+// verbatim.
+message SpawnRequest {
+  string id = 1;
+  repeated string args = 2;
+  repeated string env = 3;
+  string workspace_root = 4;
+  string work_dir = 5;
+  optional int32 oom_score_adj = 6;
+}
+
+// SpawnCancel cancels the in-flight action; its id is carried by the enclosing
+// SpawnMessage, so the message itself is empty.
+message SpawnCancel {}
+
+// SpawnResult carries the finished action's result: a
+// build.bazel.remote.execution.v2.ActionResult wrapped in an Any.
+message SpawnResult {
+  google.protobuf.Any action_result = 1;
+}
+
+// SpawnError reports that the action could not be run at all (distinct from the
+// action running and exiting non-zero, which comes back as a SpawnResult).
+message SpawnError {
+  string message = 1;
+}

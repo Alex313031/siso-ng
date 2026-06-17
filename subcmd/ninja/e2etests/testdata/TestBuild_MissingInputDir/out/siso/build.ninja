@@ -1,0 +1,12 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# should not fail remotely due to missing ../../foo/deps/include
+# (actually storing entry would fail because ../../foo/DEPS exists.)
+rule cxx
+    command = ../../clang -MM -MF $out.d -I../../foo/deps/include -c $in -o $out
+    deps = gcc
+    depfile = $out.d
+
+build obj/foo/foo.o: cxx ../../foo/foo.c

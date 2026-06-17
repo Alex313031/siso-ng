@@ -1,0 +1,16 @@
+# Copyright 2023 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule stamp
+  command = python3 ../../tools/stamp.py ${out}
+
+build gen/bar.stamp: stamp
+
+# gen/foo.txt is dependency cycle, so should trigger schedule error
+# otherwise, gen/bar.stamp can trigger this action, and succeeds.
+build gen/foo.txt: stamp gen/foo.txt gen/bar.stamp
+
+build all: phony gen/foo.txt
+
+build build.ninja: phony
