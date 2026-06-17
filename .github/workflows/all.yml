@@ -18,16 +18,16 @@ on:
 
 jobs:
   linux:
-    name: Linux amd64
+    name: Linux
     if: ${{ inputs.linux }}
     uses: ./.github/workflows/build-linux.yml
 
   windows:
-    name: Windows 32/64 Bit
+    name: Windows
     if: ${{ inputs.windows }}
     uses: ./.github/workflows/build-win.yml
 
   macos:
-    name: MacOS x64/ARM64
+    name: MacOS
     if: ${{ inputs.macos }}
     uses: ./.github/workflows/build-mac.yml
