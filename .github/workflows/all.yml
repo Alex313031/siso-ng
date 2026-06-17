@@ -1,0 +1,17 @@
+name: Build Siso-ng (All Platforms)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux amd64
+    uses: ./.github/workflows/build-linux.yml
+
+  windows:
+    name: Windows 32/64 Bit
+    uses: ./.github/workflows/build-win.yml
+
+  macos:
+    name: MacOS x64/ARM64
+    uses: ./.github/workflows/build-mac.yml

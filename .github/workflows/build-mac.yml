@@ -1,4 +1,4 @@
-name: Build Siso-ng for Windows
+name: Build Siso-ng for MacOS
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    name: Build Win32 & Win64
+    name: Build macOS x64 & arm64
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -18,12 +18,12 @@ jobs:
         with:
           go-version: '1.26.3'
 
-      - name: Cross-compile siso-ng.exe
-        run: ./build.sh -w
+      - name: Cross-compile siso-ng for macOS
+        run: ./build.sh --mac
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: siso-ng_win
-          path: release/siso-ng_win_*.zip
+          name: siso-ng_macos
+          path: release/siso-ng_macos_*.zip
           if-no-files-found: error
