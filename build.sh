@@ -20,7 +20,7 @@ die()  { yell "${RED}$* ${c0}"; exit 1; }
 try() { "$@" || die "${RED}Failed $*"; }
 
 SCRIPTNAME=$(basename "$0")
-SCRIPTVER="1.1.0"
+SCRIPTVER="1.1.1"
 
 export HERE=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
@@ -44,6 +44,13 @@ GoBuild() {
   local bin_base
   bin_base=$(basename "${binpath}")
 
+  if [ "$target_arch" == "386" ]; then
+    zipname+="_x86"
+  elif [ "$target_arch" == "amd64" ]; then
+    zipname+="_x64"
+  elif [ "$target_arch" == "arm64" ]; then
+    zipname+="_arm64"
+  fi
   export GOOS="${target_os}"
   export GOARCH="${target_arch}"
   if [ "$WANT_DEBUG" == "1" ]; then
@@ -68,21 +75,30 @@ BuildSiso() {
 
   mkdir -pv "${RELDIR}"
 
-  local target_arch="amd64"
+  local target_arch=""
   printf "${GRE}Starting Siso-ng build.${c0}\n"
 
   if [ "$WANT_TARGET" == "linux" ] || [ "$WANT_TARGET" == "all" ]; then
-    printf "${CYA}Building Siso-ng for Linux... ${c0}\n"
+    printf "${CYA}Building Siso-ng for Linux x64... ${c0}\n"
+    target_arch="amd64"
     GoBuild "${target_arch}" "linux" "${RELDIR}/${bin_base}" "siso-ng_linux"
     printf "${CYA}Linux build completed. ${c0}\n"
   fi
   if [ "$WANT_TARGET" == "win" ] || [ "$WANT_TARGET" == "all" ]; then
-    printf "${CYA}Building Siso-ng for Windows... ${c0}\n"
+    printf "${CYA}Building Siso-ng for Windows 64 Bit... ${c0}\n"
+    target_arch="amd64"
+    GoBuild "${target_arch}" "windows" "${RELDIR}/${bin_base}.exe" "siso-ng_win"
+    printf "${CYA}Building Siso-ng for Windows 32 Bit... ${c0}\n"
+    target_arch="386"
     GoBuild "${target_arch}" "windows" "${RELDIR}/${bin_base}.exe" "siso-ng_win"
     printf "${CYA}Windows build completed. ${c0}\n"
   fi
   if [ "$WANT_TARGET" == "mac" ] || [ "$WANT_TARGET" == "all" ]; then
-    printf "${CYA}Building Siso-ng for MacOS... ${c0}\n"
+    printf "${CYA}Building Siso-ng for MacOS arm64... ${c0}\n"
+    target_arch="arm64"
+    GoBuild "${target_arch}" "darwin" "${RELDIR}/${bin_base}" "siso-ng_macos"
+    printf "${CYA}Building Siso-ng for MacOS x64... ${c0}\n"
+    target_arch="amd64"
     GoBuild "${target_arch}" "darwin" "${RELDIR}/${bin_base}" "siso-ng_macos"
     printf "${CYA}MacOS build completed. ${c0}\n"
   fi
