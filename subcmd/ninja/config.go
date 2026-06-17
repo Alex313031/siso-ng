@@ -30,6 +30,7 @@ import (
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
 	"go.chromium.org/build/siso/reapi"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/sync/lockfile"
 	"go.chromium.org/build/siso/toolsupport/watchmanutil"
 	"go.chromium.org/build/siso/ui"
@@ -201,7 +202,7 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 	flagSet.IntVar(&c.failuresAllowed, "k", 1, "keep going until N jobs fail (0 means inifinity)")
 	flagSet.StringVar(&c.actionSalt, "action_salt", "", "action salt")
 
-	flagSet.IntVar(&c.ninjaJobs, "j", -1, "not supported. use -remote_jobs and -local_jobs instead")
+	flagSet.IntVar(&c.ninjaJobs, "j", 0, "Deprecated. use -remote_jobs and -local_jobs instead")
 	flagSet.IntVar(&c.ninjaLoadLimit, "l", -1, "not supported.")
 	flagSet.IntVar(&c.localJobs, "local_jobs", 0, "run N local jobs in parallel. when the value is no positive, the default will be computed based on # of CPUs.")
 	flagSet.IntVar(&c.remoteJobs, "remote_jobs", 0, "run N remote jobs in parallel. when the value is no positive, the default will be computed based on # of CPUs.")
@@ -368,7 +369,7 @@ func (c *Command) resolveFlags() error {
 	}
 
 	if c.ninjaJobs >= 0 {
-		ui.Default.Warningf("-j is not supported. use -remote_jobs and -local_jobs instead\n")
+		ui.Default.Warningf("-j is deprecated. use -remote_jobs and/or -local_jobs instead\n")
 	}
 	if c.ninjaLoadLimit >= 0 {
 		ui.Default.Warningf("-l is not supported.\n")
@@ -390,7 +391,11 @@ func (c *Command) resolveFlags() error {
 }
 
 func (c *Command) enableOfflineMode(ctx context.Context) {
-	ui.Default.Warningf("%s", ui.SGR(ui.Red, "offline mode\n"))
+	if alex313031.IsNG() {
+		ui.Default.Infof(ui.SGR(ui.Reset, "Offline mode\n"))
+	} else {
+		ui.Default.Warningf(ui.SGR(ui.Red, "offline mode\n"))
+	}
 	clog.Warningf(ctx, "offline mode")
 	c.reopt = new(reapi.Option)
 	c.reopt.Insecure = true

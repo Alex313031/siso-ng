@@ -35,6 +35,7 @@ import (
 	"go.chromium.org/build/siso/o11y/trace"
 	"go.chromium.org/build/siso/reapi"
 	"go.chromium.org/build/siso/signals"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/toolsupport/cartfsutil"
 	"go.chromium.org/build/siso/toolsupport/cogutil"
 	"go.chromium.org/build/siso/toolsupport/soongutil"
@@ -167,6 +168,14 @@ func (c *Command) setup(ctx context.Context) (buildPath *build.Path, doneLock fu
 	}
 	if c.offline {
 		c.enableOfflineMode(ctx)
+	} else {
+		if (alex313031.IsNG()) {
+			ui.Default.Infof(ui.SGR(ui.Bold, "Online Mode\n"))
+		}
+	}
+
+	if (alex313031.IsNG()) {
+		ui.Default.Infof(ui.SGR(ui.Blue, "\"NG\" build config\n"))
 	}
 
 	buildPath, err = c.changeToWorkdir(ctx)
@@ -202,16 +211,26 @@ func (c *Command) setup(ctx context.Context) (buildPath *build.Path, doneLock fu
 	return buildPath, doneLock, resetCrashOutput, nil
 }
 
+var is_local_compile bool = false
 func (c *Command) computeLimits(ctx context.Context) build.Limits {
 	// compute default limits based on fstype of work dir (e.g. artfs),
 	// not of workspace.
 	limits := build.DefaultLimits(ctx)
-	if c.localJobs > 0 {
-		limits.Local = c.localJobs
+	if c.localJobs > 0 || c.ninjaJobs > 0 {
+		if c.ninjaJobs > 0 {
+			limits.Local = c.ninjaJobs
+		} else {
+			limits.Local = c.localJobs
+		}
+		ui.Default.Infof("local_jobs = %d\n", limits.Local)
 	}
-	if c.remoteJobs > 0 {
+	if c.remoteJobs == 0 && limits.Remote == 0 {
+		is_local_compile = true
+	}
+	if c.remoteJobs > 0 && c.ninjaJobs == 0 {
 		limits.Remote = c.remoteJobs
 		limits.REWrap = c.remoteJobs
+		ui.Default.Infof("remote_jobs = %d\n", limits.Remote)
 	}
 	if !c.fastLocal && (limits.FastLocal != 0 || limits.StartLocal != 0) && (limits.Remote > 0 || limits.REWrap > 0) {
 		needWarn := true
@@ -239,6 +258,11 @@ func (c *Command) computeLimits(ctx context.Context) build.Limits {
 		limits.StartLocal = 0
 	}
 	c.checkResourceLimits(ctx, limits)
+	if is_local_compile {
+		if alex313031.IsNG() {
+			ui.Default.Infof(ui.SGR(ui.Reset, "is_local_compile = true\n"))
+		}
+	}
 	return limits
 }
 

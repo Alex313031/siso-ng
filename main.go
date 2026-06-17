@@ -25,6 +25,7 @@ import (
 	"github.com/google/subcommands"
 
 	"go.chromium.org/build/siso/auth/cred"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/subcmd/auth"
 	"go.chromium.org/build/siso/subcmd/collector"
 	"go.chromium.org/build/siso/subcmd/fetch"
@@ -62,7 +63,7 @@ var (
 )
 
 const versionID = "v1.5.19"
-const versionStr = "siso " + versionID
+var versionStr = alex313031.GetExecutableName() + " " + versionID
 
 func main() {
 	// Wraps sisoMain() because os.Exit() doesn't wait defers.
@@ -72,13 +73,25 @@ func main() {
 func sisoMain() int {
 	flag.CommandLine.Usage = func() {
 		w := flag.CommandLine.Output()
-		fmt.Fprint(w, `
+		fmt.Fprint(w, versionStr)
+		if alex313031.IsNG() {
+			fmt.Fprint(w, `
+
+Usage: siso-ng [flags] [command] [arguments]
+
+e.g.
+ $ siso-ng ninja -C out/Default
+
+`)
+		} else {
+			fmt.Fprint(w, `
 Usage: siso [flags] [command] [arguments]
 
 e.g.
  $ siso ninja -C out/Default
 
 `)
+		}
 		fmt.Fprintf(w, "important flags of %s:\n", os.Args[0])
 
 		f := flag.Lookup("credential_helper")
@@ -90,11 +103,19 @@ e.g.
 		fmt.Fprintf(w, `  -version
    %s
 `, f.Usage)
-		fmt.Fprintf(flag.CommandLine.Output(), `
+		if alex313031.IsNG() {
+			fmt.Fprintf(flag.CommandLine.Output(), `
+Use "siso-ng help" to display commands.
+Use "siso-ng help [command]" for more information about a command.
+Use "siso-ng flags" to display all flags.
+`)
+		} else {
+			fmt.Fprintf(flag.CommandLine.Output(), `
 Use "siso help" to display commands.
 Use "siso help [command]" for more information about a command.
 Use "siso flags" to display all flags.
 `)
+		}
 	}
 
 	flag.StringVar(&pprofAddr, "pprof_addr", "", `listen address for "go tool pprof". e.g. "localhost:6060"`)

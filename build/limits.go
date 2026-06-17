@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/ui"
 )
 
@@ -121,7 +122,12 @@ func DefaultLimits(ctx context.Context) Limits {
 				clog.Warningf(ctx, "unknown limits name %q", k)
 				continue
 			}
-			ui.Default.PrintLines(ui.SGR(ui.Yellow, fmt.Sprintf("use SISO_LIMITS=%s=%d\n", k, n)))
+			if (!alex313031.IsNG()) {
+				ui.Default.Infof(ui.SGR(ui.Yellow, fmt.Sprintf("Env variable SISO_LIMITS = %s=%d\n", k, n)))
+			}
+		}
+		if (alex313031.IsNG()) {
+			ui.Default.Infof("SISO_LIMITS = %s\n", overrides)
 		}
 	})
 	return defaultLimits
@@ -163,6 +169,9 @@ func limitForRemote(numCPU int) int {
 		}
 		// Apple Silicon has better scalability than Intel.
 		limit *= 8
+	}
+	if alex313031.IsNG() {
+		ui.Default.Infof("limitForRemote = %d\n", limit)
 	}
 	return limit
 }

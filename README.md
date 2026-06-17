@@ -1,6 +1,9 @@
-# Siso
+# Siso-ng
 
-Siso is a build tool that aims to significantly speed up Chromium and Android
+Siso-ng is a fork of [Chromium's Siso](https://chromium.googlesource.com/build/+/refs/heads/main/siso/README.md),
+with support for [Ninja's](https://ninja-build.org/) `-j` flag and logging enhancements.
+
+Siso is a build tool that aims to significantly speed up Chromium and Android's
 build.
 
 * It is a drop-in replacement for Ninja, which means it can be easily used
@@ -16,6 +19,10 @@ build.
 ## Where did the name "Siso" come from?
 
 Siso is named after shiso, a commonly-used herb in Japan. It's a reference to basil and the Bazel build system. Siso is an alternative romanization of shiso and more typeable than shiso (but still pronounced shiso). Considering how often we type the name of a build tool every day, we decided to optimize for that. ;)
+
+## Building
+
+See [Building](./docs/development.md#how-to-get-the-code).
 
 ## Documents
 
