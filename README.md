@@ -1,7 +1,9 @@
 # Siso-ng
 
 Siso-ng is a fork of [Chromium's Siso](https://chromium.googlesource.com/build/+/refs/heads/main/siso/README.md),
-with support for [Ninja's](https://ninja-build.org/) `-j` flag and logging enhancements.
+with support for [Ninja's](https://ninja-build.org/) `-j` flag and logging enhancements.  
+It also *supports Windows 7/8!* It uses [this fork of Go](https://github.com/thongtech/go-legacy-win7) to achieve this.  
+To use this fork, set the env variable `SISO_PATH` to point to the binary for your platform.
 
 Siso is a build tool that aims to significantly speed up Chromium and Android's
 build.
