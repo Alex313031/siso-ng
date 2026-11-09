@@ -15,7 +15,7 @@ jobs:
 
       - name: Set up Go (go-legacy-win7)
         env:
-          GO_LEGACY_VERSION: '1.26.4-1'
+          GO_LEGACY_VERSION: '1.27.3-1'
         run: |
           GO_TARBALL="go-legacy-win7-${GO_LEGACY_VERSION}.linux_amd64.tar.gz"
           GO_URL="https://github.com/thongtech/go-legacy-win7/releases/download/v${GO_LEGACY_VERSION}/${GO_TARBALL}"
@@ -24,6 +24,10 @@ jobs:
           rm -f "${GO_TARBALL}"
           echo "GOROOT=/usr/local/go-legacy-win7" >> "$GITHUB_ENV"
           echo "GOPATH=$HOME/go" >> "$GITHUB_ENV"
+          # Pin to the toolchain we just installed. Without this, a go directive
+          # in go.mod newer than GO_LEGACY_VERSION makes Go silently download the
+          # official toolchain, which would build a binary without win7 support.
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
           echo "/usr/local/go-legacy-win7/bin" >> "$GITHUB_PATH"
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
           /usr/local/go-legacy-win7/bin/go version
