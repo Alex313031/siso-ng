@@ -134,7 +134,7 @@ func DefaultLimits(ctx context.Context) Limits {
 				continue
 			}
 			if (!alex313031.IsNG()) {
-				ui.Default.Infof(ui.SGR(ui.Yellow, fmt.Sprintf("Env variable SISO_LIMITS = %s=%d\n", k, n)))
+				ui.Default.Infof("%s", ui.SGR(ui.Yellow, fmt.Sprintf("Env variable SISO_LIMITS = %s=%d\n", k, n)))
 			}
 		}
 		if (alex313031.IsNG()) {

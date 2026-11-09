@@ -176,12 +176,12 @@ func (c *Command) setup(ctx context.Context) (buildPath *build.Path, doneLock fu
 		c.enableOfflineMode(ctx)
 	} else {
 		if (alex313031.IsNG()) {
-			ui.Default.Infof(ui.SGR(ui.Bold, "Online Mode\n"))
+			ui.Default.Infof("%s", ui.SGR(ui.Bold, "Online Mode\n"))
 		}
 	}
 
 	if (alex313031.IsNG()) {
-		ui.Default.Infof(ui.SGR(ui.Blue, "\"NG\" build config\n"))
+		ui.Default.Infof("%s", ui.SGR(ui.Blue, "\"NG\" build config\n"))
 	}
 
 	buildPath, err = c.changeToWorkdir(ctx)
@@ -266,7 +266,7 @@ func (c *Command) computeLimits(ctx context.Context) build.Limits {
 	c.checkResourceLimits(ctx, limits)
 	if is_local_compile {
 		if alex313031.IsNG() {
-			ui.Default.Infof(ui.SGR(ui.Reset, "is_local_compile = true\n"))
+			ui.Default.Infof("%s", ui.SGR(ui.Reset, "is_local_compile = true\n"))
 		}
 	}
 	return limits

@@ -433,9 +433,9 @@ func (c *Command) resolveFlags() error {
 
 func (c *Command) enableOfflineMode(ctx context.Context) {
 	if alex313031.IsNG() {
-		ui.Default.Infof(ui.SGR(ui.Reset, "Offline mode\n"))
+		ui.Default.Infof("%s", ui.SGR(ui.Reset, "Offline mode\n"))
 	} else {
-		ui.Default.Warningf(ui.SGR(ui.Red, "offline mode\n"))
+		ui.Default.Warningf("%s", ui.SGR(ui.Red, "offline mode\n"))
 	}
 	clog.Warningf(ctx, "offline mode")
 	// Keep -reapi_digest_function across the reset: offline builds still
