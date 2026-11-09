@@ -12,11 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
 	pb "go.chromium.org/build/siso/hashfs/proto"
-	"go.chromium.org/build/siso/reapi/digest"
 )
 
 func TestBuild_InvalidatedFile(t *testing.T) {
@@ -71,12 +73,12 @@ func TestBuild_InvalidatedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load .siso_fs_state: %v", err)
 	}
-	stm := hashfs.StateMap(state)
+	stm := hashfs.StateMap(digest.SHA256, state)
 	var buf bytes.Buffer
 
 	// We don't need real now, just need a time newer than fi.ModTime().
 	now := fi.ModTime().Add(1 * time.Second)
-	d := digest.FromBytes("new-out", []byte("new input")).Digest()
+	d := blob.FromBytes(digest.SHA256, "new-out", []byte("new input")).Digest()
 	fname := filepath.ToSlash(filepath.Join(dir, "out/siso/out"))
 	cmdhash := stm[fname].GetCmdHash()
 	err = hashfs.JournalEntry(&buf, &pb.Entry{

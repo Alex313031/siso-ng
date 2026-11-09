@@ -18,3 +18,8 @@ func MemoryTotal() (uint64, error) {
 func OSVersion() (string, error) {
 	return osVersion()
 }
+
+// CPUCores returns the number of physical and logical CPU cores on the machine.
+func CPUCores() (int, int, error) {
+	return cpuCores()
+}

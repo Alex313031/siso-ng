@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	pb "google.golang.org/genproto/googleapis/bytestream"
+	"google.golang.org/grpc"
 
 	"go.chromium.org/build/siso/o11y/clog"
 )
@@ -24,7 +25,7 @@ func Exists(ctx context.Context, c pb.ByteStreamClient, resourceName string) err
 	rd, err := c.Read(ctx, &pb.ReadRequest{
 		ResourceName: resourceName,
 		ReadLimit:    1,
-	})
+	}, grpc.StaticMethod())
 	if err != nil {
 		return err
 	}
@@ -37,7 +38,7 @@ func Exists(ctx context.Context, c pb.ByteStreamClient, resourceName string) err
 func Open(ctx context.Context, c pb.ByteStreamClient, resourceName string) (*Reader, error) {
 	rd, err := c.Read(ctx, &pb.ReadRequest{
 		ResourceName: resourceName,
-	})
+	}, grpc.StaticMethod())
 	if err != nil {
 		return nil, err
 	}
@@ -84,14 +85,14 @@ func (r *Reader) Size() int64 {
 }
 
 // Create creates a writer on the bytestream for resourceName.
-// ctx will be used until the rriter is closed.
+// ctx will be used until the writer is closed.
 func Create(ctx context.Context, c pb.ByteStreamClient, resourceName, name string) (*Writer, error) {
 	sizeStr := path.Base(resourceName)
 	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("bad size in resource name %q: %v", resourceName, err)
 	}
-	wr, err := c.Write(ctx)
+	wr, err := c.Write(ctx, grpc.StaticMethod())
 	if err != nil {
 		return nil, err
 	}

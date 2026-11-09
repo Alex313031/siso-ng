@@ -129,9 +129,17 @@ to register handlers and step configs.
      * value: dict of a filegroup generator
        * "type" specifies filegroup generator type.
          * "glob":
-           * glob match from the dir specified by the label.
-           * "includes": path patterns to include the glob
-           * "excludes": path patterns to exclude the glob
+           * Recursively traverses files under the target directory using
+             [glob patterns](#glob-pattern). Directories themselves are not
+             included in the result.
+           * "dir": (optional) root directory to search. If omitted, defaults
+             to the directory part before `:` in the filegroup label key.
+           * "includes": list of [glob patterns](#glob-pattern) to include
+             in the glob. e.g. `["*"]` to include all files recursively.
+           * "excludes": (optional) list of [glob patterns](#glob-pattern)
+             to exclude from the glob.
+           * A file is included if it matches at least one pattern in
+             `includes` and does not match any pattern in `excludes`.
          * TODO(b/266759797): add other type, like "filelist".
    * `handlers` dict
      * key: handler name
@@ -186,13 +194,19 @@ to register handlers and step configs.
           * "unsupported-macro": use clang scandeps when unsupported macro detected.
           * "scandeps-err": use clang scandeps when builtin scandeps failed.
         * `step_inputs`: [path_filter](#path_filter) specify what inputs from the ninja graph are used in addition to tool_inputs, scandeps results.
-     * `bad_deps`
-       * key: output target known to have bad deps
+     * `missing_deps`
+       * key: output target known to have missing deps
        * value: annotation (usually bug link)
      * `executables`
        * (Windows only) a list of filenames for executables.
          This is used to send Linux executables from Windows machine.
          e.g. node binary for typescript action.
+     * `env`
+       * `inherits`: a list of environment variable names to inherit from Siso's environment for local actions. Mutually exclusive with `excludes`.
+       * `excludes`: a list of environment variable names to not pass to step commands when inheriting Siso's environment for local actions. Mutually exclusive with `inherits`.
+       * `cache_key_omits`: a list of environment variable names that are passed to step commands, but not included in cache keys (e.g. two-phase caching).
+       * `cache_key_substitutions`: a dict mapping strings to replacement values when normalizing environment variable values for cache keys (e.g. `{"/path/to/workspace": "CWD"}`).
+       * `cache_key_trim_prefixes`: a list of prefixes to strip from normalized environment variable values (when the value does not contain a path list separator) for cache keys (e.g. `["CWD/"]`).
      * `rules` list of `StepRule`.
         path is workspace relative, or ninja dir relative if it starts with "./"
         * identifier
@@ -230,6 +244,7 @@ to register handlers and step configs.
              mtime is not changed (same as ninja's restat).
           * `restat_content`: true if step cmd considers output is clean if
              content is not changed (like ninja's restat, but not use mtime).
+             false to disable it.
           * `platform_ref`: reference to platform properties
           * `platform`: additional platform properties
           * `remote`: use remote exec or not
@@ -262,6 +277,8 @@ to register handlers and step configs.
           * `ignore_extra_output_pattern`: regexp to allow if it is generated,
              but not listed in outputs.
           * `impure`: mark it as not pure. i.e. not check inputs/outputs
+          * `sandbox_disabled`: disable sandbox.
+          * `cache_disabled`: disable cache.
           * `replace`: if any output of this step is used in other steps,
              those steps will use the inputs of this step as inputs
              instead of the outputs of this step.
@@ -275,6 +292,10 @@ to register handlers and step configs.
 ### path_filter
 
 path_filter is used for `scandeps.step_inputs` and `indirect_inputs`.
+
+ * `patterns`: A list of [glob patterns](#glob-pattern).
+    If pattern starts with '!', handle it as excludes. otherwise incldues.
+    If `patterns` is set, it will ignore `excludes` and `includes`.
 
  * `excludes`: A list of [glob patterns](#glob-pattern).
    Any input path that matches a pattern
@@ -291,9 +312,22 @@ in`includes` (and is not excluded by `excludes`).
 
 ### glob pattern
 
- * If a pattern contains `/`, it is matched against the full path of an input.
- * Otherwise, the pattern is matched against the basename of the input's path.
- * The matching logic is equivalent to Go's [path.Match](https://pkg.go.dev/path#Match).
+Glob patterns are used in `filegroups` and `path_filter`.
+The matching logic is based on Go's
+[path.Match](https://pkg.go.dev/path#Match).
+
+ * If a pattern contains `/` (e.g. `"sub/*.h"`), it is matched against the
+   full or relative path of an input. Note that `*` in `path.Match` does not
+   cross path separators (`/`).
+ * Otherwise (if the pattern contains no `/`, e.g. `"*.h"`), the pattern is
+   matched against the basename of the input's path, matching files at any
+   directory depth. For example, `["*"]` matches all files under the directory
+   recursively in `filegroups`.
+ * In `path_filter` (or `patterns` list):
+   * If a pattern starts with `!`, it works as an exclude pattern.
+   * If a pattern ends with `/**` (e.g. `"dir/**"`), it is matched against the
+     directory prefix (matching any files under the directory). Note that `**`
+     glob is only supported in `path_filter` and does not work in `filegroups`.
 
 ## per-step config
 
@@ -394,6 +428,9 @@ provide `runtime`.
 ### [@builtin//struct.star](../build/buildconfig/struct.star)
 provide [`struct`](https://pkg.go.dev/go.starlark.net/starlarkstruct#Struct)
 and [`module`](https://pkg.go.dev/go.starlark.net/starlarkstruct#Module)
+
+### [@builtin//time.star](../build/buildconfig/time.star)
+provides [`time`](https://pkg.go.dev/go.starlark.net/lib/time).
 
 ### @config
 

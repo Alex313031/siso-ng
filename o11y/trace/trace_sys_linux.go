@@ -98,7 +98,7 @@ func (s *sysRecord) sample(ctx context.Context, pid int64, t time.Time) []Event 
 	return []Event{
 		{
 			Ph:   "C",
-			T:    t.Sub(s.start).Microseconds(),
+			T:    Micros(t.Sub(s.start)),
 			Pid:  pid,
 			Tid:  sysTid,
 			Name: "pressure",

@@ -39,10 +39,19 @@ Use "siso metrics help [subcommand]" for more information about a subcommand.
 func (Command) SetFlags(flagSet *flag.FlagSet) {
 }
 
+// Subcommands returns the list of subcommands under `metrics`.
+func Subcommands() []subcommands.Command {
+	return []subcommands.Command{
+		&cmpCommand{},
+		&summaryCommand{},
+	}
+}
+
 func (c Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	commander := subcommands.NewCommander(flagSet, c.Name())
-	commander.Register(&cmpCommand{}, "")
-	commander.Register(&summaryCommand{}, "")
+	for _, cmd := range Subcommands() {
+		commander.Register(cmd, "")
+	}
 	commander.Register(commander.HelpCommand(), "command-help")
 	return commander.Execute(ctx)
 }

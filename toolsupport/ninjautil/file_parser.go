@@ -214,7 +214,7 @@ func (p *fileParser) alloc(ctx context.Context) {
 	p.ruleArena.reserve(p.full.nrule)
 	p.edgeArena.reserve(p.full.nbuild)
 	p.poolArena.reserve(p.full.npool)
-	p.bindingArena.reserve(p.full.nrulevar + p.full.nbuildvar)
+	p.bindingArena.reserve(p.full.nrulevar)
 
 	// Only create new scope maps for fresh scopes. When the scope
 	// is reused from a parent (as with `include`), preserve existing
@@ -227,7 +227,7 @@ func (p *fileParser) alloc(ctx context.Context) {
 	}
 
 	if log.V(1) {
-		clog.Infof(ctx, "alloc rule=%d edge=%d pool=%d var=%d binding=%d+%d", p.full.nrule, p.full.nbuild, p.full.npool, p.full.nvar, p.full.nrulevar, p.full.nbuildvar)
+		clog.Infof(ctx, "alloc rule=%d edge=%d pool=%d var=%d binding=%d", p.full.nrule, p.full.nbuild, p.full.npool, p.full.nvar, p.full.nrulevar)
 	}
 
 	for i := range p.chunks {
@@ -241,7 +241,7 @@ func (p *fileParser) alloc(ctx context.Context) {
 		ch.ruleArena = p.ruleArena.chunk(ch.nrule)
 		ch.edgeArena = p.edgeArena.chunk(ch.nbuild)
 		ch.poolArena = p.poolArena.chunk(ch.npool)
-		ch.bindingArena = p.bindingArena.chunk(ch.nrulevar + ch.nbuildvar)
+		ch.bindingArena = p.bindingArena.chunk(ch.nrulevar)
 		ch.edgePathSlab = newSlab[*Node](ch.nbuild)
 
 		if log.V(2) {

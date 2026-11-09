@@ -12,13 +12,14 @@ import sys
 def Main(args):
   if len(args) < 4:
     print(
-        "Usage: %s output.hmap Foo.framework header1.h..." % args[0],
-        file=sys.stderr)
+      "Usage: %s output.hmap Foo.framework header1.h..." % args[0],
+      file=sys.stderr,
+    )
     return 1
 
   (out, framework, all_headers) = args[1], args[2], args[3:]
 
-  framework_name = os.path.basename(framework).split('.')[0]
+  framework_name = os.path.basename(framework).split(".")[0]
   all_headers = map(os.path.abspath, all_headers)
   filelist = {}
   for header in all_headers:
@@ -30,7 +31,7 @@ def Main(args):
 
 
 def NextGreaterPowerOf2(x):
-  return 2**(x).bit_length()
+  return 2 ** (x).bit_length()
 
 
 def WriteHmap(output_name, filelist):
@@ -54,10 +55,19 @@ def WriteHmap(output_name, filelist):
   # pylint: disable=W0108
   max_value_length = len(max(filelist.values(), key=lambda v: len(v)))
 
-  out = open(output_name, 'wb')
+  out = open(output_name, "wb")
   out.write(
-      struct.pack('<LHHLLLL', magic, version, _reserved, strings_offset, count,
-                  capacity, max_value_length))
+    struct.pack(
+      "<LHHLLLL",
+      magic,
+      version,
+      _reserved,
+      strings_offset,
+      count,
+      capacity,
+      max_value_length,
+    )
+  )
 
   # Create empty hashmap buckets.
   buckets = [None] * capacity
@@ -74,33 +84,33 @@ def WriteHmap(output_name, filelist):
   next_offset = 1
   for bucket in buckets:
     if bucket is None:
-      out.write(struct.pack('<LLL', 0, 0, 0))
+      out.write(struct.pack("<LLL", 0, 0, 0))
     else:
       (file, path) = bucket
       key_offset = next_offset
       prefix_offset = key_offset + len(file) + 1
       suffix_offset = prefix_offset + len(os.path.dirname(path) + os.sep) + 1
       next_offset = suffix_offset + len(os.path.basename(path)) + 1
-      out.write(struct.pack('<LLL', key_offset, prefix_offset, suffix_offset))
+      out.write(struct.pack("<LLL", key_offset, prefix_offset, suffix_offset))
 
   # Pad byte since next offset starts at 1.
-  out.write(struct.pack('<x'))
+  out.write(struct.pack("<x"))
 
   for bucket in buckets:
     if bucket is not None:
       (file, path) = bucket
       base = os.path.dirname(path) + os.sep
       path = os.path.basename(path)
-      file = file.encode('UTF-8')
-      base = base.encode('UTF-8')
-      path = path.encode('UTF-8')
-      out.write(struct.pack('<%ds' % len(file), file))
-      out.write(struct.pack('<s', b'\0'))
-      out.write(struct.pack('<%ds' % len(base), base))
-      out.write(struct.pack('<s', b'\0'))
-      out.write(struct.pack('<%ds' % len(path), path))
-      out.write(struct.pack('<s', b'\0'))
+      file = file.encode("UTF-8")
+      base = base.encode("UTF-8")
+      path = path.encode("UTF-8")
+      out.write(struct.pack("<%ds" % len(file), file))
+      out.write(struct.pack("<s", b"\0"))
+      out.write(struct.pack("<%ds" % len(base), base))
+      out.write(struct.pack("<s", b"\0"))
+      out.write(struct.pack("<%ds" % len(path), path))
+      out.write(struct.pack("<s", b"\0"))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
   sys.exit(Main(sys.argv))

@@ -6,15 +6,16 @@ package e2etests
 
 import (
 	"bytes"
+	"runtime"
 	"strings"
 	"testing"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/reapitest"
 	"go.chromium.org/build/siso/ui"
 )
@@ -59,7 +60,7 @@ func TestBuild_Fail_Remote(t *testing.T) {
 				OutputFiles: []*rpb.OutputFile{
 					{
 						Path:   "gen/foo.srcjar",
-						Digest: digest.Empty.Proto(),
+						Digest: digest.SHA256.Empty().Proto(),
 					},
 				},
 			}, nil
@@ -179,4 +180,71 @@ func TestBuild_Fail_Remote(t *testing.T) {
 		t.Errorf("ninja output_log=%q; want empty", outputLog.String())
 	}
 	outputLog.Reset()
+}
+
+func TestBuild_Fail_Signal(t *testing.T) {
+	if !runInSubProcess(t) {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("signal termination test is not supported on windows")
+	}
+	ctx := t.Context()
+	dir := tempDir(t)
+
+	runNinjaTest := func(t *testing.T, failureSummary, outputLog *bytes.Buffer) (build.Stats, error) {
+		t.Helper()
+		opt, graph, cleanup := setupBuild(ctx, t, dir, hashfs.Option{
+			StateFile: ".siso_fs_state",
+		})
+		defer cleanup()
+		opt.FailureSummaryWriter = failureSummary
+		opt.OutputLogWriter = outputLog
+		return ninjabuild.Run(ctx, graph, opt, nil, ninjabuild.RunNinjaOpts{})
+	}
+
+	setupFiles(t, dir, t.Name(), nil)
+
+	var stdout, stderr syncBuffer
+	ui.Default = ui.LogUI{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	}
+	t.Cleanup(func() {
+		ui.Default = ui.LogUI{}
+	})
+
+	var failureSummary, outputLog bytes.Buffer
+	stats, err := runNinjaTest(t, &failureSummary, &outputLog)
+	if err == nil {
+		t.Fatalf("ninja succeeded, but want err; stats=%#v", stats)
+	}
+	if stats.Done != 1 || stats.Fail != 1 || stats.Local != 1 || stats.Remote != 0 {
+		t.Fatalf("ninja stats done=%d Fail=%d Local=%d Remote=%d; want done=1 Fail=1 Local=1 Remote=0", stats.Done, stats.Fail, stats.Local, stats.Remote)
+	}
+	if len(failureSummary.Bytes()) == 0 {
+		t.Errorf("ninja failure_summary is empty; want failure summary")
+	}
+	if !strings.Contains(failureSummary.String(), "standard output") {
+		t.Errorf("ninja failure_summary=%q; want 'standard output'", failureSummary.String())
+	}
+	if !strings.Contains(failureSummary.String(), "standard error") {
+		t.Errorf("ninja failure_summary=%q; want 'standard error'", failureSummary.String())
+	}
+	if !strings.Contains(failureSummary.String(), "exit=-1") {
+		t.Errorf("ninja failure_summary=%q; want 'exit=-1'", failureSummary.String())
+	}
+	if !strings.Contains(outputLog.String(), "standard output") {
+		t.Errorf("ninja output_log=%q; want 'standard output'", outputLog.String())
+	}
+	if !strings.Contains(outputLog.String(), "standard error") {
+		t.Errorf("ninja output_log=%q; want 'standard error'", outputLog.String())
+	}
+	if !strings.Contains(outputLog.String(), "exit=-1") {
+		t.Errorf("ninja output_log=%q; want 'exit=-1'", outputLog.String())
+	}
+	outString := stdout.String() + stderr.String()
+	if !strings.Contains(outString, "FAILED:") || !strings.Contains(outString, "standard output") || !strings.Contains(outString, "standard error") || !strings.Contains(outString, "exit=-1") {
+		t.Errorf("ninja output missing `FAILED:` or `standard output` or `standard error` or `exit=-1`\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
 }

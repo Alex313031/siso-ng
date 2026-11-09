@@ -10,12 +10,12 @@ import time
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('target', help='target filename')
-  parser.add_argument('link_name', help='link filename')
+  parser.add_argument("target", help="target filename")
+  parser.add_argument("link_name", help="link filename")
   options = parser.parse_args()
   time.sleep(0.2)
   os.symlink(options.target, options.link_name)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
   sys.exit(main())

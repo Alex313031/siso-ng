@@ -6,7 +6,6 @@ package metadata
 
 import (
 	"context"
-	"errors"
 	"runtime"
 
 	"github.com/klauspost/cpuid/v2"
@@ -32,11 +31,14 @@ func GatherMachineInfo(ctx context.Context) MachineInfo {
 		clog.Warningf(ctx, "failed to get machine memory: %v", err)
 	}
 	osVersion, err := host.OSVersion()
-	if errors.Is(err, host.ErrUnsupportedOS) {
-		osVersion = ""
-	} else {
+	if err != nil {
 		clog.Warningf(ctx, "failed to get os version: %v", err)
 	}
+	physicalCores, logicalCores, err := host.CPUCores()
+	if err != nil {
+		clog.Warningf(ctx, "failed to get cpu cores: %v", err)
+	}
+
 	return MachineInfo{
 		Platform: PlatformInfo{
 			Architecture: runtime.GOARCH,
@@ -46,8 +48,8 @@ func GatherMachineInfo(ctx context.Context) MachineInfo {
 		CPU: CPUInfo{
 			BrandName:     cpuid.CPU.BrandName,
 			VendorString:  cpuid.CPU.VendorString,
-			LogicalCores:  cpuid.CPU.LogicalCores,
-			PhysicalCores: cpuid.CPU.PhysicalCores,
+			LogicalCores:  logicalCores,
+			PhysicalCores: physicalCores,
 		},
 		Memory: MemoryInfo{
 			Total: total,
@@ -74,14 +76,18 @@ type CPUInfo struct {
 	BrandName string `json:"brand"`
 	// VendorString is the raw vendor string reported by the CPU, e.g. "GenuineIntel".
 	VendorString string `json:"vendor"`
-	// LogicalCores is the number of logical cores usable by the current process.
+	// LogicalCores is the total number of logical cores (hardware threads) on
+	// the machine's CPU, independent of any cgroup, processor-group, or CPU
+	// affinity restrictions on the current process.
 	LogicalCores int `json:"logical_cores"`
-	// PhysicalCores is the number of physical cores on the machine.
+	// PhysicalCores is the total number of physical cores on the machine's CPU,
+	// independent of any cgroup, processor-group, or CPU affinity restrictions
+	// on the current process.
 	PhysicalCores int `json:"physical_cores"`
 }
 
 // MemoryInfo reports memory information.
 type MemoryInfo struct {
 	// Total is the total amount of memory on the machine in bytes.
-	Total uint64 `json:"total,omitempty"`
+	Total uint64 `json:"total,omitzero"`
 }

@@ -12,9 +12,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/reapi/merkletree"
 )
 
@@ -22,11 +23,11 @@ func TestTraverse(t *testing.T) {
 	ctx := t.Context()
 	defer glog.Flush()
 
-	ds := digest.NewStore()
-	mt := merkletree.New(ds)
+	ds := blob.NewStore()
+	mt := merkletree.New(digest.SHA256, ds)
 
-	file1 := digest.FromBytes("file1", []byte{1})
-	file2 := digest.FromBytes("file2", []byte{2})
+	file1 := blob.FromBytes(digest.SHA256, "file1", []byte{1})
+	file2 := blob.FromBytes(digest.SHA256, "file2", []byte{2})
 
 	// Set test entries.
 	for _, e := range []merkletree.Entry{
@@ -50,7 +51,7 @@ func TestTraverse(t *testing.T) {
 		},
 		{
 			Name: "dir2/dir3/file1",
-			Data: digest.FromBytes("file1", []byte{1}),
+			Data: blob.FromBytes(digest.SHA256, "file1", []byte{1}),
 		},
 		{
 			Name:   "dir2/dir3/link2",
@@ -67,7 +68,7 @@ func TestTraverse(t *testing.T) {
 		t.Fatalf("failed to build merkletree: %v", err)
 	}
 
-	files, links, dirs := merkletree.Traverse(ctx, "root", mt.RootDirectory(), ds)
+	files, links, dirs := merkletree.Traverse(ctx, digest.SHA256, "root", mt.RootDirectory(), ds)
 
 	// Assertions
 	wantFiles := []*rpb.OutputFile{

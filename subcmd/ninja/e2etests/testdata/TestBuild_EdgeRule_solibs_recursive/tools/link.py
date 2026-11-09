@@ -11,18 +11,18 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("inputs", nargs='*', help="inputs")
-  parser.add_argument("-o", nargs='*', help="output")
+  parser.add_argument("inputs", nargs="*", help="inputs")
+  parser.add_argument("-o", nargs="*", help="output")
   options = parser.parse_args()
 
-  data = ''
-  for input in options.inputs:
-    data += input + '\n'
-    with open(input) as f:
+  data = ""
+  for input_path in options.inputs:
+    data += input_path + "\n"
+    with open(input_path) as f:
       data += f.read()
-      data += '\n'
+      data += "\n"
   for output in options.o:
-    with open(output, 'w') as f:
+    with open(output, "w") as f:
       f.write(data)
 
 

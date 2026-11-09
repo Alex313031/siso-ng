@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
@@ -52,7 +54,7 @@ func TestBuild_Symlink(t *testing.T) {
 	if err != nil {
 		t.Errorf("hashfs.Load=%v; want nil err", err)
 	}
-	m := hashfs.StateMap(st)
+	m := hashfs.StateMap(digest.SHA256, st)
 	e1, ok := m[filepath.Join(dir, "out/siso/out1")]
 	if !ok {
 		t.Errorf("out1 not found: %v", m)
@@ -312,8 +314,7 @@ func TestBuild_SymlinkSourceDangling(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = runNinjaTest(t)
-	var missingSourceErr build.MissingSourceError
-	if !errors.As(err, &missingSourceErr) {
+	if _, ok := errors.AsType[build.MissingSourceError](err); !ok {
 		t.Errorf("unexpected error = %v; want MissingSourceError", err)
 	}
 }

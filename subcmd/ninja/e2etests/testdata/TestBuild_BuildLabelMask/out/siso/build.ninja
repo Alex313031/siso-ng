@@ -1,0 +1,15 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule gen
+  command = python3 ../../tools/gen.py ${in} ${out}
+
+rule copy_rule
+  command = python3 ../../tools/gen.py ${in} ${out}
+
+build obj/gen.txt: gen ../../in/source.txt
+build obj/copy.txt: copy_rule ../../in/source.txt
+build obj/downstream.txt: copy_rule obj/gen.txt
+
+build all: phony obj/gen.txt obj/copy.txt obj/downstream.txt

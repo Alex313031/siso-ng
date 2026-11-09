@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -61,6 +62,9 @@ type State struct {
 	// nodeMap is used during parse and lookup by path, and freeze it in nodes.
 	nodeMap *nodeMap
 	nodes   []*Node
+	// dirOutputs are output nodes whose path ends in "/", collected during
+	// freeze so callers need not rescan.
+	dirOutputs []*Node
 
 	scope *fileScope
 
@@ -76,6 +80,10 @@ type State struct {
 	// mmaps pins file-backed byte slices alive for the lifetime of State,
 	// because Edge.env.buf and binding evalStrings hold sub-slices into them.
 	mmaps [][]byte
+
+	outEdgesOnce sync.Once
+	outEdgeIdx   []int
+	outEdges     []*Edge
 }
 
 // addMmap registers a mmap'd buffer for release on Close.
@@ -164,6 +172,12 @@ func (s *State) LookupNodeByPath(path string) (*Node, bool) {
 	return n, ok
 }
 
+// DirOutputs returns the directory-output nodes (path ends in "/"), collected
+// during parse. Empty for builds with none, so callers can skip a node scan.
+func (s *State) DirOutputs() []*Node {
+	return s.dirOutputs
+}
+
 // AllNodes returns all nodes.
 func (s *State) AllNodes() []*Node {
 	var nodes []*Node
@@ -176,13 +190,56 @@ func (s *State) AllNodes() []*Node {
 	return nodes
 }
 
+// OutEdges returns out-edges of the node.
+// Reverse edges are computed lazily on the first call for a node with out-edges.
+func (s *State) OutEdges(n *Node) []*Edge {
+	if n == nil || !n.HasOut() || len(s.nodes) == 0 {
+		return nil
+	}
+	s.outEdgesOnce.Do(s.buildOutEdges)
+	id := int(n.id)
+	if id <= 0 || id >= len(s.outEdgeIdx) || s.nodes[id] != n {
+		return nil
+	}
+	start := s.outEdgeIdx[id-1]
+	end := s.outEdgeIdx[id]
+	if start == end {
+		return nil
+	}
+	return s.outEdges[start:end:end]
+}
+
+func (s *State) buildOutEdges() {
+	idx := make([]int, len(s.nodes))
+	for _, edge := range s.edges {
+		for _, in := range edge.inputs {
+			idx[in.id]++
+		}
+	}
+	total := 0
+	for i, count := range idx {
+		idx[i] = total
+		total += count
+	}
+	outEdges := make([]*Edge, total)
+	for _, edge := range s.edges {
+		for _, in := range edge.inputs {
+			pos := idx[in.id]
+			outEdges[pos] = edge
+			idx[in.id] = pos + 1
+		}
+	}
+	s.outEdgeIdx = idx
+	s.outEdges = outEdges
+}
+
 // RootNodes returns root nodes, that are nodes without output actions.
 // (Hence can be considered final artifacts, i.e. other nodes will not use root nodes as inputs.)
 func (s *State) RootNodes() ([]*Node, error) {
 	var roots []*Node
 	for _, e := range s.edges {
 		for _, out := range e.outputs {
-			if len(out.outs) == 0 {
+			if !out.HasOut() {
 				roots = append(roots, out)
 			}
 		}
@@ -219,10 +276,10 @@ func (s *State) Targets(args []string) ([]*Node, error) {
 			seen := make(map[string]bool)
 			n, ok := s.hatTarget(t, seen)
 			if !ok {
-				errs = append(errs, fmt.Errorf("unknown target %q", t))
+				errs = append(errs, UnknownTargetError{t})
 				continue
 			}
-			outs := n.OutEdges()
+			outs := s.OutEdges(n)
 			if len(outs) == 0 {
 				// TODO(b/289309062): deps log first reverse deps node?
 				errs = append(errs, fmt.Errorf("no outs for %q", t))
@@ -246,7 +303,7 @@ func (s *State) Targets(args []string) ([]*Node, error) {
 		}
 		n, ok := s.LookupNodeByPath(t)
 		if !ok {
-			errs = append(errs, fmt.Errorf("unknown target %q", t))
+			errs = append(errs, UnknownTargetError{t})
 			continue
 		}
 		nodes = append(nodes, n)
@@ -266,7 +323,7 @@ func (s *State) resolvePhony(n *Node, seen map[*Node]struct{}) []*Node {
 	}
 
 	var realNodes []*Node
-	for _, outEdge := range n.OutEdges() {
+	for _, outEdge := range s.OutEdges(n) {
 		for _, outNode := range outEdge.Outputs() {
 			realNodes = append(realNodes, s.resolvePhony(outNode, seen)...)
 		}
@@ -451,4 +508,11 @@ func (s *State) Binding(name string) string {
 // Filenames returns files parsed by the parser (e.g. build.ninja and its subninja etc.)
 func (s *State) Filenames() []string {
 	return s.filenames
+}
+
+// Edges returns all edges in the state.
+func (s *State) Edges() []*Edge {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.edges)
 }

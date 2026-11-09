@@ -5,4 +5,4 @@
 // Package proto provides protocol buffer message for execute.
 package proto
 
-//go:generate ../../scripts/install-protoc-gen-go protoc -I. --go_out=. --go_opt=paths=source_relative rusage.proto spawn.proto
+//go:generate ../../scripts/install-protoc-gen-go protoc -I. --go_out=. --go_opt=paths=source_relative rusage.proto spawn.proto tap.proto

@@ -7,6 +7,7 @@ package ninjautil
 import (
 	"bytes"
 	"hash/maphash"
+	"slices"
 	"sync"
 )
 
@@ -68,15 +69,15 @@ func (sb *shardBindings) get(pos int, key []byte) (evalString, bool) {
 	var found bool
 	// m.list is not ordered by pos, but need to find the largest
 	// value.pos less than given pos (i.e. shadowed bindings).
-	for i := len(m.list) - 1; i >= 0; i-- {
-		if pos >= 0 && m.list[i].value.pos >= pos {
+	for _, e := range slices.Backward(m.list) {
+		if pos >= 0 && e.value.pos >= pos {
 			continue
 		}
-		if found && m.list[i].value.pos < ret.pos {
+		if found && e.value.pos < ret.pos {
 			continue
 		}
-		if bytes.Equal(key, m.list[i].name) {
-			ret = m.list[i].value
+		if bytes.Equal(key, e.name) {
+			ret = e.value
 			found = true
 		}
 	}

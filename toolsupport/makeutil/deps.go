@@ -85,7 +85,6 @@ depLines:
 }
 
 func nextToken(s []byte) (string, []byte) {
-	var sb strings.Builder
 	// skip spaces
 	var i int
 skipSpaces:
@@ -108,8 +107,38 @@ skipSpaces:
 		}
 	}
 	s = s[i:]
-	// extract next space not escaped
-	for i := 0; i < len(s); i++ {
+	// Fast path: most depfile tokens are unescaped paths. Scan to the first
+	// delimiter or escape and return the input sub-slice in one allocation.
+	for j := range s {
+		switch s[j] {
+		case '\\':
+			// escape sequence; fall through to Builder slow path.
+			return nextTokenSlow(s, j)
+		case ' ', '\t', '\n', '\r':
+			return string(s[:j]), s[j:]
+		case ':':
+			switch j {
+			case 0:
+				return ":", s[1:]
+			case 1:
+				// <drive>: ? keep scanning.
+			default:
+				return string(s[:j]), s[j:]
+			}
+		}
+	}
+	return string(s), nil
+}
+
+// nextTokenSlow handles tokens with backslash escapes. nextToken calls
+// it on the first escape; the prefix s[:start] has no escapes or
+// delimiters, so it seeds the Builder.
+func nextTokenSlow(s []byte, start int) (string, []byte) {
+	// String() returns the builder buffer uncopied, so keep it token-sized: a
+	// depfile-sized builder would let one short escaped token pin a huge allocation.
+	var sb strings.Builder
+	sb.Write(s[:start])
+	for i := start; i < len(s); i++ {
 		if s[i] == '\\' && i+1 < len(s) {
 			i++
 			switch s[i] {

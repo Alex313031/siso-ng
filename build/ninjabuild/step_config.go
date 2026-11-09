@@ -21,6 +21,7 @@ import (
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
+	sisopath "go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
 )
 
@@ -66,7 +67,7 @@ type StepRule struct {
 
 	// IndirectInputs enables indirect (transitive, recursive) inputs
 	// as action input of the step.
-	IndirectInputs *PathFilter `json:"indirect_inputs,omitempty"`
+	IndirectInputs *PathFilter `json:"indirect_inputs,omitzero"`
 
 	// Outputs are outputs to add to the step.
 	Outputs []string `json:"outputs,omitempty"`
@@ -86,11 +87,11 @@ type StepRule struct {
 	// Output will be considered as clean if output mtime
 	// is not changed by the command execution.
 	// https://ninja-build.org/manual.html#ref_rule:~:text=appears%20in%20commands.-,restat,-if%20present%2C%20causes
-	Restat bool `json:"restat,omitempty"`
+	Restat bool `json:"restat,omitzero"`
 
 	// RestatContent means output will be considered as clean
 	// if output content is the same as before.
-	RestatContent bool `json:"restat_content,omitempty"`
+	RestatContent *bool `json:"restat_content,omitzero"`
 
 	// PlatformRef is reference to platform properties.
 	PlatformRef string `json:"platform_ref,omitempty"`
@@ -99,10 +100,10 @@ type StepRule struct {
 	Platform map[string]string `json:"platform,omitempty"`
 
 	// Remote marks the step is remote executable.
-	Remote bool `json:"remote,omitempty"`
+	Remote bool `json:"remote,omitzero"`
 	// StrictRemote forces strict remote execution for matched steps.
 	// i.e. no fastlocal, no local fallback.
-	StrictRemote bool `json:"strict_remote,omitempty"`
+	StrictRemote bool `json:"strict_remote,omitzero"`
 	// RemoteWrapper is a wrapper used in remote execution.
 	// TODO: put RemoteWrapper in Platform["siso:remote_wrapper"]
 	RemoteWrapper string `json:"remote_wrapper,omitempty"`
@@ -112,20 +113,20 @@ type StepRule struct {
 	// path in remote action -> local path
 	RemoteInputs map[string]string `json:"remote_inputs,omitempty"`
 	// InputRootAbsolutePath indicates the step requires absolute path for the input root, i.e. not relocatable.
-	InputRootAbsolutePath bool `json:"input_root_absolute_path,omitempty"`
+	InputRootAbsolutePath bool `json:"input_root_absolute_path,omitzero"`
 	// CanonicalizeDir indicates the step can canonicalize the working dir.
 	// true, false or not-set(when nil), and treated as true when not set.
-	CanonicalizeDir *bool `json:"canonicalize_dir,omitempty"`
+	CanonicalizeDir *bool `json:"canonicalize_dir,omitzero"`
 
 	// UseSystemInput indicates to allow extra inputs outside of workspace.
-	UseSystemInput bool `json:"use_system_input,omitempty"`
+	UseSystemInput bool `json:"use_system_input,omitzero"`
 
 	// UseRemoteExecWrapper indicates the command uses remote exec wrapper
 	// (e.g. gomacc, rewrapper), so
 	// - no need to run `clang -M`
 	// - run locally but more parallelism
 	// - no file access trace
-	UseRemoteExecWrapper bool `json:"use_remote_exec_wrapper,omitempty"`
+	UseRemoteExecWrapper bool `json:"use_remote_exec_wrapper,omitzero"`
 
 	// Timeout specifies time duration for the remote execution call of the step.
 	// This covers the remote execution overheads that are not covered by
@@ -155,7 +156,7 @@ type StepRule struct {
 	// OutputLocal indicates to force to write output files to local disk
 	// for subsequent steps.
 	// TODO: better to have `require_local_inputs`=[<globs>] to reduce unnecessary downloads?
-	OutputLocal bool `json:"output_local,omitempty"`
+	OutputLocal bool `json:"output_local,omitzero"`
 
 	// IgnoreExtraInputPattern specifies regexp to ignore extra inputs.
 	// ignore extra input detected by strace if it matches with this pattern
@@ -170,20 +171,26 @@ type StepRule struct {
 	// Impure marks the step is impure, i.e. allow extra inputs/outputs.
 	// Better to use above options if possible.
 	// Impure disables file access trace.
-	Impure bool `json:"impure,omitempty"`
+	Impure bool `json:"impure,omitzero"`
+
+	// SandboxDisabled marks the step disables sandbox.
+	SandboxDisabled bool `json:"sandbox_disabled,omitzero"`
+
+	// CacheDisabled marks the step disables cache.
+	CacheDisabled bool `json:"cache_disabled,omitzero"`
 
 	// Replace replaces the outputs, when used by other step,
 	// to the inputs of the step.
 	// e.g. stamp.
-	Replace bool `json:"replace,omitempty"`
+	Replace bool `json:"replace,omitzero"`
 
 	// Accumulate accumulates the inputs of the step to
 	// the outputs, when used by other step.
 	// e.g. thin archive.
-	Accumulate bool `json:"accumulate,omitempty"`
+	Accumulate bool `json:"accumulate,omitzero"`
 
 	// Debug indicates to log debug information for the step.
-	Debug bool `json:"debug,omitempty"`
+	Debug bool `json:"debug,omitzero"`
 }
 
 // Init initializes the step rule.
@@ -249,22 +256,30 @@ type StepConfig struct {
 	// Rules lists step rules.
 	Rules []*StepRule `json:"rules,omitempty"`
 
-	// BadDeps specifies known targets with bad deps,
+	// MissingDeps specifies known targets with missing dependencies,
 	// i.e. target has other generated targets not in direct/indirect
 	// dependencies in depfile.
-	// This target won't cause error with bad deps even with
-	// `SISO_EXPERIMENTS=fail-on-bad-deps` to make it easy to
-	// detect new bad deps.
-	// key is output target known to have bad deps.
+	// This target won't cause error with missing deps even with
+	// `-missing_deps=error/fatal` to make it easy to detect new missing deps.
+	// key is output target known to have missing deps.
 	// value is annotation (usually bug link).
-	BadDeps map[string]string `json:"bad_deps,omitempty"`
+	MissingDeps map[string]string `json:"missing_deps,omitempty"`
 
 	// Executables are files that need to have executable bit on Linux worker.
 	// This field is used to upload Linux executables from Windows host.
 	Executables []string `json:"executables,omitempty"`
 
+	// Shell specifies the path to the hermetic shell binary to use, when the
+	// command cannot be simply exec'd. If not given, /bin/sh will be used.
+	// The basename of the shell must be 'sh' or 'bash' currently.
+	// Not supported on windows.
+	Shell string `json:"shell,omitempty"`
+
 	// Sandbox is sandbox config
 	Sandbox map[string]string `json:"sandbox,omitempty"`
+
+	// Env specifies environment variable configuration.
+	Env *build.EnvConfig `json:"env,omitempty"`
 }
 
 // ScandepsConfig is a config for scandeps.
@@ -289,6 +304,9 @@ type ScandepsConfig struct {
 
 // Init initializes StepConfig.
 func (sc *StepConfig) Init(ctx context.Context) error {
+	if sc.Env != nil && len(sc.Env.Inherits) > 0 && len(sc.Env.Excludes) > 0 {
+		return fmt.Errorf("env: cannot specify both inherits and excludes")
+	}
 	seen := make(map[string]bool)
 	for _, rule := range sc.Rules {
 		if rule == nil {
@@ -332,7 +350,7 @@ func (sc *StepConfig) Init(ctx context.Context) error {
 	if len(sc.InputsRequiringClangScandeps) > 0 || sc.ClangScandeps != "" {
 		return fmt.Errorf("inputs_requiring_clang_scandeps and clang_scandeps is deprecated. just use scandeps")
 	}
-	sc.Scandeps.stepInputsFilter = sc.Scandeps.StepInputs.filter(ctx, "scandeps.step_inputs")
+	sc.Scandeps.stepInputsFilter = sc.Scandeps.StepInputs.Filter(ctx, "scandeps.step_inputs")
 	if sc.InputDeps == nil {
 		sc.InputDeps = make(map[string][]string)
 	}
@@ -345,27 +363,28 @@ func (sc *StepConfig) UpdateFilegroups(ctx context.Context, filegroups map[strin
 	return nil
 }
 
-func fromConfigPath(ctx context.Context, p *build.Path, path string) string {
-	if strings.HasPrefix(path, "./") {
-		return p.MaybeFromRelative(ctx, path)
+func fromConfigPath(ctx context.Context, p *build.Path, s string) sisopath.Path {
+	if strings.HasPrefix(s, "./") {
+		return sisopath.New(p.MaybeFromRelative(ctx, s))
 	}
-	return path
+	return sisopath.FromClean(s)
 }
 
-func toConfigPath(p *build.Path, path string) string {
-	path = filepath.ToSlash(path)
-	if after, ok := strings.CutPrefix(path, p.BaseDir+"/"); ok {
+func toConfigPath(p *build.Path, pp sisopath.Path) string {
+	s := filepath.ToSlash(string(pp))
+	if after, ok := strings.CutPrefix(s, p.BaseDir+"/"); ok {
 		return "./" + after
 	}
-	return path
+	return s
 }
 
 // Lookup returns a step rule for the edge.
 func (sc StepConfig) Lookup(ctx context.Context, bpath *build.Path, edge *ninjautil.Edge) (StepRule, bool) {
-	var out, outConfig string
+	var outPath sisopath.Path
+	var outConfig string
 	if len(edge.Outputs()) > 0 {
-		out = bpath.MaybeFromRelative(ctx, edge.Outputs()[0].Path())
-		outConfig = toConfigPath(bpath, out)
+		outPath = sisopath.New(bpath.MaybeFromRelative(ctx, edge.Outputs()[0].Path()))
+		outConfig = toConfigPath(bpath, outPath)
 	}
 	actionName := edge.RuleName()
 	command := edge.RawBinding("command")
@@ -383,12 +402,13 @@ func (sc StepConfig) Lookup(ctx context.Context, bpath *build.Path, edge *ninjau
 		}
 	}
 	if log.V(1) {
-		clog.Infof(ctx, "lookup action:%s out:%s args0:%s", actionName, out, args0)
+		clog.Infof(ctx, "lookup action:%s out:%s args0:%s", actionName, outPath, args0)
 	}
 
 	remoteBinding := edge.Binding("remote_enabled")
 	platformRefBinding := edge.Binding("remote_platform_ref")
 	timeoutBinding := edge.Binding("remote_timeout")
+	outputLocalBinding := edge.Binding("output_local")
 
 loop:
 	for _, c := range sc.Rules {
@@ -428,6 +448,9 @@ loop:
 		if timeoutBinding != "" {
 			rule.Timeout = timeoutBinding
 		}
+		if outputLocalBinding != "" {
+			rule.OutputLocal = (outputLocalBinding == "true")
+		}
 
 		if rule.Remote {
 			if len(rule.Platform) == 0 {
@@ -460,15 +483,13 @@ loop:
 		inputs = append(inputs, rule.Inputs...)
 		inputs = append(inputs, opt.Inputs...)
 		for i := range inputs {
-			inputs[i] = fromConfigPath(ctx, bpath, inputs[i])
+			inputs[i] = string(fromConfigPath(ctx, bpath, inputs[i]))
 		}
 		rule.Inputs = inputs
 		if len(rule.RemoteInputs) > 0 {
 			m := make(map[string]string)
 			for k, v := range rule.RemoteInputs {
-				k = fromConfigPath(ctx, bpath, k)
-				v = fromConfigPath(ctx, bpath, v)
-				m[k] = v
+				m[string(fromConfigPath(ctx, bpath, k))] = string(fromConfigPath(ctx, bpath, v))
 			}
 			rule.RemoteInputs = m
 		}
@@ -476,15 +497,15 @@ loop:
 		outputs = append(outputs, rule.Outputs...)
 		outputs = append(outputs, opt.Outputs...)
 		for i := range outputs {
-			outputs[i] = fromConfigPath(ctx, bpath, outputs[i])
+			outputs[i] = string(fromConfigPath(ctx, bpath, outputs[i]))
 		}
 		rule.Outputs = outputs
 
 		for i := range rule.AuxiliaryLogOutputFiles {
-			rule.AuxiliaryLogOutputFiles[i] = fromConfigPath(ctx, bpath, rule.AuxiliaryLogOutputFiles[i])
+			rule.AuxiliaryLogOutputFiles[i] = string(fromConfigPath(ctx, bpath, rule.AuxiliaryLogOutputFiles[i]))
 		}
 		for i := range rule.AuxiliaryLogOutputDirs {
-			rule.AuxiliaryLogOutputDirs[i] = fromConfigPath(ctx, bpath, rule.AuxiliaryLogOutputDirs[i])
+			rule.AuxiliaryLogOutputDirs[i] = string(fromConfigPath(ctx, bpath, rule.AuxiliaryLogOutputDirs[i]))
 		}
 
 		if len(opt.Platform) > 0 {
@@ -496,8 +517,11 @@ loop:
 		return rule, !c.Impure
 	}
 
+	// output_local alone does not create a rule here, since a step without
+	// a matching rule or remote bindings runs locally (and its outputs are
+	// on local disk anyway), and creating a rule would make it pure.
 	if remoteBinding != "" || platformRefBinding != "" || timeoutBinding != "" {
-		clog.Infof(ctx, "miss, but configured in ninja: actionName:%q out:%q args0:%q", actionName, out, args0)
+		clog.Infof(ctx, "miss, but configured in ninja: actionName:%q out:%q args0:%q", actionName, outPath, args0)
 		rule := StepRule{
 			Name: "ninja:" + actionName,
 		}
@@ -506,6 +530,9 @@ loop:
 		}
 		if timeoutBinding != "" {
 			rule.Timeout = timeoutBinding
+		}
+		if outputLocalBinding != "" {
+			rule.OutputLocal = (outputLocalBinding == "true")
 		}
 		if rule.Remote {
 			if len(rule.Platform) == 0 {
@@ -523,12 +550,12 @@ loop:
 			}
 		}
 		if bool(log.V(1)) || rule.Debug {
-			clog.Infof(ctx, "hit ninja properties %s actionName:%q out:%q args0:%q -> remote:%t timeout:%q platform:%v", rule.Name, actionName, outConfig, args0, rule.Remote, rule.Timeout, rule.Platform)
+			clog.Infof(ctx, "hit ninja properties %s actionName:%q out:%q args0:%q -> remote:%t timeout:%q output-local:%t platform:%v", rule.Name, actionName, outConfig, args0, rule.Remote, rule.Timeout, rule.OutputLocal, rule.Platform)
 		}
 		return rule, true
 	}
 
-	clog.Infof(ctx, "miss actionName:%q out:%q args0:%q", actionName, out, args0)
+	clog.Infof(ctx, "miss actionName:%q out:%q args0:%q", actionName, outPath, args0)
 	return StepRule{}, false
 }
 
@@ -538,49 +565,57 @@ type depPathPair struct{ dep, path string }
 var knownMissingInputs sync.Map // {path or depPathPair} -> true
 
 // ExpandInputs expands inputs, and returns paths separated by slash.
-func (sc StepConfig) ExpandInputs(ctx context.Context, p *build.Path, hashFS *hashfs.HashFS, paths []string) []string {
-	seen := make(map[string]bool)
-	var expanded []string
+func (sc StepConfig) ExpandInputs(ctx context.Context, p *build.Path, hashFS *hashfs.HashFS, paths []sisopath.Path) []sisopath.Path {
+	seen := make(map[sisopath.Path]bool)
+	var expanded []sisopath.Path
 	for i := 0; i < len(paths); i++ {
-		path := paths[i]
-		if seen[path] {
+		pp := paths[i]
+		if seen[pp] {
 			continue
 		}
-		seen[path] = true
-		if !strings.Contains(path, ":") {
-			_, err := hashFS.Stat(ctx, p.WorkspaceRoot, path)
+		seen[pp] = true
+		if !strings.Contains(string(pp), ":") {
+			_, err := hashFS.Stat(ctx, p.WorkspaceRoot, pp)
 			if err != nil {
-				if _, loaded := knownMissingInputs.LoadOrStore(path, true); !loaded {
+				if _, loaded := knownMissingInputs.LoadOrStore(pp, true); !loaded {
 					// TODO(b/271783311): hard error for bad config
-					clog.Warningf(ctx, "missing inputs %s", path)
+					clog.Warningf(ctx, "missing inputs %s", pp)
 				}
 			} else {
-				expanded = append(expanded, filepath.ToSlash(path))
+				expanded = append(expanded, pp)
 			}
 		}
-		path = toConfigPath(p, path)
-		deps, ok := sc.InputDeps[path]
+		configPath := toConfigPath(p, pp)
+		deps, ok := sc.InputDeps[configPath]
 		if ok {
 			if log.V(1) {
-				clog.Infof(ctx, "input-deps expand %s", path)
+				clog.Infof(ctx, "input-deps expand %s", configPath)
 			}
 			for _, dep := range deps {
-				dep := fromConfigPath(ctx, p, dep)
-				if strings.Contains(dep, ":") {
-					paths = append(paths, dep)
+				depPath := fromConfigPath(ctx, p, dep)
+				if strings.Contains(string(depPath), ":") {
+					paths = append(paths, depPath)
 					continue
 				}
-				_, err := hashFS.Stat(ctx, p.WorkspaceRoot, dep)
+				_, err := hashFS.Stat(ctx, p.WorkspaceRoot, depPath)
 				if err != nil {
-					if _, loaded := knownMissingInputs.LoadOrStore(depPathPair{dep, path}, true); !loaded {
-						clog.Warningf(ctx, "missing file in input-dep %s (from %s): %v", dep, path, err)
+					if _, loaded := knownMissingInputs.LoadOrStore(depPathPair{dep, configPath}, true); !loaded {
+						clog.Warningf(ctx, "missing file in input-dep %s (from %s): %v", depPath, configPath, err)
 					}
 					continue
 				}
-				paths = append(paths, dep)
+				paths = append(paths, depPath)
 			}
 		}
 	}
-	sort.Strings(expanded)
+	slices.SortFunc(expanded, func(a, b sisopath.Path) int {
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	})
 	return expanded
 }

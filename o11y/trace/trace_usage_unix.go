@@ -27,7 +27,7 @@ func (u *usageRecord) sample(pid int64, t time.Time) []Event {
 	ret := make([]Event, 0, 3)
 	o := Event{
 		Ph:  "C",
-		T:   t.Sub(u.start).Microseconds(),
+		T:   Micros(t.Sub(u.start)),
 		Pid: pid,
 		Tid: sisoTid,
 	}

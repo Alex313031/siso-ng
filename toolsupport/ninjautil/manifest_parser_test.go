@@ -5,12 +5,16 @@
 package ninjautil
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -29,6 +33,30 @@ func TestParser_Empty(t *testing.T) {
 	err = p.Load(ctx, "input")
 	if err != nil {
 		t.Errorf("Load %v", err)
+	}
+}
+
+// TestParser_PoolAtEnd checks that a pool can be the last statement.
+func TestParser_PoolAtEnd(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	err := os.WriteFile(filepath.Join(dir, "build.ninja"), []byte("pool p\n  depth = 3\n"), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewState()
+	p := NewManifestParser(state)
+	p.SetWd(dir)
+	if err := p.Load(ctx, "build.ninja"); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	pool, ok := state.LookupPool("p")
+	if !ok {
+		t.Fatal("missing pool p")
+	}
+	if got, want := pool.Depth(), 3; got != want {
+		t.Errorf("pool depth=%d; want=%d", got, want)
 	}
 }
 
@@ -396,6 +424,113 @@ subninja %[1]s/i/build.ninja
 	err := p.Load(ctx, "build.ninja")
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestParser_NestedSubninjaOnePermit(t *testing.T) {
+	origLoaderConcurrency := loaderConcurrency
+	loaderConcurrency = 1
+	defer func() { loaderConcurrency = origLoaderConcurrency }()
+	// A parent that held its permit while waiting for its children's
+	// permits would deadlock; the deadline turns that into an error.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+
+	write := func(fname, content string) {
+		t.Helper()
+		fname = filepath.Join(dir, fname)
+		err := os.MkdirAll(filepath.Dir(fname), 0755)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = os.WriteFile(fname, []byte(content), 0644)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Three levels of subninjas, three per file, with one edge per leaf.
+	var subninjas func(dir string, depth int) string
+	subninjas = func(dir string, depth int) string {
+		if depth == 0 {
+			return fmt.Sprintf("build %s/out: phony\n", dir)
+		}
+		var content string
+		for _, sub := range []string{"a", "b", "c"} {
+			fname := filepath.Join(dir, sub, "build.ninja")
+			write(fname, subninjas(filepath.Join(dir, sub), depth-1))
+			content += fmt.Sprintf("subninja %s\n", fname)
+		}
+		return content
+	}
+	write("build.ninja", subninjas("top", 3))
+
+	state := NewState()
+	p := NewManifestParser(state)
+	p.SetWd(dir)
+	err := p.Load(ctx, "build.ninja")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(state.edges), 27; got != want {
+		t.Errorf("len(state.edges)=%d; want %d", got, want)
+	}
+}
+
+// loadCancelledDuringParse loads a build.ninja with content and cancels
+// the context with cause while the file is being parsed. build.ninja has no
+// subninjas, so no later loader permit wait sees the cancellation.
+func loadCancelledDuringParse(t *testing.T, content string, cause error) error {
+	t.Helper()
+	dir := t.TempDir()
+	err := os.WriteFile(filepath.Join(dir, "build.ninja"), []byte(content), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancelCause(t.Context())
+		defer cancel(nil)
+		state := NewState()
+		defer state.Close()
+		p := NewManifestParser(state)
+		p.SetWd(dir)
+
+		// Hold the chunk permit so parsing blocks after acquiring the
+		// loader permit. Call loadFiles directly because Load resets fsema.
+		p.fsema = make(chan struct{}, 1)
+		p.fsema <- struct{}{}
+		result := make(chan error, 1)
+		go func() { result <- p.loadFiles(ctx, "build.ninja") }()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("loadFiles returned before cancellation: %v", err)
+		default:
+		}
+
+		// Cancel while parsing is blocked, then let it finish.
+		cancel(cause)
+		<-p.fsema
+		err = <-result
+	})
+	return err
+}
+
+func TestParser_CancelDuringLastParse(t *testing.T) {
+	cause := errors.New("test cancel")
+	err := loadCancelledDuringParse(t, "build out: phony\n", cause)
+	if !errors.Is(err, cause) {
+		t.Errorf("loadFiles: %v; want %v", err, cause)
+	}
+}
+
+func TestParser_LoadErrorWinsOverCancel(t *testing.T) {
+	// The include is read only after the held chunk permit is released, so
+	// it fails after the cancellation.
+	err := loadCancelledDuringParse(t, "include missing.ninja\n", errors.New("test cancel"))
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("loadFiles: %v; want %v", err, fs.ErrNotExist)
 	}
 }
 

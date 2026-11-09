@@ -28,6 +28,7 @@ import (
 	"go.chromium.org/build/siso/hashfs"
 	fspb "go.chromium.org/build/siso/hashfs/proto"
 	"go.chromium.org/build/siso/o11y/clog"
+	sisopath "go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/scandeps"
 	pb "go.chromium.org/build/siso/toolsupport/ciderutil/proto"
 	"go.chromium.org/build/siso/toolsupport/gccutil"
@@ -170,8 +171,14 @@ func (c *ideAnalysisCommand) analyze(ctx context.Context, buildPath *build.Path,
 		if err != nil {
 			return err
 		}
+		// Interpret the state under the digest function it was recorded with,
+		// so states from non-sha256 builds are not discarded as mismatched.
+		fn, err := hashfs.StateDigestFunction(fsstate)
+		if err != nil {
+			return err
+		}
 		// hashFS.SetState ?
-		analyzer.fsm = hashfs.StateMap(fsstate)
+		analyzer.fsm = hashfs.StateMap(fn, fsstate)
 		fmt.Fprintf(os.Stderr, "load hashfs state in %s\n", ui.FormatDuration(time.Since(started)))
 		return nil
 	})
@@ -406,34 +413,24 @@ func (a *ideAnalyzer) analyzeCPP(ctx context.Context, edge *ninjautil.Edge, resu
 		}
 		return result, nil
 	}
-	for i := range params.Sources {
-		params.Sources[i] = a.path.MaybeFromRelative(ctx, params.Sources[i])
+	canonicalizeAll := func(ss []string) []sisopath.Path {
+		ps := make([]sisopath.Path, len(ss))
+		for i, s := range ss {
+			ps[i] = sisopath.New(a.path.MaybeFromRelative(ctx, s))
+		}
+		return ps
 	}
-	// no need to canonicalize path for Includes.
-	// it should be used as is for `#include "pathname.h"`
 	for i := range params.Files {
 		params.Files[i] = a.path.MaybeFromRelative(ctx, params.Files[i])
 	}
-	for i := range params.Dirs {
-		params.Dirs[i] = a.path.MaybeFromRelative(ctx, params.Dirs[i])
-	}
-	for i := range params.QuoteDirs {
-		params.QuoteDirs[i] = a.path.MaybeFromRelative(ctx, params.QuoteDirs[i])
-	}
-	for i := range params.Frameworks {
-		params.Frameworks[i] = a.path.MaybeFromRelative(ctx, params.Frameworks[i])
-	}
-	for i := range params.Sysroots {
-		params.Sysroots[i] = a.path.MaybeFromRelative(ctx, params.Sysroots[i])
-	}
 	req := scandeps.Request{
 		Defines:    params.Defines,
-		Sources:    params.Sources,
-		Includes:   params.Includes,
-		Dirs:       params.Dirs,
-		QuoteDirs:  params.QuoteDirs,
-		Frameworks: params.Frameworks,
-		Sysroots:   params.Sysroots,
+		Sources:    canonicalizeAll(params.Sources),
+		Includes:   sisopath.Paths(params.Includes),
+		Dirs:       canonicalizeAll(params.Dirs),
+		QuoteDirs:  canonicalizeAll(params.QuoteDirs),
+		Frameworks: canonicalizeAll(params.Frameworks),
+		Sysroots:   canonicalizeAll(params.Sysroots),
 	}
 	started := time.Now()
 	clog.Infof(ctx, "scandeps %#v", req)
@@ -450,7 +447,7 @@ func (a *ideAnalyzer) analyzeCPP(ctx context.Context, edge *ninjautil.Edge, resu
 	started = time.Now()
 
 	for _, inc := range incs {
-		incTarget := a.path.MaybeToRelative(ctx, inc)
+		incTarget := a.path.MaybeToRelative(ctx, string(inc))
 		node, ok := a.state.LookupNodeByPath(incTarget)
 		if !ok {
 			clog.Infof(ctx, "not in build graph: %s", incTarget)
@@ -465,7 +462,7 @@ func (a *ideAnalyzer) analyzeCPP(ctx context.Context, edge *ninjautil.Edge, resu
 		var generatedFiles []*pb.GeneratedFile
 		for _, out := range inEdge.Outputs() {
 			path := out.Path()
-			buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, a.path.MaybeFromRelative(ctx, path))
+			buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, sisopath.New(a.path.MaybeFromRelative(ctx, path)))
 			if err != nil {
 				clog.Infof(ctx, "not exist generated file %q: %v", path, err)
 				continue
@@ -561,7 +558,7 @@ func (a *ideAnalyzer) invalidation(ctx context.Context) *pb.Invalidation {
 			},
 		},
 	}
-	buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, a.path.MaybeFromRelative(ctx, "build.ninja.d"))
+	buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, sisopath.New(a.path.MaybeFromRelative(ctx, "build.ninja.d")))
 	if err != nil {
 		clog.Warningf(ctx, "failed to read build.ninja.d: %v", err)
 		return inv

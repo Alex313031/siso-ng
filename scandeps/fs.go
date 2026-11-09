@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"hash/maphash"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -16,6 +15,7 @@ import (
 
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 )
 
 // filesystem is mirror of hashfs to optimize for scandeps access pattern.
@@ -33,10 +33,19 @@ type filesystem struct {
 
 	hmaps sync.Map // hmap path -> *hmapresult
 
-	// shard by maphash to reduce lock contention
-	symtab  [256]sync.Map  // for incname, macros
-	pathtab [4096]sync.Map // for pathname
+	// sharded by maphash to reduce lock contention. A typed
+	// map[string]string + RWMutex avoids boxing string keys into
+	// interface{}, which a sync.Map does per access (~104M allocs
+	// per cache-cold build, top of the alloc profile).
+	symtab  [256]internShard  // for incname, macros
+	pathtab [4096]internShard // for pathname
 	seed    maphash.Seed
+
+	// headersDirs holds the directories with a ":headers" entry in
+	// InputDeps, so addDir looks up by dir instead of building
+	// dir+":headers" per call (~17M string allocs per cache-cold
+	// build). Read-only after ScanDeps.New, so no lock is needed.
+	headersDirs map[string]struct{}
 }
 
 type dircache struct {
@@ -51,22 +60,22 @@ func (fsys *filesystem) update(ctx context.Context, fi *hashfs.FileInfo) {
 	if log.V(1) {
 		clog.Infof(ctx, "update %s dir:%t", fi.Path(), fi.IsDir())
 	}
-	var dname string
+	var dname path.Path
 	var base string
 	if !fi.IsDir() {
-		fname := filepath.ToSlash(fi.Path())
+		fname := fi.Path()
 		fsys.forgetFile(fname)
-		base = filepath.Base(fname)
-		dname = filepath.ToSlash(filepath.Dir(fname))
+		base = string(fname.Base())
+		dname = fname.Dir()
 	} else {
-		dname = filepath.ToSlash(fi.Path())
+		dname = fi.Path()
 	}
 	// fix dircache
-	for dname := dname; !strings.HasSuffix(dname, "/"); {
+	for dname := dname; !strings.HasSuffix(string(dname), "/"); {
 		v, ok := fsys.dircache.Load(dname)
 		if !ok {
-			base = filepath.Base(dname)
-			dname = filepath.ToSlash(filepath.Dir(dname))
+			base = string(dname.Base())
+			dname = dname.Dir()
 			continue
 		}
 		dc := v.(*dircache)
@@ -75,34 +84,34 @@ func (fsys *filesystem) update(ctx context.Context, fi *hashfs.FileInfo) {
 		default:
 			clog.Infof(ctx, "update race ReadDir&update %s", fi.Path())
 			fsys.dircache.Delete(dname)
-			base = filepath.Base(dname)
-			dname = filepath.ToSlash(filepath.Dir(dname))
+			base = string(dname.Base())
+			dname = dname.Dir()
 			continue
 		}
 		if dc.err != nil {
 			// negative cache?
 			clog.Infof(ctx, "update clear negative cache %s %v", fi.Path(), dc.err)
 			fsys.dircache.Delete(dname)
-			base = filepath.Base(dname)
-			dname = filepath.ToSlash(filepath.Dir(dname))
+			base = string(dname.Base())
+			dname = dname.Dir()
 			continue
 		}
 		if base != "" {
 			dc.m.LoadOrStore(base, true)
 		}
-		base = filepath.Base(dname)
-		dname = filepath.ToSlash(filepath.Dir(dname))
+		base = string(dname.Base())
+		dname = dname.Dir()
 	}
-	for !strings.HasSuffix(dname, "/") {
+	for !strings.HasSuffix(string(dname), "/") {
 		if fsys.markDirExists(dname) {
 			return
 		}
-		dname = filepath.ToSlash(filepath.Dir(dname))
+		dname = dname.Dir()
 	}
 }
 
-func (fsys *filesystem) forgetFile(fname string) {
-	base := filepath.Base(fname)
+func (fsys *filesystem) forgetFile(fname path.Path) {
+	base := string(fname.Base())
 	v, ok := fsys.files.Load(base)
 	if ok {
 		m := v.(*sync.Map)
@@ -110,8 +119,8 @@ func (fsys *filesystem) forgetFile(fname string) {
 	}
 }
 
-func (fsys *filesystem) markDirExists(dname string) bool {
-	v, _ := fsys.dirs.LoadOrStore(filepath.Base(dname), new(sync.Map))
+func (fsys *filesystem) markDirExists(dname path.Path) bool {
+	v, _ := fsys.dirs.LoadOrStore(string(dname.Base()), new(sync.Map))
 	m := v.(*sync.Map)
 	v, ok := m.Load(dname)
 	if !ok {
@@ -126,8 +135,8 @@ func (fsys *filesystem) markDirExists(dname string) bool {
 	return false
 }
 
-func (fsys *filesystem) ReadDir(ctx context.Context, workspaceRoot, dname string) (*sync.Map, []string, error) {
-	fullpath := filepath.ToSlash(filepath.Join(workspaceRoot, dname))
+func (fsys *filesystem) ReadDir(ctx context.Context, workspaceRoot string, dname path.Path) (*sync.Map, []string, error) {
+	fullpath := path.JoinRoot(workspaceRoot, dname)
 
 	// To avoid allocation of `dircache` in LoadOrStore, call Load first here.
 	dv, loaded := fsys.dircache.Load(fullpath)
@@ -147,12 +156,12 @@ func (fsys *filesystem) ReadDir(ctx context.Context, workspaceRoot, dname string
 			var visited []string
 			var err error
 			hfsys := fsys.hashfs.FileSystem(ctx, workspaceRoot)
-			fi, err := hfsys.Stat(dname)
+			fi, err := hfsys.Stat(string(dname))
 			if err == nil {
 				if len(hfsys.Visited(fi)) > 1 {
-					visited = hfsys.ExpandSymlinks(dname)
+					visited = hfsys.ExpandSymlinks(string(dname))
 				}
-				des, err := hfsys.ReadDir(dname)
+				des, err := hfsys.ReadDir(string(dname))
 				if err == nil {
 					dents = make([]hashfs.DirEntry, 0, len(des))
 					for _, de := range des {
@@ -168,12 +177,12 @@ func (fsys *filesystem) ReadDir(ctx context.Context, workspaceRoot, dname string
 				}
 				dc.m.Store(fsys.pathIntern(de.Name()), true)
 			}
-			dname = fullpath
-			for !strings.HasSuffix(dname, "/") {
-				if fsys.markDirExists(dname) {
+			walkName := fullpath
+			for !strings.HasSuffix(string(walkName), "/") {
+				if fsys.markDirExists(walkName) {
 					break
 				}
-				dname = filepath.ToSlash(filepath.Dir(dname))
+				walkName = walkName.Dir()
 			}
 			close(dc.ready)
 		}()
@@ -189,24 +198,54 @@ func (fsys *filesystem) ReadDir(ctx context.Context, workspaceRoot, dname string
 	return &dc.m, dc.symlinkTargets, nil
 }
 
+// internShard is one shard of a typed string interning table. The
+// typed map avoids the per-access interface-boxing allocation a
+// sync.Map would pay on the hot scandeps intern paths.
+type internShard struct {
+	mu sync.RWMutex
+	m  map[string]string
+}
+
+// get returns the canonical interned string for v, storing it on first
+// sight. clone controls whether v is cloned before storing; pass false
+// for callers holding a stable Go string (e.g. filepath.Base/Dir).
+func (s *internShard) get(v string, clone bool) string {
+	s.mu.RLock()
+	if existing, ok := s.m[v]; ok {
+		s.mu.RUnlock()
+		return existing
+	}
+	s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.m[v]; ok {
+		return existing
+	}
+	if s.m == nil {
+		s.m = make(map[string]string)
+	}
+	if clone {
+		v = strings.Clone(v)
+	}
+	s.m[v] = v
+	return v
+}
+
 func (fsys *filesystem) intern(v string) string {
-	v = strings.Clone(v)
 	i := int(maphash.String(fsys.seed, v) % uint64(len(fsys.symtab)))
-	vv, _ := fsys.symtab[i].LoadOrStore(v, v)
-	return vv.(string)
+	return fsys.symtab[i].get(v, true)
 }
 
 func (fsys *filesystem) pathIntern(v string) string {
 	i := int(maphash.String(fsys.seed, v) % uint64(len(fsys.pathtab)))
-	vv, _ := fsys.pathtab[i].LoadOrStore(v, v)
-	return vv.(string)
+	return fsys.pathtab[i].get(v, false)
 }
 
-func (fsys *filesystem) getDir(workspaceRoot, dname string) (exist, ok bool) {
-	base := filepath.Base(dname)
+func (fsys *filesystem) getDir(workspaceRoot string, dname path.Path) (exist, ok bool) {
+	base := string(dname.Base())
 	v, _ := fsys.dirs.LoadOrStore(base, new(sync.Map))
 	m := v.(*sync.Map)
-	v, ok = m.Load(filepath.ToSlash(filepath.Join(workspaceRoot, dname)))
+	v, ok = m.Load(path.JoinRoot(workspaceRoot, dname))
 	if !ok {
 		return false, false
 	}
@@ -214,19 +253,19 @@ func (fsys *filesystem) getDir(workspaceRoot, dname string) (exist, ok bool) {
 	return exist, true
 }
 
-func (fsys *filesystem) setDir(workspaceRoot, dname string, exist bool) {
-	v, _ := fsys.dirs.LoadOrStore(filepath.Base(dname), new(sync.Map))
+func (fsys *filesystem) setDir(workspaceRoot string, dname path.Path, exist bool) {
+	v, _ := fsys.dirs.LoadOrStore(string(dname.Base()), new(sync.Map))
 	m := v.(*sync.Map)
-	m.Store(filepath.ToSlash(filepath.Join(workspaceRoot, dname)), exist)
+	m.Store(path.JoinRoot(workspaceRoot, dname), exist)
 }
 
-func (fsys *filesystem) getFile(workspaceRoot, fname string) (*scanResult, bool) {
-	v, ok := fsys.files.Load(filepath.Base(fname))
+func (fsys *filesystem) getFile(workspaceRoot string, fname path.Path) (*scanResult, bool) {
+	v, ok := fsys.files.Load(string(fname.Base()))
 	if !ok {
 		return nil, false
 	}
 	m := v.(*sync.Map)
-	v, ok = m.Load(filepath.ToSlash(filepath.Join(workspaceRoot, fname)))
+	v, ok = m.Load(path.JoinRoot(workspaceRoot, fname))
 	if !ok {
 		return nil, false
 	}
@@ -234,10 +273,30 @@ func (fsys *filesystem) getFile(workspaceRoot, fname string) (*scanResult, bool)
 	return sr, true
 }
 
-func (fsys *filesystem) setFile(workspaceRoot, fname string, sr *scanResult) {
-	v, _ := fsys.files.LoadOrStore(filepath.Base(fname), new(sync.Map))
+// setFile caches sr for fname and returns the shared winner; racing callers
+// must adopt the return. sr == nil is a negative (not-found) entry: a real
+// *scanResult wins over nil and nil never overwrites one, so a regular-file
+// scan never adopts a nil and nil-derefs.
+func (fsys *filesystem) setFile(workspaceRoot string, fname path.Path, sr *scanResult) *scanResult {
+	v, _ := fsys.files.LoadOrStore(string(fname.Base()), new(sync.Map))
 	m := v.(*sync.Map)
-	m.Store(filepath.ToSlash(filepath.Join(workspaceRoot, fname)), sr)
+	key := path.JoinRoot(workspaceRoot, fname)
+	if sr == nil {
+		actual, _ := m.LoadOrStore(key, sr)
+		return actual.(*scanResult)
+	}
+	for {
+		actual, loaded := m.LoadOrStore(key, sr)
+		if !loaded {
+			return sr
+		}
+		if cur := actual.(*scanResult); cur != nil {
+			return cur
+		}
+		if m.CompareAndSwap(key, actual, sr) {
+			return sr
+		}
+	}
 }
 
 type hmapresult struct {
@@ -252,9 +311,9 @@ type hmapresult struct {
 
 // getHmap returns hmap and success flag.
 // If the same hamp has been computed, the results are returned from cache.
-func (fsys *filesystem) getHmap(ctx context.Context, workspaceRoot, fname string) (map[string]string, bool) {
+func (fsys *filesystem) getHmap(ctx context.Context, workspaceRoot string, fname path.Path) (map[string]string, bool) {
 	clog.Infof(ctx, "check hmap %s", fname)
-	v, _ := fsys.hmaps.LoadOrStore(filepath.ToSlash(filepath.Join(workspaceRoot, fname)), new(hmapresult))
+	v, _ := fsys.hmaps.LoadOrStore(path.JoinRoot(workspaceRoot, fname), new(hmapresult))
 	hr := v.(*hmapresult)
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
@@ -279,26 +338,26 @@ func (fsys *filesystem) getHmap(ctx context.Context, workspaceRoot, fname string
 	return hr.m, hr.ok
 }
 
-func (fsys *filesystem) readFile(ctx context.Context, root, fname string) ([]byte, []string, error) {
+func (fsys *filesystem) readFile(ctx context.Context, root string, fname path.Path) ([]byte, []string, error) {
 	hfsys := fsys.hashfs.FileSystem(ctx, root)
-	fi, err := hfsys.Stat(fname)
+	fi, err := hfsys.Stat(string(fname))
 	if err != nil {
 		return nil, nil, err
 	}
 	var visited []string
 	if len(hfsys.VisitedPaths(fi)) > 1 {
-		visited = hfsys.ExpandSymlinks(fname)
+		visited = hfsys.ExpandSymlinks(string(fname))
 	}
-	buf, err := hfsys.ReadFile(fname)
+	buf, err := hfsys.ReadFile(string(fname))
 	if err != nil {
 		return nil, nil, err
 	}
 	return buf, visited, nil
 }
 
-func (fsys *filesystem) statFollowSymlink(ctx context.Context, root, fname string) (hashfs.FileInfo, error) {
+func (fsys *filesystem) statFollowSymlink(ctx context.Context, root string, fname path.Path) (hashfs.FileInfo, error) {
 	hfsys := fsys.hashfs.FileSystem(ctx, root)
-	fi, err := hfsys.Stat(fname)
+	fi, err := hfsys.Stat(string(fname))
 	if err != nil {
 		return hashfs.FileInfo{}, err
 	}

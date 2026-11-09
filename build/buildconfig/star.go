@@ -13,6 +13,7 @@ import (
 	"go.starlark.net/starlarkstruct"
 
 	"go.chromium.org/build/siso/execute"
+	"go.chromium.org/build/siso/path"
 )
 
 const (
@@ -44,20 +45,24 @@ func packCmd(cmd *execute.Cmd, expandedInputs func() []string) (*starlarkstruct.
 	if err != nil {
 		return nil, err
 	}
+	outputs := path.Strings(cmd.Outputs)
+	for _, outdir := range cmd.OutputDirs {
+		outputs = append(outputs, outdir.String()+"/")
+	}
 	return starlarkstruct.FromStringDict(starlark.String("cmd"), map[string]starlark.Value{
 		cmdFieldArgs:          packTuple(cmd.Args),
 		cmdFieldEnvs:          envs,
-		cmdFieldDir:           starlark.String(cmd.WorkDir),
+		cmdFieldDir:           starlark.String(string(cmd.WorkDir)),
 		cmdFieldWorkspaceRoot: starlark.String(cmd.WorkspaceRoot),
 		cmdFieldDeps:          starlark.String(cmd.Deps),
-		cmdFieldInputs:        packList(cmd.Inputs),
-		cmdFieldToolInputs:    packList(cmd.ToolInputs),
+		cmdFieldInputs:        packList(path.Strings(cmd.Inputs)),
+		cmdFieldToolInputs:    packList(path.Strings(cmd.ToolInputs)),
 		cmdFieldExpandedInputs: starlark.NewBuiltin(cmdFieldExpandedInputs, func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 			log.V(1).Infof("cmd.expanded_inputs")
 			return packList(expandedInputs()), nil
 		}),
 		cmdFieldRSPFileContent: starlark.Bytes(cmd.RSPFileContent),
-		cmdFieldOutputs:        packList(cmd.Outputs),
+		cmdFieldOutputs:        packList(outputs),
 	}), nil
 }
 

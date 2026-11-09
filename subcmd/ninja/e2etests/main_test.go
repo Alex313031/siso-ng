@@ -10,20 +10,30 @@ import (
 	"os"
 	"testing"
 
+	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/subcmd/spawnhelper"
 )
 
-// TestMain lets the test binary act as the spawn helper when re-exec'd by
-// localexec.StartHelper (tests that drive ninja.Command.Run start one): under
-// `go test`, os.Executable() is this test binary. Without the dispatch, the
-// re-exec would run the whole test suite recursively (fork bomb).
+// TestMain lets the test binary act as the spawn helper or landlock helper when
+// re-exec'd (tests that drive ninja.Command.Run start one; landlock executor runs
+// `siso landlock <config>`): under `go test`, os.Executable() is this test binary.
+// Without the dispatch, the re-exec would run the whole test suite recursively (fork bomb).
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && os.Args[1] == "spawn-helper" {
-		c := spawnhelper.Cmd()
-		fs := flag.NewFlagSet("spawn-helper", flag.ExitOnError)
-		c.SetFlags(fs)
-		_ = fs.Parse(os.Args[2:]) // ExitOnError: exits on parse failure
-		os.Exit(int(c.Execute(context.Background(), fs)))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "spawn-helper":
+			c := spawnhelper.Cmd()
+			fs := flag.NewFlagSet("spawn-helper", flag.ExitOnError)
+			c.SetFlags(fs)
+			_ = fs.Parse(os.Args[2:]) // ExitOnError: exits on parse failure
+			os.Exit(int(c.Execute(context.Background(), fs)))
+		case "landlock":
+			c := build.LandlockCmd()
+			fs := flag.NewFlagSet("landlock", flag.ExitOnError)
+			c.SetFlags(fs)
+			_ = fs.Parse(os.Args[2:]) // ExitOnError: exits on parse failure
+			os.Exit(int(c.Execute(context.Background(), fs)))
+		}
 	}
 	m.Run()
 }

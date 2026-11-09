@@ -1,0 +1,19 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule gen
+  command = python3 ../../gen.py ../../foo.in ${out}
+
+rule cxx
+  command = python3 ../../cxx.py ${in} ${out}
+  deps = gcc
+  depfile = ${out}.d
+
+build gen/foo.h: gen ../../foo.in
+build a.o: cxx ../../a.cc || gen/foo.h
+build a2.o: cxx a.o
+build a3.o: cxx a2.o
+build b.o: cxx ../../b.cc || gen/foo.h
+build all: phony a3.o b.o
+default all

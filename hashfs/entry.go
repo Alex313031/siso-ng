@@ -21,10 +21,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/hashfs/osfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/monitoring"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
+	"go.chromium.org/build/siso/reapi/fetch"
 	"go.chromium.org/build/siso/reapi/retry"
 )
 
@@ -58,6 +62,9 @@ type entry struct {
 
 	// local indicates the file is generated locally.
 	local bool
+	// diskMiss indicates this negative entry came from a local-disk probe
+	// (init found the path absent), as opposed to an explicit removal.
+	diskMiss bool
 	// isChanged indicates the file is changed in the session.
 	isChanged bool
 	// isMissingChecked indicates the file is checked in ForgetMissings.
@@ -65,7 +72,7 @@ type entry struct {
 
 	target string // symlink.
 
-	src digest.Source
+	src blob.Source
 	buf []byte // from WriteFile.
 
 	mu sync.RWMutex
@@ -105,13 +112,14 @@ func (e *entry) String() string {
 
 var errNotRegular = errors.New("unexpected filetype not regular")
 
-func (e *entry) init(ctx context.Context, fname string, executables map[string]bool, osfs *osfs.OSFS) {
+func (e *entry) init(ctx context.Context, fname string, executables map[path.Path]bool, osfs *osfs.OSFS) {
 	fi, err := osfs.Lstat(ctx, fname)
 	if errors.Is(err, fs.ErrNotExist) {
 		if log.V(1) {
 			clog.Infof(ctx, "not exist %s", fname)
 		}
 		e.err = err
+		e.diskMiss = true
 		return
 	}
 	if err != nil {
@@ -162,7 +170,7 @@ func (e *entry) init(ctx context.Context, fname string, executables map[string]b
 	}
 }
 
-func (e *entry) compute(ctx context.Context, fname string) error {
+func (e *entry) compute(ctx context.Context, fn digest.Function, fname string) error {
 	// Fast path: already done, errored, or nothing to compute.
 	e.mu.Lock()
 	if e.err != nil {
@@ -174,58 +182,46 @@ func (e *entry) compute(ctx context.Context, fname string) error {
 		e.mu.Unlock()
 		return nil
 	}
-	if e.dch != nil {
-		// Another goroutine is already computing; wait for it.
-		dch := e.dch
+	dch := e.dch
+	if dch == nil {
+		// We're the first caller: claim the computation.
+		dch = make(chan struct{})
+		e.dch = dch
+		src := e.src
 		e.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-dch:
-		}
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.err
-	}
-	// We're the first caller: claim the computation.
-	e.dch = make(chan struct{})
-	e.mu.Unlock()
 
-	// Run in a goroutine so we can bail on context cancellation
-	// without blocking on disk I/O.
-	type result struct {
-		data digest.Data
-		err  error
+		// Run in a goroutine so callers can bail on context cancellation
+		// without blocking on disk I/O. Detach from the first caller's
+		// cancellation so a canceled caller does not poison e.err with
+		// context.Canceled or fail concurrent/subsequent waiters.
+		dctx := context.WithoutCancel(ctx)
+		go func() {
+			data, err := localDigest(dctx, fn, src, fname)
+			// Only write e.err on the error path. ReadDir's Range callback
+			// reads ee.err without holding e.mu, so an unconditional write
+			// (even of nil) would race with that read.
+			e.mu.Lock()
+			if err != nil {
+				e.err = err
+			} else {
+				e.d = data.Digest()
+			}
+			e.entryErrLogged.Store(false)
+			close(dch)
+			e.mu.Unlock()
+		}()
+	} else {
+		e.mu.Unlock()
 	}
-	ch := make(chan result, 1)
-	go func() {
-		data, err := localDigest(ctx, e.src, fname)
-		ch <- result{data, err}
-	}()
 
-	var err error
-	var d digest.Digest
 	select {
 	case <-ctx.Done():
-		err = context.Cause(ctx)
-	case r := <-ch:
-		err = r.err
-		d = r.data.Digest()
+		return context.Cause(ctx)
+	case <-dch:
 	}
-
-	// Only write e.err on the error path. ReadDir's Range callback
-	// reads ee.err without holding e.mu, so an unconditional write
-	// (even of nil) would race with that read.
 	e.mu.Lock()
-	if err != nil {
-		e.err = err
-	} else {
-		e.d = d
-	}
-	e.entryErrLogged.Store(false)
-	close(e.dch)
-	e.mu.Unlock()
-	return err
+	defer e.mu.Unlock()
+	return e.err
 }
 
 func (e *entry) digest() digest.Digest {
@@ -293,7 +289,7 @@ func (e *entry) updateDir(ctx context.Context, hfs *HashFS, dname string) []stri
 			}
 			wg.Go(func() {
 				// update entry in e.directory.
-				_, err := hfs.stat(ctx, dname, name, false)
+				_, err := hfs.stat(ctx, dname, path.Path(name), statOpts{})
 				if err != nil {
 					clog.Warningf(ctx, "updateDir stat %s: %v", name, err)
 				}
@@ -312,7 +308,7 @@ func (e *entry) updateDir(ctx context.Context, hfs *HashFS, dname string) []stri
 				continue
 			}
 			// update entry in e.directory.
-			_, err := hfs.stat(ctx, dname, name, false)
+			_, err := hfs.stat(ctx, dname, path.Path(name), statOpts{})
 			if err != nil {
 				clog.Warningf(ctx, "updateDir stat %s: %v", name, err)
 			}
@@ -402,26 +398,90 @@ func (e *entry) flush(ctx context.Context, fname string, osfs *osfs.OSFS, timeou
 	}
 }
 
-// flushRemove removes a file from disk, waiting for any in-progress
-// digest calculation to finish first (Windows sharing violation guard).
+// flushRemove removes a file from disk. Removal is safe even while a digest
+// read holds the file open: openRead shares FILE_SHARE_DELETE on Windows.
 func (e *entry) flushRemove(ctx context.Context, fname string, osfs *osfs.OSFS) error {
-	// to protect concurrent digest calculation and removal
-	// on Windows.
-	digestLock.Lock()
-	for {
-		if _, ok := digestFnames[fname]; !ok {
-			break
-		}
-		// wait if digest calculation on fname is under progress
-		digestCond.Wait()
-	}
 	err := osfs.Remove(ctx, fname)
-	digestLock.Unlock()
 	clog.Infof(ctx, "flush remove %s: %v", fname, err)
 	if errors.Is(err, fs.ErrNotExist) {
 		err = nil
 	}
 	return err
+}
+
+// removeStaleForFlush removes an on-disk entry whose type no longer matches
+// the recorded output. RemoveAll, not Remove: it may be a non-empty directory.
+func removeStaleForFlush(ctx context.Context, fname, desc string, osfs *osfs.OSFS) error {
+	clog.Warningf(ctx, "flush %s: was %s in a previous build; removing stale entry", fname, desc)
+	if err := osfs.RemoveAll(ctx, fname); err != nil {
+		return fmt.Errorf("flush %s: remove stale %s: %w", fname, desc, err)
+	}
+	return nil
+}
+
+// staleAncestorMu serializes stale-ancestor removal across concurrent
+// flushes. Two outputs below the same stale file must not both act on their
+// own Lstat: one would recreate the directory and materialize its output,
+// and the other would then RemoveAll that directory (with the sibling's
+// fresh output inside) based on its stale view.
+var staleAncestorMu sync.Mutex
+
+// mkdirAllForFlush ensures dir exists for an output being flushed below it,
+// removing a stale non-directory ancestor: the recorded entry proves every
+// component must be a directory, so anything else on the path is a leftover
+// from a previous build. A symlink that resolves to a directory is a valid
+// component and is kept.
+func mkdirAllForFlush(ctx context.Context, dir string, osfs *osfs.OSFS) error {
+	err := osfs.MkdirAll(ctx, dir, 0755)
+	if err == nil {
+		return nil
+	}
+	staleAncestorMu.Lock()
+	defer staleAncestorMu.Unlock()
+	// A concurrent flush may have removed the stale ancestor while we waited
+	// for the lock; the walk below then acts on the current on-disk state.
+	if merr := osfs.MkdirAll(ctx, dir, 0755); merr == nil {
+		return nil
+	}
+	// Walk up to the first existing component. At most one non-directory can
+	// exist on the path (nothing can exist below it), so one removal is
+	// enough.
+	for p := dir; ; {
+		fi, lerr := osfs.Lstat(ctx, p)
+		if lerr != nil {
+			// The component doesn't exist or is unreachable below a
+			// non-directory ancestor (ENOTDIR); keep walking up.
+			parent := filepath.Dir(p)
+			if parent == p {
+				return err
+			}
+			p = parent
+			continue
+		}
+		if fi.IsDir() {
+			// MkdirAll failed for some other reason.
+			return err
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			sfi, serr := os.Stat(p)
+			if serr == nil && sfi.IsDir() {
+				// A symlink to a directory is a valid component, not what
+				// made MkdirAll fail.
+				return err
+			}
+			// A symlink is stale only on positive proof: it resolves to a
+			// non-directory, or it is dangling (ENOENT/ENOTDIR). One with an
+			// unstatable target (EACCES, EIO, ...) may be intentional;
+			// removing it would divert outputs from the symlink's target.
+			if serr != nil && !errors.Is(serr, fs.ErrNotExist) && !errors.Is(serr, syscall.ENOTDIR) {
+				return serr
+			}
+		}
+		if rerr := removeStaleForFlush(ctx, p, "a non-directory ancestor", osfs); rerr != nil {
+			return rerr
+		}
+		return osfs.MkdirAll(ctx, dir, 0755)
+	}
 }
 
 // flushDir ensures a directory exists on disk with the correct mtime.
@@ -434,7 +494,14 @@ func (e *entry) flushDir(ctx context.Context, fname string, osfs *osfs.OSFS) err
 		}
 		return nil
 	}
-	err = osfs.MkdirAll(ctx, fname, 0755)
+	if err == nil && !fi.IsDir() {
+		// A stale file/symlink from a previous build is in the way;
+		// MkdirAll can't replace it, so remove it first.
+		if rerr := removeStaleForFlush(ctx, fname, "a non-directory", osfs); rerr != nil {
+			return rerr
+		}
+	}
+	err = mkdirAllForFlush(ctx, fname, osfs)
 	if err != nil {
 		clog.Infof(ctx, "flush dir %s: %v", fname, err)
 	} else {
@@ -450,15 +517,35 @@ func (e *entry) flushSymlink(ctx context.Context, fname string, osfs *osfs.OSFS)
 	if err == nil && e.target == target {
 		return nil
 	}
-	e.mu.Lock()
-	err = osfs.Symlink(ctx, e.target, fname)
-	if errors.Is(err, fs.ErrExist) {
-		err = osfs.Remove(ctx, fname)
-		if err == nil {
-			err = osfs.Symlink(ctx, e.target, fname)
+	// Clear whatever occupies the path before creating the symlink, outside
+	// e.mu so readers of the entry aren't blocked behind a slow tree removal.
+	// Probe with Lstat rather than keying on the Symlink error: on Windows a
+	// directory in the way fails with ERROR_ACCESS_DENIED, not ErrExist.
+	if _, lerr := osfs.Lstat(ctx, fname); lerr == nil {
+		if rerr := removeStaleForFlush(ctx, fname, "a stale entry", osfs); rerr != nil {
+			return rerr
+		}
+	} else {
+		// needed for SISO_EXPERIMENTS=disable-ensure-output-dirs,
+		// since the parent directory of symlink may not exist yet
+		// and symlink below would fail.
+		err = mkdirAllForFlush(ctx, filepath.Dir(fname), osfs)
+		if err != nil {
+			clog.Warningf(ctx, "flush %s: mkdir: %v", fname, err)
+			return fmt.Errorf("failed to create directory for %s: %w", fname, err)
 		}
 	}
-	e.mu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	err = osfs.Symlink(ctx, e.target, fname)
+	if errors.Is(err, fs.ErrExist) {
+		// The path appeared between the Lstat probe and the Symlink (an
+		// external writer racing the flush); clear it and retry once.
+		if rerr := removeStaleForFlush(ctx, fname, "a raced entry", osfs); rerr != nil {
+			return rerr
+		}
+		err = osfs.Symlink(ctx, e.target, fname)
+	}
 	clog.Infof(ctx, "flush symlink %s -> %s: %v", fname, e.target, err)
 	// don't change mtimes. it fails if target doesn't exist.
 	return err
@@ -472,16 +559,15 @@ func (e *entry) flushRegularFile(ctx context.Context, fname string, osfs *osfs.O
 
 	var removeReason string
 	fi, err := osfs.Lstat(ctx, fname)
-	if err == nil {
-		if fi.IsDir() {
-			err := &fs.PathError{
-				Op:   "flush",
-				Path: fname,
-				Err:  syscall.EISDIR,
-			}
-			clog.Warningf(ctx, "flush %s: %v", fname, err)
-			return err
+	if err == nil && fi.IsDir() {
+		// A stale directory from a previous build is in the way; remove
+		// the tree and treat the path as absent.
+		if rerr := removeStaleForFlush(ctx, fname, "a directory", osfs); rerr != nil {
+			return rerr
 		}
+		fi, err = nil, fs.ErrNotExist
+	}
+	if err == nil {
 		if e.matchesFileInfo(fi) {
 			// TODO: check hash, mode?
 			clog.Infof(ctx, "flush %s: already exist", fname)
@@ -500,7 +586,7 @@ func (e *entry) flushRegularFile(ctx context.Context, fname string, osfs *osfs.O
 		}
 	}
 
-	err = osfs.MkdirAll(ctx, filepath.Dir(fname), 0755)
+	err = mkdirAllForFlush(ctx, filepath.Dir(fname), osfs)
 	if err != nil {
 		clog.Warningf(ctx, "flush %s: mkdir: %v", fname, err)
 		return fmt.Errorf("failed to create directory for %s: %w", fname, err)
@@ -522,9 +608,8 @@ func (e *entry) flushRegularFile(ctx context.Context, fname string, osfs *osfs.O
 		clog.Infof(ctx, "flush %s: empty file", fname)
 		err = osfs.WriteFile(ctx, fname, nil, 0644)
 	case len(e.buf) > 0:
-		removeBeforeWrite()
 		clog.Infof(ctx, "flush %s from embedded buf", fname)
-		err = osfs.WriteFile(ctx, fname, e.buf, e.mode)
+		err = writeFileAtomic(ctx, fname, osfs, e.buf, e.mode, removeReason)
 	case d.IsZero():
 		return fmt.Errorf("no data: retrieve %s: ", fname)
 	case removeReason == "" && e.isSourceFile(osfs, fname):
@@ -545,9 +630,11 @@ func isWritable(fi os.FileInfo) bool {
 	return fi.Mode()&0200 != 0
 }
 
-// matchesFileInfo reports whether fi has the same size and mtime as the entry.
+// matchesFileInfo reports whether fi is a regular file with the same size and
+// mtime as the entry. The type check rejects a stale symlink whose
+// link-string length and mtime coincide with the recorded file.
 func (e *entry) matchesFileInfo(fi os.FileInfo) bool {
-	return fi.Size() == e.digest().SizeBytes && fi.ModTime().Equal(e.getMtime())
+	return fi.Mode().IsRegular() && fi.Size() == e.digest().SizeBytes && fi.ModTime().Equal(e.getMtime())
 }
 
 // flushSkipMatchingDigest checks whether the file on disk already has the
@@ -560,7 +647,7 @@ func (e *entry) flushSkipMatchingDigest(ctx context.Context, fname string, fi os
 		return false, nil
 	}
 	src := osfs.FileSource(fname, fi.Size())
-	ld, err := localDigest(ctx, src, fname)
+	ld, err := localDigest(ctx, osfs.DigestFunction(), src, fname)
 	if err != nil {
 		clog.Warningf(ctx, "flush %s: digest error: %v", fname, err)
 		return false, nil
@@ -601,6 +688,26 @@ func (e *entry) isSourceFile(osfs *osfs.OSFS, fname string) bool {
 	return ok && lsrc.Fname == fname
 }
 
+// writeFileAtomic writes data to fname via a temp file and rename, so a
+// concurrent reader or an interrupted flush never observes a truncated or
+// partially-written file. rename atomically replaces an existing regular file
+// (including a hardlink). A non-regular dst (removeReason != "") is removed
+// first, mirroring flushWrite, since rename can't replace a directory.
+func writeFileAtomic(ctx context.Context, fname string, osfs *osfs.OSFS, data []byte, perm fs.FileMode, removeReason string) error {
+	tmpname := filepath.Join(filepath.Dir(fname), "."+filepath.Base(fname)+".siso_tmp")
+	if err := osfs.WriteFile(ctx, tmpname, data, perm); err != nil {
+		return err
+	}
+	if removeReason != "" {
+		if err := osfs.Remove(ctx, fname); err != nil {
+			clog.Warningf(ctx, "flush %s: remove %s: %v", fname, removeReason, err)
+		} else {
+			clog.Infof(ctx, "flush %s: remove %s", fname, removeReason)
+		}
+	}
+	return osfs.Rename(ctx, tmpname, fname)
+}
+
 // flushWrite writes file data to fname, trying clone first if supported,
 // falling back to tmp+rename.
 func (e *entry) flushWrite(ctx context.Context, fname string, osfs *osfs.OSFS, started time.Time, timeout time.Duration, removeReason string) error {
@@ -637,7 +744,7 @@ func (e *entry) flushWrite(ctx context.Context, fname string, osfs *osfs.OSFS, s
 		srcname = lsrc.Fname
 	}
 	tmpname := filepath.Join(filepath.Dir(fname), "."+filepath.Base(fname)+".siso_tmp")
-	ctx, cancel := digest.ContextWithTimeout(ctx, e.d)
+	ctx, cancel := fetch.ContextWithTimeout(ctx, e.d)
 	defer cancel()
 	// Skip the first-byte watchdog for local FileSource: no gRPC
 	// InPayload event can fire and a slow local copy would be falsely

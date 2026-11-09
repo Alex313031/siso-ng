@@ -13,15 +13,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/buildconfig"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/reapi"
 )
 
 var (
@@ -242,6 +247,17 @@ func touchFile(t *testing.T, dir, name string) {
 	}
 }
 
+// readFile returns the content of the file at path, failing the test if it
+// cannot be read.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -331,7 +347,7 @@ func setupBuild(ctx context.Context, t *testing.T, dir string, fsopt hashfs.Opti
 			t.Fatal(err)
 		}
 	})
-	stepConfig, err := ninjabuild.NewStepConfig(ctx, config, path, "build.ninja", ".")
+	stepConfig, err := ninjabuild.NewStepConfig(ctx, digest.SHA256, config, path, "build.ninja", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,9 +356,12 @@ func setupBuild(ctx context.Context, t *testing.T, dir string, fsopt hashfs.Opti
 		t.Fatal(err)
 	}
 
-	graph := ninjabuild.NewGraph(ctx, "build.ninja", nstate, config, path, hashFS, stepConfig, depsLog)
+	graph, err := ninjabuild.NewGraph(ctx, "build.ninja", nstate, config, path, hashFS, stepConfig, depsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	cachestore, err := build.NewLocalCache(".siso_cache")
+	cachestore, err := reapi.NewLocalCache(".siso_cache")
 	if err != nil {
 		t.Logf("no local cache enabled: %v", err)
 	}
@@ -359,8 +378,10 @@ func setupBuild(ctx context.Context, t *testing.T, dir string, fsopt hashfs.Opti
 		}
 	})
 	opt := build.Options{
-		Path:            path,
-		HashFS:          hashFS,
+		Path:   path,
+		HashFS: hashFS,
+		// Forward active build label from fsopt so test builds tag output artifacts in .siso_fs_state.
+		BuildLabel:      fsopt.BuildLabel,
 		REExecEnable:    true,
 		Cache:           cache,
 		FailuresAllowed: 1,
@@ -368,8 +389,8 @@ func setupBuild(ctx context.Context, t *testing.T, dir string, fsopt hashfs.Opti
 		ExplainWriter:   &explain,
 	}
 	return opt, graph, func() {
-		for i := len(cleanups) - 1; i >= 0; i-- {
-			cleanups[i]()
+		for _, cleanup := range slices.Backward(cleanups) {
+			cleanup()
 		}
 	}
 }
@@ -406,8 +427,48 @@ func openDepsLog(ctx context.Context, t *testing.T, dir string) (*ninjabuild.Dep
 		}
 	})
 	return depsLog, func() {
-		for i := len(cleanups) - 1; i >= 0; i-- {
-			cleanups[i]()
+		for _, cleanup := range slices.Backward(cleanups) {
+			cleanup()
 		}
+	}
+}
+
+// skipUnlessNsjailUsable skips the test unless nsjail can actually run here:
+// it may be installed yet unable to build its mount namespace in restricted
+// environments (unprivileged CI containers), so probe with a trivial action.
+func skipUnlessNsjailUsable(t *testing.T) {
+	t.Helper()
+	nsjailPath, err := exec.LookPath("nsjail")
+	if err != nil {
+		t.Skip("This test requires nsjail: not found in PATH")
+	}
+	out, err := exec.Command(nsjailPath, "--quiet", "--chroot", "/", "--cwd", "/", "--disable_rlimits", "--", "/bin/true").CombinedOutput()
+	if err != nil {
+		t.Skipf("This test requires a working nsjail: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+}
+
+// skipUnlessLandlockUsable skips the test unless landlock can actually run here:
+// it may not be supported by the host kernel or in restricted environments.
+func skipUnlessLandlockUsable(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("landlock sandbox is only available on linux")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("cannot find executable: %v", err)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "landlock_probe_*.json")
+	if err != nil {
+		t.Skipf("cannot create temp file for landlock probe: %v", err)
+	}
+	defer os.Remove(f.Name())
+	_, _ = f.WriteString(`{"AllowGlobalReaddir":true,"RODirs":["/bin","/lib","/lib64","/usr/bin","/usr/lib","/usr/lib32","/usr/lib64"],"RWDirs":["/dev"],"Args":["/bin/true"]}`)
+	_ = f.Close()
+
+	out, err := exec.Command(exe, "landlock", f.Name()).CombinedOutput()
+	if err != nil {
+		t.Skipf("This test requires working landlock: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 }

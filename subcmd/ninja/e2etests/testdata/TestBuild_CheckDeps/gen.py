@@ -3,14 +3,13 @@
 # found in the LICENSE file.
 
 import argparse
-import os
 import sys
 
 
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("input", type=argparse.FileType())
-  parser.add_argument("outs", type=argparse.FileType(mode='w'), nargs='+')
+  parser.add_argument("outs", type=argparse.FileType(mode="w"), nargs="+")
   options = parser.parse_args()
 
   data = options.input.read()

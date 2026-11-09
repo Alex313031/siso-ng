@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"go.chromium.org/build/siso/execute"
+	"go.chromium.org/build/siso/execute/spawnhelper"
 )
 
 func helperCmd(t *testing.T, args ...string) *execute.Cmd {
@@ -169,33 +170,6 @@ func TestRunViaHelperCancel(t *testing.T) {
 	}
 }
 
-// TestHelperExitsOnConnClose verifies the parent-death contract: when siso's end
-// of the control socket closes, the helper observes EOF and exits.
-func TestHelperExitsOnConnClose(t *testing.T) {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := launch(exe, "")
-	if err != nil {
-		t.Fatalf("launch: %v", err)
-	}
-	if err := c.conn.close(); err != nil {
-		t.Fatalf("close conn: %v", err)
-	}
-	exited := make(chan struct{})
-	go func() {
-		_ = c.cmd.Wait()
-		close(exited)
-	}()
-	select {
-	case <-exited:
-	case <-time.After(10 * time.Second):
-		_ = c.cmd.Process.Kill()
-		t.Fatal("helper did not exit after the control connection closed")
-	}
-}
-
 // TestRunViaHelperEnv checks that cmd.Env reaches the child through the helper.
 func TestRunViaHelperEnv(t *testing.T) {
 	cmd := &execute.Cmd{
@@ -255,12 +229,12 @@ func TestHelperDeathUnblocksRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := launch(exe, "")
+	c, err := spawnhelper.Launch([]string{exe, "spawn-helper"}, "", false)
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
-	orig := helper.Swap(c)
-	t.Cleanup(func() { helper.Store(orig) })
+	orig := SetSpawnHelper(c)
+	t.Cleanup(func() { SetSpawnHelper(orig) })
 
 	// ctx stays live while we wait below; the unblock under test must come from
 	// the helper dying, not from ctx cancellation (which only happens at cleanup).
@@ -279,7 +253,7 @@ func TestHelperDeathUnblocksRun(t *testing.T) {
 
 	// Let the action start its child, then kill the helper (not the child).
 	time.Sleep(300 * time.Millisecond)
-	if err := c.cmd.Process.Kill(); err != nil {
+	if err := c.Kill(); err != nil {
 		t.Fatalf("kill helper: %v", err)
 	}
 
@@ -300,12 +274,12 @@ func TestHelperDrainsOnConnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := launch(exe, "")
+	c, err := spawnhelper.Launch([]string{exe, "spawn-helper"}, "", false)
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
-	orig := helper.Swap(c)
-	t.Cleanup(func() { helper.Store(orig) })
+	orig := SetSpawnHelper(c)
+	t.Cleanup(func() { SetSpawnHelper(orig) })
 
 	tmp := t.TempDir()
 	pidfile := filepath.Join(tmp, "pid")
@@ -326,15 +300,15 @@ func TestHelperDrainsOnConnClose(t *testing.T) {
 
 	// Simulate siso death: close the control socket. The helper must drain
 	// (cancel + kill + reap the child) before exiting.
-	if err := c.conn.close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatalf("close conn: %v", err)
 	}
 	exited := make(chan struct{})
-	go func() { _ = c.cmd.Wait(); close(exited) }()
+	go func() { _ = c.Wait(); close(exited) }()
 	select {
 	case <-exited:
 	case <-time.After(15 * time.Second):
-		_ = c.cmd.Process.Kill()
+		_ = c.Kill()
 		t.Fatal("helper did not exit after the control connection closed")
 	}
 
@@ -348,33 +322,30 @@ func TestHelperDrainsOnConnClose(t *testing.T) {
 	}
 }
 
-// TestLaunchSetsOwnProcessGroup verifies launch puts the helper in its own process
-// group, so a terminal Ctrl-C or group SIGTERM to siso doesn't reach it directly.
-func TestLaunchSetsOwnProcessGroup(t *testing.T) {
+// TestHelperExitsOnConnClose verifies the parent-death contract: when siso's end
+// of the control socket closes, the helper observes EOF and exits.
+func TestHelperExitsOnConnClose(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := launch(exe, "")
+	c, err := spawnhelper.Launch([]string{exe, "spawn-helper"}, "", false)
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = c.conn.close()
-		_ = c.cmd.Process.Kill()
-		_ = c.cmd.Wait()
-	})
-
-	pid := c.cmd.Process.Pid
-	pgid, err := syscall.Getpgid(pid)
-	if err != nil {
-		t.Fatalf("Getpgid(%d): %v", pid, err)
+	if err := c.Close(); err != nil {
+		t.Fatalf("close conn: %v", err)
 	}
-	if pgid != pid {
-		t.Errorf("helper pgid = %d, want it to lead its own group (== pid %d)", pgid, pid)
-	}
-	if self, err := syscall.Getpgid(0); err == nil && pgid == self {
-		t.Errorf("helper pgid = %d shares the test process group %d; want its own", pgid, self)
+	exited := make(chan struct{})
+	go func() {
+		_ = c.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		_ = c.Kill()
+		t.Fatal("helper did not exit after the control connection closed")
 	}
 }
 

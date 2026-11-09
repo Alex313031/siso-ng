@@ -7,6 +7,7 @@ package pprof
 
 import (
 	"compress/gzip"
+	"context"
 	"errors"
 	"io"
 	"sort"
@@ -16,8 +17,15 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/siso/build/metadata"
 	pb "go.chromium.org/build/siso/o11y/pprof/proto"
 )
+
+// Uploader defines interface for uploading pprof profiles.
+type Uploader interface {
+	SetMetadata(ctx context.Context, m metadata.Metadata)
+	Upload(ctx context.Context, p *Profile) error
+}
 
 // Profile is a profile entry.
 type Profile struct {

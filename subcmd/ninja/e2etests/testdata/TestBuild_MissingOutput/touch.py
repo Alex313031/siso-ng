@@ -8,10 +8,10 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('output', type=argparse.FileType(mode='w'), help='output')
+  parser.add_argument("output", type=argparse.FileType(mode="w"), help="output")
   options = parser.parse_args()
 
-  options.output.write('')
+  options.output.write("")
   return 0
 
 

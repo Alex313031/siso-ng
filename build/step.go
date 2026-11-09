@@ -11,18 +11,21 @@ import (
 	"fmt"
 	"iter"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	log "github.com/golang/glog"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
-	"go.chromium.org/build/siso/reapi/digest"
+	sisopath "go.chromium.org/build/siso/path"
+	"go.chromium.org/build/siso/reapi"
 )
 
 // StepDef is a build step definition.
@@ -56,69 +59,80 @@ type StepDef interface {
 	Binding(string) string
 
 	// Depfile returns workspace relative depfile path, or empty if not set.
-	Depfile(context.Context) string
+	Depfile(context.Context) sisopath.Path
 
 	// Rspfile returns workspace relative rspfile path, or empty if not set.
-	Rspfile(context.Context) string
+	Rspfile(context.Context) sisopath.Path
 
 	// Inputs returns inputs of the step.
-	Inputs(context.Context) []string
+	Inputs(context.Context) []sisopath.Path
 
 	// TriggerInputs returns inputs of the step that would trigger
 	// the step's action.  no order-only.
 	// For  deps in deps log, use DepInputs.
-	TriggerInputs(context.Context) []string
+	TriggerInputs(context.Context) []sisopath.Path
+
+	// ExpandedTriggerInputs returns trigger inputs of the step with phony
+	// targets expanded recursively to their underlying trigger inputs.
+	ExpandedTriggerInputs(context.Context) []sisopath.Path
 
 	// DepInputs returns iterator for inputs via depfile of the step.
 	// if depfile is not set, returns emptyIter, nil
 	// if depfile or deplog is not found, returns wrapped ErrMissingDeps.
-	DepInputs(context.Context) (iter.Seq[string], error)
+	DepInputs(context.Context) (iter.Seq[sisopath.Path], error)
 
 	// DepsBaseInputs returns inputs of the step, which will be combined
 	// with scandeps results (bool arg false),
 	// or will be trimmed down by scandeps results (bool arg true).
-	DepsBaseInputs(context.Context, []string, bool) []string
+	DepsBaseInputs(context.Context, []sisopath.Path, bool) []sisopath.Path
 
 	// ToolInputs returns tool inputs of the step.
 	// ToolInputs is added to deps inputs.
-	ToolInputs(context.Context) []string
+	ToolInputs(context.Context) []sisopath.Path
 
 	// ExpandedCaseSensitives returns expanded filenames if platform is case-sensitive.
-	ExpandedCaseSensitives(context.Context, []string) []string
+	ExpandedCaseSensitives(context.Context, []sisopath.Path) []sisopath.Path
 
 	// ExpandedInputs returns expanded inputs of the step.
-	ExpandedInputs(context.Context) []string
+	ExpandedInputs(context.Context) []sisopath.Path
 
 	// RemoteInputs maps file used in remote to file exists on local.
 	// path in remote action -> local path
-	RemoteInputs() map[string]string
+	RemoteInputs() map[sisopath.Path]sisopath.Path
 
-	// CheckInputDeps checks dep can be found in its direct/indirect inputs.
-	// Returns true if it is unknown bad deps, false otherwise.
-	CheckInputDeps(context.Context, []string) (bool, error)
+	// CheckMissingDeps checks if depInputs can be found in direct/indirect inputs.
+	// It returns whether any missing dependency is a known issue, and an error describing
+	// any missing dependencies found.
+	CheckMissingDeps(context.Context, []sisopath.Path) (known bool, err error)
 
 	// Handle runs a handler for the cmd.
 	Handle(context.Context, *execute.Cmd) error
 
 	// Outputs returns outputs of the step.
-	Outputs(context.Context) []string
+	Outputs(context.Context) []sisopath.Path
 
 	// LocalOutputs returns outputs of the step that should be written to the local disk.
-	LocalOutputs(context.Context) []string
+	LocalOutputs(context.Context) []sisopath.Path
 
 	// AuxiliaryLogOutputFiles returns output files that siso explicitly logs digest of
 	// but doesn't download to disk.
-	AuxiliaryLogOutputFiles(context.Context) []string
+	AuxiliaryLogOutputFiles(context.Context) []sisopath.Path
 
 	// AuxiliaryLogOutputDirs returns output directories that siso explicitly logs digest of
 	// but doesn't download to disk.
-	AuxiliaryLogOutputDirs(context.Context) []string
+	AuxiliaryLogOutputDirs(context.Context) []sisopath.Path
 
 	// Pure indicates the step is pure or not.
 	Pure() bool
 
 	// Platform returns platform properties for remote execution.
 	Platform() map[string]string
+
+	// IsRemoteRule reports whether the step is declared remote-executable in
+	// the stepconfig (the static rule.Remote flag). Unlike Platform(), it is
+	// stable from scheduling on, even when Platform() is cleared at runtime
+	// (pool=console, scandeps fallback).
+	IsRemoteRule() bool
 
 	// Sandbox returns properties for action sandboxing.
 	Sandbox() map[string]string
@@ -151,11 +165,18 @@ type Step struct {
 
 	cmd *execute.Cmd
 
-	readyTime     time.Time
-	prevStepID    string
+	readyTime time.Time
+	// prevStepIDs[0] is the step that most recently released one of this
+	// step's inputs, prevStepIDs[1] the distinct one before it.
+	prevStepIDs   [2]string
 	queueTime     time.Time
 	queueSize     int
 	queueDuration time.Duration
+
+	// releaseTime is when completeStep handed the outputs to the steps
+	// waiting on them. Work after it, such as the depfile flush, delays
+	// nothing downstream.
+	releaseTime time.Time
 
 	// startTime is the time that the step starts running in a dedicated goroutine.
 	// There might be other semaphore throttling for local exec, scandeps, remote exec.
@@ -177,6 +198,9 @@ type Step struct {
 	finishReported *sync.Once
 
 	state *stepState
+
+	// depsExpanded is set once depsExpandInputs has run. See ensureExpanded.
+	depsExpanded bool
 }
 
 // Clone creates a shallow clone of the step with a cloned Cmd
@@ -195,6 +219,7 @@ func (s *Step) Clone() *Step {
 		startReported:  s.startReported,
 		finishReported: s.finishReported,
 		metrics:        s.metrics,
+		depsExpanded:   s.depsExpanded,
 	}
 }
 
@@ -234,6 +259,11 @@ func NewStepForTest(idnum int, def StepDef) *Step {
 // SetMetricsForTest sets the StepMetric of the step for external package testing.
 func (s *Step) SetMetricsForTest(metrics StepMetric) {
 	s.metrics = metrics
+}
+
+// SetCmdForTest sets the Cmd of the step for external package testing.
+func (s *Step) SetCmdForTest(cmd *execute.Cmd) {
+	s.cmd = cmd
 }
 
 // Outputs returns step's outputs (target name in ninja, i.e. output path relative to wd.)
@@ -283,10 +313,9 @@ func (s *stepState) SetPhase(phase stepPhase) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.phase = phase
-	switch phase {
-	case stepLocalWait, stepREWrapperWait, stepRemoteWait, stepFallbackWait, stepRetryWait:
+	if phase.isWait() {
 		s.waitStart = time.Now()
-	default:
+	} else {
 		if !s.waitStart.IsZero() {
 			s.waitDuration += time.Since(s.waitStart)
 		}
@@ -334,10 +363,13 @@ func (s *Step) ReadyToRun(prev string, out Target) bool {
 	if out != 0 {
 		s.nwaits--
 	}
+	if prev != s.prevStepIDs[0] {
+		s.prevStepIDs[1] = s.prevStepIDs[0]
+		s.prevStepIDs[0] = prev
+	}
 	ready := s.nwaits == 0
 	if ready {
 		s.readyTime = time.Now()
-		s.prevStepID = prev
 	}
 	return ready
 }
@@ -372,6 +404,7 @@ const (
 	stepRetryWait
 	stepRetryRun
 	stepOutput
+	stepCacheCheck
 	stepCacheWrite
 	stepCacheWriteWait
 	stepDone
@@ -411,6 +444,8 @@ func (s stepPhase) String() string {
 		return "retry"
 	case stepOutput:
 		return "output"
+	case stepCacheCheck:
+		return "cache-check"
 	case stepCacheWrite:
 		return "cache-write"
 	case stepCacheWriteWait:
@@ -422,23 +457,34 @@ func (s stepPhase) String() string {
 	}
 }
 
+var phaseWaitPairs = [...]struct {
+	run  stepPhase
+	wait stepPhase
+}{
+	{stepLocalRun, stepLocalWait},
+	{stepREWrapperRun, stepREWrapperWait},
+	{stepRemoteRun, stepRemoteWait},
+	{stepFallbackRun, stepFallbackWait},
+	{stepRetryRun, stepRetryWait},
+	{stepCacheWrite, stepCacheWriteWait},
+}
+
 func (s stepPhase) wait() stepPhase {
-	switch s {
-	case stepLocalRun:
-		return stepLocalWait
-	case stepREWrapperRun:
-		return stepREWrapperWait
-	case stepRemoteRun:
-		return stepRemoteWait
-	case stepFallbackRun:
-		return stepFallbackWait
-	case stepRetryRun:
-		return stepRetryWait
-	case stepCacheWrite:
-		return stepCacheWriteWait
-	default:
-		return s
+	for _, p := range phaseWaitPairs {
+		if s == p.run {
+			return p.wait
+		}
 	}
+	return s
+}
+
+func (s stepPhase) isWait() bool {
+	for _, p := range phaseWaitPairs {
+		if s == p.wait {
+			return true
+		}
+	}
+	return false
 }
 
 // setPhase sets a phase of the step.
@@ -448,11 +494,31 @@ func (s *Step) setPhase(phase stepPhase) {
 
 // phase returns the phase of the step.
 func (s *Step) phase() stepPhase {
+	if s.state == nil {
+		return stepPhaseNone
+	}
 	return s.state.Phase()
 }
 
 func (s *Step) servDuration() time.Duration {
+	if s.state == nil {
+		return time.Since(s.startTime)
+	}
 	return time.Since(s.startTime) - s.state.WaitDuration()
+}
+
+func (s *Step) displayDuration() time.Duration {
+	if s.phase().isWait() {
+		if s.state != nil {
+			s.state.mu.Lock()
+			defer s.state.mu.Unlock()
+			if !s.state.waitStart.IsZero() {
+				return time.Since(s.state.waitStart)
+			}
+		}
+		return 0
+	}
+	return s.servDuration()
 }
 
 // Done checks the step is done.
@@ -506,7 +572,7 @@ func stepBacktraces(ctx context.Context, step *Step) []string {
 			outs := s.Outputs(ctx)
 			loc = stepSpanName(s)
 			if len(outs) > 0 {
-				out := outs[0]
+				out := string(outs[0])
 				if odir := filepath.Dir(out); odir != "." {
 					out = odir
 				}
@@ -529,7 +595,7 @@ func (s *Step) init(ctx context.Context, b *Builder, stepManifest *stepManifest)
 	s.def.EnsureRule(ctx)
 	s.outputPaths = make([]string, 0, len(stepManifest.outputs))
 	for _, out := range stepManifest.outputs {
-		s.outputPaths = append(s.outputPaths, b.path.MaybeToRelative(ctx, out))
+		s.outputPaths = append(s.outputPaths, b.path.MaybeToRelative(ctx, string(out)))
 	}
 	s.cmd = newCmd(ctx, b, s.def, stepManifest)
 	if log.V(1) {
@@ -538,6 +604,18 @@ func (s *Step) init(ctx context.Context, b *Builder, stepManifest *stepManifest)
 }
 
 func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *stepManifest) *execute.Cmd {
+	// we need to use stepDef.Outputs instead of stepManifest.outputs
+	// to reflect outputs specified by siso rule.
+	// reusing stepManifest.outputs is optimization.
+	outputs := stepManifest.outputs
+	if stepDef.RuleName() != "" {
+		// siso rule applied. update outputs by rule
+		newouts := stepDef.Outputs(ctx)
+		if !slices.Equal(outputs, newouts) {
+			outputs = newouts
+		}
+	}
+
 	// add build.ninja as outputs of gn step.
 	// gn uses
 	//
@@ -552,8 +630,8 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 	// so add it as output to make timestamp of build.ninja
 	// correctly managed by Siso.
 	// This workaround is needed to make second build as null build.
-	if stepDef.ActionName() == "gn" && len(stepManifest.outputs) == 1 && filepath.Base(stepManifest.outputs[0]) == "build.ninja.stamp" {
-		stepManifest.outputs = append(stepManifest.outputs, b.path.MaybeFromRelative(ctx, "build.ninja"))
+	if stepDef.ActionName() == "gn" && len(outputs) == 1 && filepath.Base(string(outputs[0])) == "build.ninja.stamp" {
+		outputs = append(outputs, sisopath.New(b.path.MaybeFromRelative(ctx, "build.ninja")))
 	}
 
 	cmd := &execute.Cmd{
@@ -565,10 +643,11 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 		RSPFileContent:          []byte(stepDef.Binding("rspfile_content")),
 		CmdHash:                 stepManifest.cmdHash,
 		WorkspaceRoot:           b.path.WorkspaceRoot, // use step binding?
-		WorkDir:                 b.path.BaseDir,
+		WorkDir:                 sisopath.Path(b.path.BaseDir),
 		Inputs:                  stepInputs(ctx, stepDef),
 		ToolInputs:              stepDef.ToolInputs(ctx),
-		Outputs:                 stepManifest.outputs,
+		Outputs:                 stepFileOutputs(outputs),
+		OutputDirs:              stepDirOutputs(outputs),
 		EdgeHash:                stepManifest.edgeHash,
 		UseSystemInput:          stepDef.Binding("use_system_input") != "",
 		Deps:                    stepDef.Binding("deps"),
@@ -577,7 +656,7 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 		AuxiliaryLogOutputDirs:  stepDef.AuxiliaryLogOutputDirs(ctx),
 
 		Restat:        stepDef.Binding("restat") != "",
-		RestatContent: stepDef.Binding("restat_content") != "",
+		RestatContent: stepRestatContent(stepDef),
 
 		Pure: stepDef.Pure(),
 
@@ -604,6 +683,7 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 	if stepDef.Binding("phony_output") != "" {
 		clog.Infof(ctx, "phony_output: no outputs by cmd")
 		cmd.Outputs = nil
+		cmd.OutputDirs = nil
 	}
 	if envfile := stepDef.Binding("envfile"); envfile != "" {
 		cmd.Env = b.loadEnvfile(ctx, envfile)
@@ -621,6 +701,11 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 		}
 		cmd.Platform["dockerRuntime"] = "runsc"
 	}
+	if stepDef.Binding("cache_disabled") == "true" {
+		cmd.SkipCacheLookup = true
+		cmd.DoNotCache = true
+		clog.Infof(ctx, "cache disabled")
+	}
 	cmd.InitOutputs()
 
 	if experiments.Enabled("oom-score-adj", "Set oom_score_adj=1000 on local exec") {
@@ -628,6 +713,23 @@ func newCmd(ctx context.Context, b *Builder, stepDef StepDef, stepManifest *step
 		cmd.OOMScoreAdj = &score
 	}
 	return cmd
+}
+
+// stepRestatContent reports whether the step should use content-based restat.
+// An explicit restat_content binding (in the Ninja rule/edge or the Starlark
+// step config) always wins. Otherwise, with the auto-restat-content
+// experiment, restat=true is treated as restat_content.
+// Outputs written locally still restat by mtime; see computeOutputEntries.
+func stepRestatContent(stepDef StepDef) bool {
+	switch stepDef.Binding("restat_content") {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	// TODO(b/575621006): enable by default once validated on builders.
+	return stepDef.Binding("restat") != "" &&
+		experiments.Enabled("auto-restat-content", "restat=true is treated as restat_content")
 }
 
 func stepTimeout(ctx context.Context, d string) time.Duration {
@@ -655,9 +757,9 @@ func execTimeout(ctx context.Context, d string) time.Duration {
 	return dur
 }
 
-func stepInputs(ctx context.Context, stepDef StepDef) []string {
-	seen := make(map[string]bool)
-	var inputs []string
+func stepInputs(ctx context.Context, stepDef StepDef) []sisopath.Path {
+	seen := make(map[sisopath.Path]bool)
+	var inputs []sisopath.Path
 	for _, in := range stepDef.Inputs(ctx) {
 		if seen[in] {
 			continue
@@ -669,7 +771,7 @@ func stepInputs(ctx context.Context, stepDef StepDef) []string {
 	if err != nil {
 		return inputs
 	}
-	depsIter(func(in string) bool {
+	depsIter(func(in sisopath.Path) bool {
 		if seen[in] {
 			return true
 		}
@@ -678,6 +780,28 @@ func stepInputs(ctx context.Context, stepDef StepDef) []string {
 		return true
 	})
 	return inputs
+}
+
+// stepFileOutputs returns file outputs (non-directory) with paths as-is.
+func stepFileOutputs(outputs []sisopath.Path) []sisopath.Path {
+	var files []sisopath.Path
+	for _, out := range outputs {
+		if !IsDirTarget(string(out)) {
+			files = append(files, out)
+		}
+	}
+	return files
+}
+
+// stepDirOutputs returns directory outputs with trailing slash stripped.
+func stepDirOutputs(outputs []sisopath.Path) []sisopath.Path {
+	var dirs []sisopath.Path
+	for _, out := range outputs {
+		if IsDirTarget(string(out)) {
+			dirs = append(dirs, sisopath.New(DirTargetPath(string(out))))
+		}
+	}
+	return dirs
 }
 
 func stepDescription(stepDef StepDef) string {
@@ -689,15 +813,7 @@ func stepDescription(stepDef StepDef) string {
 }
 
 func validateRemoteActionResult(result *rpb.ActionResult) bool {
-	if result == nil {
-		return false
-	}
-
-	if result.ExitCode == 0 && len(result.GetOutputFiles()) == 0 {
-		// succeeded result should have at least one output. b/350360391
-		return false
-	}
-	return true
+	return reapi.ValidateActionResult(result)
 }
 
 type envfile struct {
@@ -715,7 +831,7 @@ func (b *Builder) loadEnvfile(ctx context.Context, fname string) []string {
 		// https://ninja-build.org/manual.html#_extra_tools
 		// ninja -t msvc -e ENVFILE -- cl.exe <arguments>
 		//  Where ENVFILE is a binary file that contains an environment block suitable for CreateProcessA() on Windows (i.e. a series of zero-terminated strings that look like NAME=VALUE, followed by an extra zero terminator).
-		buf, err := b.hashFS.ReadFile(ctx, b.path.WorkspaceRoot, b.path.MaybeFromRelative(ctx, fname))
+		buf, err := b.hashFS.ReadFile(ctx, b.path.WorkspaceRoot, sisopath.New(b.path.MaybeFromRelative(ctx, fname)))
 		if err != nil {
 			clog.Warningf(ctx, "failed to load envfile %q: %v", fname, err)
 			return

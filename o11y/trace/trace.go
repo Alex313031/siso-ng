@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime/metrics"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.chromium.org/build/siso/build/metadata"
@@ -59,11 +61,15 @@ type Tracer struct {
 
 	mu      sync.Mutex
 	procs   map[string]int64
+	sorted  map[int64]bool // pids with a sort index written
 	sysPid  int64
 	mainPid int64
 	semaPid int64
 
 	threads []*threadMap // string -> int
+
+	// last flow id handed out; unique across the file. Atomic, not under mu.
+	flowID atomic.Int64
 }
 
 type Semaphore interface {
@@ -78,9 +84,10 @@ type threadMap struct {
 	m  map[string]int
 }
 
-func (tm *threadMap) get(name string) int {
+// get returns name's tid, and whether this call assigned it.
+func (tm *threadMap) get(name string) (int, bool) {
 	if tm == nil {
-		return sisoTid
+		return sisoTid, false
 	}
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -89,11 +96,11 @@ func (tm *threadMap) get(name string) int {
 	}
 	tid, ok := tm.m[name]
 	if ok {
-		return tid
+		return tid, false
 	}
 	tid = len(tm.m) + sisoTid + 1
 	tm.m[name] = tid
-	return tid
+	return tid, true
 }
 
 // NewTracer creates new trace json in fname.
@@ -125,12 +132,45 @@ func NewTracer(ctx context.Context, fname string) (*Tracer, error) {
 	return te, nil
 }
 
+// NextFlowID returns an id no other flow in this file will use. Several
+// builders share one tracer, so a per-builder counter would collide.
+func (te *Tracer) NextFlowID() int64 {
+	if te == nil {
+		return 0
+	}
+	return te.flowID.Add(1)
+}
+
 // Enabled reports whether the tracer is active (i.e., writing to a file).
 func (te *Tracer) Enabled() bool {
 	return te != nil && te.fname != ""
 }
 
 var startTime = time.Now()
+
+// Micros is a time.Duration (int64 nanoseconds) for Event.T and Event.Dur that
+// marshals to and from JSON as fractional microseconds (float64). Whole
+// microseconds would truncate a shorter span to zero width, while keeping
+// int64 nanoseconds in memory avoids IEEE 754 float64 rounding errors during
+// arithmetic and comparisons.
+type Micros time.Duration
+
+func (m Micros) MarshalJSON() ([]byte, error) {
+	return json.Marshal(float64(m) / float64(time.Microsecond))
+}
+
+func (m *Micros) UnmarshalJSON(b []byte) error {
+	var us float64
+	if err := json.Unmarshal(b, &us); err != nil {
+		return err
+	}
+	*m = Micros(math.Round(us * float64(time.Microsecond)))
+	return nil
+}
+
+func (m Micros) Format(f fmt.State, verb rune) {
+	fmt.Fprintf(f, fmt.FormatString(f, verb), float64(m)/float64(time.Microsecond))
+}
 
 // StartTime returns start time of tracer.
 // Event.T should be time.Since(trace.StartTime()).
@@ -263,7 +303,36 @@ func (te *Tracer) Process(ctx context.Context, name string) int64 {
 	return pid
 }
 
-// Thread returns tid for thread name in pid.
+// ProcessSortIndex orders pid among the process tracks; lower sorts first.
+// Written once per pid, since builders sharing the tracer ask again.
+func (te *Tracer) ProcessSortIndex(ctx context.Context, pid int64, index int) {
+	if te == nil {
+		return
+	}
+	te.mu.Lock()
+	seen := te.sorted[pid]
+	if !seen {
+		if te.sorted == nil {
+			te.sorted = make(map[int64]bool)
+		}
+		te.sorted[pid] = true
+	}
+	te.mu.Unlock()
+	if seen {
+		return
+	}
+	te.write(ctx, Event{
+		Name: "process_sort_index",
+		Ph:   "M",
+		Pid:  pid,
+		Tid:  sisoTid,
+		Args: map[string]any{
+			"sort_index": index,
+		},
+	})
+}
+
+// Thread returns tid for thread name in pid, writing its thread_name once.
 func (te *Tracer) Thread(ctx context.Context, pid int64, name string) int {
 	if te == nil {
 		return sisoTid
@@ -275,8 +344,8 @@ func (te *Tracer) Thread(ctx context.Context, pid int64, name string) int {
 		m = te.threads[i]
 	}
 	te.mu.Unlock()
-	tid := m.get(name)
-	if tid != sisoTid {
+	tid, added := m.get(name)
+	if added {
 		te.write(ctx, Event{
 			Name: "thread_name",
 			Ph:   "M",
@@ -311,9 +380,9 @@ type Event struct {
 	// of event being output.
 	Ph string `json:"ph"`
 
-	// The tracing clock timestamp of the event.
-	// The timestamps are provided at microsecond granularity.
-	T int64 `json:"ts"`
+	// The tracing clock timestamp of the event, in microseconds in JSON
+	// (stored in memory as int64 nanoseconds).
+	T Micros `json:"ts"`
 
 	// The process ID of the process that output this event.
 	Pid int64 `json:"pid"`
@@ -321,9 +390,18 @@ type Event struct {
 	// The thread ID of the thread that output this event.
 	Tid int64 `json:"tid"`
 
-	// The tracing clock duration of complete events in microseconds.
+	// The tracing clock duration of complete events, in microseconds in JSON
+	// (stored in memory as int64 nanoseconds).
 	// Used for "ph"="X".
-	Dur int64 `json:"dur,omitempty"`
+	Dur Micros `json:"dur,omitzero"`
+
+	// The identifier pairing the two ends of one flow.
+	// Used for "ph"="s" and "ph"="f".
+	ID int64 `json:"id,omitempty"`
+
+	// The binding point of a flow end. "e" attaches it to the enclosing
+	// slice rather than to the next slice to begin on the track.
+	Bp string `json:"bp,omitempty"`
 
 	// Any arguments provided for the event.
 	Args map[string]any `json:"args,omitempty"`
@@ -403,7 +481,7 @@ func (te *Tracer) traceMemStats(t time.Time) []Event {
 		{
 			Name: "memstats",
 			Ph:   "C",
-			T:    t.Sub(startTime).Microseconds(),
+			T:    Micros(t.Sub(startTime)),
 			Pid:  te.mainPid,
 			Tid:  sisoTid,
 			Args: map[string]any{
@@ -426,7 +504,7 @@ func (te *Tracer) traceSemaphore(t time.Time, sema Semaphore, reqs *int) []Event
 		{
 			Name: sema.Name(),
 			Ph:   "C",
-			T:    t.Sub(startTime).Microseconds(),
+			T:    Micros(t.Sub(startTime)),
 			Pid:  te.semaPid,
 			Tid:  sisoTid,
 			Args: map[string]any{
@@ -443,7 +521,7 @@ func (te *Tracer) traceIOMetrics(t time.Time, pid int64, m *iometrics.IOMetrics,
 
 	o := Event{
 		Ph:  "C",
-		T:   t.Sub(startTime).Microseconds(),
+		T:   Micros(t.Sub(startTime)),
 		Pid: pid,
 		Tid: sisoTid,
 	}
@@ -546,7 +624,7 @@ func (te *Tracer) Begin(ctx context.Context, name string, region *Region) *Regio
 	te.write(ctx, Event{
 		Name: name,
 		Ph:   "B",
-		T:    time.Since(startTime).Microseconds(),
+		T:    Micros(time.Since(startTime)),
 		Pid:  region.Pid,
 		Tid:  int64(region.Tid),
 	})
@@ -560,7 +638,7 @@ func (r *Region) End() {
 	}
 	r.te.write(r.ctx, Event{
 		Ph:  "E",
-		T:   time.Since(startTime).Microseconds(),
+		T:   Micros(time.Since(startTime)),
 		Pid: r.Pid,
 		Tid: int64(r.Tid),
 	})

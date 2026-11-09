@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,11 +20,13 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/reapi/firstbyte"
 )
 
-// stallingSource is a digest.Source whose Reader.Read blocks until the
+// stallingSource is a blob.Source whose Reader.Read blocks until the
 // per-call ctx is cancelled. Models a wedged ByteStream Read where the
 // server has accepted the stream but no DATA frames are arriving.
 type stallingSource struct{}
@@ -263,6 +266,61 @@ func TestWriteDigestData_CallerCancel_SurfacesAfterSuccessfulCopy(t *testing.T) 
 	}
 }
 
+// FileSource.Size() must report the size of the file that Open reads. Open uses
+// os.Open (follows symlinks), so for a symlink to a file the unknown-size branch
+// must Stat (target size), not Lstat (the link's own length).
+func TestFileSourceSizeFollowsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	content := []byte("hello git world")
+	if err := os.WriteFile(target, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	ofs := New(t.Context(), "test", Option{})
+	got, err := ofs.FileSource(link, -1).Size()
+	if err != nil {
+		t.Fatalf("Size() = %v", err)
+	}
+	if want := int64(len(content)); got != want {
+		t.Errorf("Size() = %d, want target size %d (not symlink length)", got, want)
+	}
+}
+
+// GITSHA1 (git-framing) writes the size header from Size() and enforces it
+// against the bytes Open reads. A symlink-to-file FileSource with unknown size
+// must therefore report the target's size, else the read-size check fails.
+func TestFileSourceGitSHA1OverSymlink(t *testing.T) {
+	fn, err := digest.ParseFunction("gitsha1")
+	if err != nil {
+		t.Fatalf("ParseFunction(gitsha1): %v", err)
+	}
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	content := []byte("hello git world")
+	if err := os.WriteFile(target, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	ofs := New(t.Context(), "test", Option{})
+	data, err := blob.FromLocalFile(t.Context(), fn, ofs.FileSource(link, -1))
+	if err != nil {
+		t.Fatalf("FromLocalFile(gitsha1, symlink): %v", err)
+	}
+	if got, want := data.Digest().SizeBytes, int64(len(content)); got != want {
+		t.Errorf("digest size = %d, want %d", got, want)
+	}
+}
+
 func unwrap(err error) error {
 	for {
 		u := errors.Unwrap(err)
@@ -272,5 +330,3 @@ func unwrap(err error) error {
 		err = u
 	}
 }
-
-var _ = digest.Digest{}

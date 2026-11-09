@@ -14,6 +14,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -101,56 +102,44 @@ func verifyVersion(ctx context.Context, f io.Reader) error {
 	return nil
 }
 
-func readRecordHeader(ctx context.Context, f io.Reader) (recordHeader, error) {
-	var header recordHeader
-	err := binary.Read(f, binary.LittleEndian, &header)
-	if log.V(3) {
-		clog.Infof(ctx, "header=0x%0x: %v", header, err)
-	}
-	if err != nil {
-		return -1, err
-	}
-	return header, nil
-}
-
-func readDepsRecord(ctx context.Context, buf []byte, size int, depsLogPaths []string) (int32, *depsRecord, error) {
+func readDepsRecord(ctx context.Context, buf []byte, depsLogPaths []string) (int32, *depsRecord, error) {
 	// dependency record
 	// array of 4-byte integers
 	//   output path id
 	//   output path mtime_lo
 	//   output path mtime_hi
 	//   input path id, ...
-	rec := make([]int32, size/4)
-	err := binary.Read(bytes.NewReader(buf[:size]), binary.LittleEndian, rec)
+	size := len(buf)
+	if size < 12 {
+		return -1, nil, fmt.Errorf("bad deps record size %d", size)
+	}
+	word := func(i int) uint32 { return binary.LittleEndian.Uint32(buf[4*i:]) }
 	if log.V(3) {
-		clog.Infof(ctx, "deps record=%v: %v", rec, err)
+		clog.Infof(ctx, "deps record size=%d", size)
 	}
-	if err != nil {
-		return -1, nil, err
-	}
-	outID := rec[0]
-	mtimeLo := rec[1]
-	mtimeHi := rec[2]
-	mtime := int64(uint32(mtimeHi))<<32 | int64(uint32(mtimeLo))
-	rec = rec[3:]
-	deps := &depsRecord{mtime: mtime, inputs: make([]int, 0, len(rec))}
-	for _, id := range rec {
-		if int(id) < 0 || int(id) >= len(depsLogPaths) {
+	outID := int32(word(0))
+	mtime := int64(word(2))<<32 | int64(word(1))
+	n := size/4 - 3
+	deps := &depsRecord{mtime: mtime, inputs: make([]int, n)}
+	for i := range n {
+		id := int(word(3 + i))
+		if id >= len(depsLogPaths) {
 			clog.Warningf(ctx, "bad path id=%d (depsLog.paths=%d)", id, len(depsLogPaths))
 			return -1, nil, nil
 		}
-		deps.inputs = append(deps.inputs, int(id))
+		deps.inputs[i] = id
 	}
 
 	return outID, deps, nil
 }
 
-func readPathRecord(ctx context.Context, buf []byte, size int, numDepsLogPaths int) (string, error) {
+func readPathRecord(ctx context.Context, buf []byte, numDepsLogPaths int) (string, error) {
 	// path record
 	//  string name of the path
 	//  up to 3 padding bytes to align on 4 byte boundaries
 	//  one's complement of the expected index of the record
 	//  checksum (4 bytes)
+	size := len(buf)
 	pathSize := size - 4
 	for range 3 {
 		if pathSize-1 < 0 || pathSize-1 >= len(buf) {
@@ -165,19 +154,33 @@ func readPathRecord(ctx context.Context, buf []byte, size int, numDepsLogPaths i
 		clog.Infof(ctx, "path record %q %d", pathname, numDepsLogPaths)
 	}
 
-	var checksum int32
-	err := binary.Read(bytes.NewReader(buf[size-4:size]), binary.LittleEndian, &checksum)
+	checksum := int32(binary.LittleEndian.Uint32(buf[size-4:]))
 	if log.V(3) {
-		clog.Infof(ctx, "checksum %x: %v", checksum, err)
-	}
-	if err != nil {
-		return "", err
+		clog.Infof(ctx, "checksum %x", checksum)
 	}
 	expectedID := ^checksum
 	if numDepsLogPaths != int(expectedID) {
 		return "", fmt.Errorf("failed to match checksum %x -> %d != %d", checksum, expectedID, numDepsLogPaths)
 	}
 	return pathname, nil
+}
+
+// countPathRecords returns the number of path records in records, up to
+// the first malformed record.
+func countPathRecords(records []byte) int {
+	n := 0
+	for len(records) >= 4 {
+		header := recordHeader(binary.LittleEndian.Uint32(records))
+		size := header.RecordSize()
+		if size > maxRecordSize || len(records)-4 < size {
+			break
+		}
+		if !header.IsDepsRecord() {
+			n++
+		}
+		records = records[4+size:]
+	}
+	return n
 }
 
 // NewDepsLog reads or creates a new deps log.
@@ -211,32 +214,31 @@ func NewDepsLog(ctx context.Context, fname string) (*DepsLog, error) {
 		createNewDepsLogFile(ctx, fname)
 		return depsLog, nil
 	}
-	var offset int64
-	// TODO(ukai): this reflects original ninja impl, may not be optimal
-	buf := make([]byte, maxRecordSize+1)
 	// Perform read loop. Truncates with current state of deps log if error
 	// encountered while parsing (i.e. broken input should never cause error)
 	totalRecords := 0
 	uniqueRecords := 0
 	broken := false
+	rest := fbuf[len(fbuf)-f.Len():]
+	// Output ids are path ids, so the number of path records bounds both.
+	numPaths := countPathRecords(rest)
+	depsLog.paths = make([]string, 0, numPaths)
+	depsLog.pathIdx = make(map[string]int, numPaths)
+	depsLog.deps = make([]*depsRecord, 0, numPaths)
 readLoop:
-	for {
-		offset, err = f.Seek(0, io.SeekCurrent)
+	for len(rest) > 0 {
+		offset := len(fbuf) - len(rest)
 		if log.V(3) {
-			clog.Infof(ctx, "offset=%d: %v", offset, err)
+			clog.Infof(ctx, "offset=%d", offset)
 		}
-		if err != nil {
-			clog.Errorf(ctx, "failed to get offset: %v", err)
+		if len(rest) < 4 {
+			clog.Errorf(ctx, "failed to read header at %d: %v", offset, io.ErrUnexpectedEOF)
 			broken = true
 			break readLoop
 		}
-		header, err := readRecordHeader(ctx, f)
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				clog.Errorf(ctx, "failed to read header at %d: %v", offset, err)
-				broken = true
-			}
-			break readLoop
+		header := recordHeader(binary.LittleEndian.Uint32(rest))
+		if log.V(3) {
+			clog.Infof(ctx, "header=0x%0x", header)
 		}
 		size := header.RecordSize()
 		if size > maxRecordSize {
@@ -244,14 +246,15 @@ readLoop:
 			broken = true
 			break readLoop
 		}
-		n, err := f.Read(buf[:size])
-		if err != nil || n != size {
-			clog.Errorf(ctx, "failed to read record %d at %d: n=%d, %v", size, offset, n, err)
+		if len(rest)-4 < size {
+			clog.Errorf(ctx, "failed to read record %d at %d: n=%d", size, offset, len(rest)-4)
 			broken = true
 			break readLoop
 		}
+		rec := rest[4 : 4+size]
+		rest = rest[4+size:]
 		if header.IsDepsRecord() {
-			outID, deps, err := readDepsRecord(ctx, buf, size, depsLog.paths)
+			outID, deps, err := readDepsRecord(ctx, rec, depsLog.paths)
 			if err != nil {
 				clog.Errorf(ctx, "failed to parse deps record at %d: %v", offset, err)
 				broken = true
@@ -265,7 +268,7 @@ readLoop:
 				}
 			}
 		} else {
-			pathname, err := readPathRecord(ctx, buf, size, len(depsLog.paths))
+			pathname, err := readPathRecord(ctx, rec, len(depsLog.paths))
 			if err != nil {
 				clog.Errorf(ctx, "failed to parse path record at %d: %v", offset, err)
 				broken = true
@@ -283,8 +286,8 @@ readLoop:
 
 	clog.Infof(ctx, "ninja deps %s => paths=%d, deps=%d total=%d unique=%d recompact=%t (broken:%t)", depsLog.fname, len(depsLog.paths), len(depsLog.deps), totalRecords, uniqueRecords, depsLog.needsRecompact, broken)
 	depsLog.rPaths = depsLog.paths
-	maps.Copy(depsLog.rPathIdx, depsLog.pathIdx)
-	depsLog.rDeps = depsLog.deps
+	depsLog.rPathIdx = maps.Clone(depsLog.pathIdx)
+	depsLog.rDeps = slices.Clone(depsLog.deps)
 
 	return depsLog, nil
 }
@@ -294,7 +297,7 @@ func (d *DepsLog) Reset() {
 	d.mu.Lock()
 	d.rPaths = d.paths
 	maps.Copy(d.rPathIdx, d.pathIdx)
-	d.rDeps = d.deps
+	d.rDeps = slices.Clone(d.deps)
 	d.mu.Unlock()
 }
 
@@ -362,8 +365,9 @@ func (d *DepsLog) Recompact(ctx context.Context) error {
 
 	d.mu.Lock()
 	d.rPaths = nd.paths
+	clear(d.rPathIdx)
 	maps.Copy(d.rPathIdx, nd.pathIdx)
-	d.rDeps = nd.deps
+	d.rDeps = slices.Clone(nd.deps)
 
 	d.paths = nd.paths
 	d.pathIdx = nd.pathIdx

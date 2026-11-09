@@ -26,6 +26,19 @@ import (
 	"go.chromium.org/build/siso/o11y/clog"
 )
 
+// AuthError is an authentication error.
+type AuthError struct {
+	Err error
+}
+
+func (e AuthError) Error() string {
+	return e.Err.Error()
+}
+
+func (e AuthError) Unwrap() error {
+	return e.Err
+}
+
 // Cred holds credentials and derived values.
 type Cred struct {
 	// Type is credential type. e.g. "luci-auth", "gcloud", etc.
@@ -183,11 +196,13 @@ func (o Options) Logout(ctx context.Context) error {
 func New(ctx context.Context, uri string, opts Options) (Cred, error) {
 	switch opts.Type {
 	case "":
-		return Cred{}, fmt.Errorf(`empty credential helper. need to set credential helper path, "luci-auth" or "google-application-default" in SISO_CREDENTIAL_HELPER`)
+		return Cred{}, AuthError{
+			Err: errors.New(`empty credential helper. need to set credential helper path, "luci-auth" or "google-application-default" in SISO_CREDENTIAL_HELPER`),
+		}
 	case "google-application-default":
 		adc, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
 		if err != nil {
-			return Cred{}, err
+			return Cred{}, AuthError{Err: err}
 		}
 		// TODO: context aware token source - https://github.com/golang/oauth2/issues/262
 		errch := make(chan error, 1)
@@ -200,7 +215,14 @@ func New(ctx context.Context, uri string, opts Options) (Cred, error) {
 			return Cred{}, context.Cause(ctx)
 		case err = <-errch:
 			if err != nil {
-				return Cred{}, fmt.Errorf("google-application-default credential found, but invalid token\n on cloudtop, you need to run `gcloud application-default login`:\n %w", err)
+				if os.Getenv("LUCI_CONTEXT") != "" {
+					return Cred{}, AuthError{
+						Err: fmt.Errorf("google-application-default credential found, but invalid token\n error of `luci-auth context`?\n %w", err),
+					}
+				}
+				return Cred{}, AuthError{
+					Err: fmt.Errorf("google-application-default credential found, but invalid token\n on cloudtop, you need to run `gcloud auth application-default login`:\n %w", err),
+				}
 			}
 		}
 	}
@@ -349,10 +371,10 @@ func (c *lazyCredWrapper) init(ctx context.Context) {
 			switch c.opts.Type {
 			case "luci-auth", "gcloud", "":
 				clog.Warningf(ctx, "auth %s: %v", c.opts.Type, err)
-				c.err = fmt.Errorf("need to run `siso login`")
+				c.err = AuthError{Err: errors.New("need to run `siso login`")}
 				return
 			default:
-				c.err = err
+				c.err = AuthError{Err: err}
 				return
 			}
 		}

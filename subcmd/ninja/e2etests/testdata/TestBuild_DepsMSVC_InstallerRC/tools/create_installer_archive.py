@@ -25,12 +25,12 @@ def main():
       dstdir = os.path.join(options.staging_dir, srcdir)
       os.makedirs(dstdir, mode=0o755, exist_ok=True)
       dst = os.path.join(dstdir, os.path.basename(src))
-      print('copy %s to %s' % (src, dst))
+      print("copy %s to %s" % (src, dst))
       shutil.copyfile(src, dst)
       files.append(dst)
-  with open(options.resource_file_path, 'w') as f:
+  with open(options.resource_file_path, "w") as f:
     for file in files:
-      f.write(file + '\n')
+      f.write(file + "\n")
   return 0
 
 

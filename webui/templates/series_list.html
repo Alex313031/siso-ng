@@ -1,0 +1,82 @@
+{{/* Copyright 2026 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "breadcrumbs"}}
+<div class="breadcrumb">
+  <span class="breadcrumb-label">Invocations</span>
+</div>
+{{end}}
+
+{{define "content"}}
+<div class="surface">
+  <h2>Invocations</h2>
+  <div class="data-table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Build ID</th>
+          <th>Status</th>
+          <th>Started</th>
+          <th>Duration</th>
+          <th>Steps</th>
+          <th>Targets</th>
+          <th>Siso Version</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range $r := .revs}}
+        <tr>
+          <td>
+            <a href="{{$.outdirBaseURL}}/builds/{{$r.Rev}}/steps/"><code>{{$r.Rev}}</code></a>
+          </td>
+          <td>
+            {{if $r.Status.Succeeded}}
+              <span class="status-badge success" title="Success">
+                <md-icon>check_circle</md-icon>
+                <span>Success</span>
+              </span>
+            {{else if $r.Status.Failed}}
+              <span class="status-badge failure" title="Failed">
+                <md-icon>cancel</md-icon>
+                <span>Failed ({{$r.FailedSteps}})</span>
+              </span>
+            {{else}}
+              <span class="status-badge unknown" title="Unknown">
+                <md-icon>help</md-icon>
+                <span>Unknown</span>
+              </span>
+            {{end}}
+          </td>
+          <td>
+            {{if not $r.Started.IsZero}}
+              <relative-time datetime="{{timeRFC3339 $r.Started.Time}}"></relative-time>{{if $r.Started.Inferred}} <abbr title="Inferred start time (file modification time minus duration)">*</abbr>{{end}}
+            {{end}}
+          </td>
+          <td>{{formatIntervalMetricHuman $r.BuildDuration}}</td>
+          <td>{{len $r.StepMetrics}}</td>
+          <td>
+            {{if and $r.Info $r.Info.Targets}}
+              <code>{{joinStrings $r.Info.Targets ", "}}</code>
+            {{end}}
+          </td>
+          <td>
+            {{if and $r.Info $r.Info.SisoVersion}}
+              <code>{{$r.Info.SisoVersion}}</code>
+            {{end}}
+          </td>
+          <td>
+            <button class="link-button" onclick="openInPerfetto('{{$.outdirBaseURL}}/builds/{{$r.Rev}}/logs/siso_trace.json?raw=true')">
+              <md-icon>speed</md-icon>
+              <span class="text">Perfetto</span>
+            </button>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}
+

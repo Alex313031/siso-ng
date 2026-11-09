@@ -34,7 +34,7 @@ func (*Command) Synopsis() string {
 }
 
 func (*Command) Usage() string {
-	return "Starts the experimental webui. Not ready for wide use yet, requires static files to work. This is subject to breaking changes at any moment."
+	return "Starts the experimental webui. Not ready for wide use yet, requires static files to work. This is subject to breaking changes at any moment.\n"
 }
 
 // Command implements webui subcommand.
@@ -56,17 +56,21 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 }
 
 func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	s, err := webui.NewServer(ctx, webui.ServerConfig{
+	_, workspaceRoot, outDir, err := ninjabuild.InitDir(ctx, c.outDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to init dir: %v: need `-config_repo_dir <dir>` and/or `-C <dir>`?\n", err)
+		return subcommands.ExitFailure
+	}
+	s, err := webui.NewServer(webui.ServerConfig{
 		Version:          c.version,
 		LocalDevelopment: c.localDevelopment,
 		Port:             c.port,
-		OutDir:           c.outDir,
+		WorkspaceRoot:    workspaceRoot,
+		DefaultOutdir:    outDir,
 		ManifestPath:     c.fname,
 	})
 	if err != nil {
-		if workspaceNotExist, ok := errors.AsType[*webui.ErrWorkspaceNotExist](err); ok {
-			fmt.Fprintf(os.Stderr, "%v: need `-config_repo_dir <dir>` and/or `-C <dir>`?\n", workspaceNotExist)
-		} else if manifestNotExist, ok := errors.AsType[*webui.ErrManifestNotExist](err); ok {
+		if manifestNotExist, ok := errors.AsType[*webui.ErrManifestNotExist](err); ok {
 			fmt.Fprintf(os.Stderr, "%v: need `-C <dir>` and/or `-f <manifest>`?\n", manifestNotExist)
 		} else {
 			fmt.Fprintf(os.Stderr, "failed to init server: %v\n", err)

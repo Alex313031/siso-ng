@@ -12,6 +12,7 @@ import (
 
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/path"
 )
 
 func TestDescMSVCDepsAfterRun(t *testing.T) {
@@ -29,7 +30,7 @@ func TestDescMSVCDepsAfterRun(t *testing.T) {
 		"base/bar.h",
 		"v1/foo.h",
 	} {
-		err = hfs.WriteFile(ctx, dir, in, nil, false, time.Now(), nil, nil)
+		err = hfs.WriteFile(ctx, dir, path.New(in), nil, false, time.Now(), nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -43,7 +44,7 @@ func TestDescMSVCDepsAfterRun(t *testing.T) {
 		def: fakeStepDef{},
 		cmd: &execute.Cmd{
 			Args: []string{"clang-cl.exe", "/showIncludes", "/TP", "../../base/foo.cc"},
-			Inputs: []string{
+			Inputs: []path.Path{
 				"out/siso/clang-cl.exe",
 				"base/foo.cc",
 				// These headers will be added by scandeps,
@@ -53,7 +54,7 @@ func TestDescMSVCDepsAfterRun(t *testing.T) {
 				"base/bar.h",
 				"v1/foo.h",
 			},
-			Outputs: []string{
+			Outputs: []path.Path{
 				"foo.obj",
 			},
 			Deps: "msvc",
@@ -70,11 +71,8 @@ func TestDescMSVCDepsAfterRun(t *testing.T) {
 	if err != nil {
 		t.Errorf("DepsAfterRun(ctx, b, step)=%q, %v; want nil err", got, err)
 	}
-	// v1/foo.h is workaround for b/294927170 and
-	// https://github.com/llvm/llvm-project/issues/58726
 	want := []string{
 		"../../base/foo.h",
-		"../../v1/foo.h",
 		"../../base/foo.cc",
 	}
 	if diff := cmp.Diff(want, got); diff != "" {

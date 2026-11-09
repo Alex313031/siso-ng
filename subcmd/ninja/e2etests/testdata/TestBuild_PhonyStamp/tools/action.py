@@ -13,7 +13,7 @@ def main():
   options = parser.parse_args()
   with open(options.input) as r:
     data = r.read()
-  with open(options.output, 'w') as w:
+  with open(options.output, "w") as w:
     w.write(data)
 
 

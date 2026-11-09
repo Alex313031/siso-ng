@@ -11,8 +11,9 @@ import (
 	"slices"
 	"strings"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/execute"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/toolsupport/msvcutil"
 	"go.chromium.org/build/siso/ui"
 )
@@ -211,30 +212,40 @@ func cmdOutput(ctx context.Context, result cmdOutputResult, cmd *execute.Cmd, in
 	}
 	var output string
 	if len(cmd.Outputs) > 0 {
-		output = cmd.Outputs[0]
+		output = string(cmd.Outputs[0])
+	} else if len(cmd.OutputDirs) > 0 {
+		// Dir-only step: show the directory so the log line is not empty.
+		output = string(cmd.OutputDirs[0])
 	}
-	if after, ok := strings.CutPrefix(output, cmd.WorkDir+"/"); ok {
+	if after, ok := strings.CutPrefix(output, string(cmd.WorkDir)+"/"); ok {
 		output = "./" + after
 	}
 	res.output = output
 	if len(cmd.AuxiliaryOutputDigests) > 0 {
+		fn := cmd.HashFS.DigestFunction()
 		for _, name := range slices.Sorted(maps.Keys(cmd.AuxiliaryOutputDigests)) {
 			d := cmd.AuxiliaryOutputDigests[name]
-			if strings.HasSuffix(name, "/") && d == digest.EmptyTree {
+			if strings.HasSuffix(name, "/") && d == fn.EmptyTree() {
 				continue
 			}
-			msg := formatAuxiliaryOutput(name, d, instance)
+			msg := formatAuxiliaryOutput(name, d, instance, fn)
 			res.auxiliaryOutputs = append(res.auxiliaryOutputs, msg)
 		}
 	}
 	return res
 }
 
-func formatAuxiliaryOutput(name string, d digest.Digest, instance string) string {
+// formatAuxiliaryOutput formats one auxiliary output as a copy-pastable
+// `siso fetch` command line. For non-sha256 digest functions it appends
+// -reapi_digest_function so the fetch subcommand uses the right function.
+func formatAuxiliaryOutput(name string, d digest.Digest, instance string, fn digest.Function) string {
 	var cmdArgs []string
 	cmdArgs = append(cmdArgs, "siso", "fetch")
 	if instance != "" {
 		cmdArgs = append(cmdArgs, "-reapi_instance", instance)
+	}
+	if fn != digest.SHA256 {
+		cmdArgs = append(cmdArgs, "-reapi_digest_function", fn.String())
 	}
 	if strings.HasSuffix(name, "/") {
 		cmdArgs = append(cmdArgs, "-type=tree-extract")

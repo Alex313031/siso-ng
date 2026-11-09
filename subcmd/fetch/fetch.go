@@ -17,30 +17,33 @@ import (
 	"strings"
 
 	"github.com/google/subcommands"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/auth/cred"
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/merkletree/exporter"
 	"go.chromium.org/build/siso/signals"
 )
 
 const usage = `fetch contents from CAS or ActionResult.
-Print contents to stdout, or extract in <dir> for -type dir-extract.
+Print contents to stdout, or extract in <dir> for -type *-extract.
 
  $ siso fetch [-project <project>] [-reapi_instance <instance>] \
-          [-type <type>] \
+          [-type <type>] [-format <format>]\
           <digest> [<dir>]
  $ siso fetch [-type <type>] \
   bytesteam://<endpoint>/projects/<project>/instances/<instance>/blobs/<digest>
+
 `
 
 // Cmd returns the Command for the `fetch` subcommand provided by this package.
-func Cmd(authOpts cred.Options) *Command {
+func Cmd(authOpts func() cred.Options) *Command {
 	return &Command{
 		authOpts: authOpts,
 	}
@@ -61,10 +64,11 @@ func (*Command) Usage() string {
 // Command implements fetch subcommand.
 type Command struct {
 	Flags     *flag.FlagSet
-	authOpts  cred.Options
+	authOpts  func() cred.Options
 	projectID string
 	reopt     *reapi.Option
 	dataType  string
+	format    string
 }
 
 func (c *Command) SetFlags(flagSet *flag.FlagSet) {
@@ -82,7 +86,9 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
                or list (if <dir> is not specified)
   tree-extract: tree message extract to <dir> (if <dir> is specified)
                or list (if <dir> is not specified)
+  action-list: actions associated with two phase cache key.
 `)
+	flagSet.StringVar(&c.format, "format", "", `format: "raw", "proto" or "json"`)
 }
 
 func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
@@ -101,6 +107,52 @@ func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) 
 	return subcommands.ExitSuccess
 }
 
+// parseBytestreamURI extracts the endpoint, project, instance, and digest
+// function from a bytestream:// URI into c, and returns the "<hash>/<size>"
+// digest string. It accepts the format emitted by reapi.Client.FileURI: an
+// explicit {digest_function} segment (e.g. blake3) always wins; an omitted
+// segment is inferred from the hash length, unless the configured
+// -reapi_digest_function already matches that length (so the flag decides
+// ambiguous lengths, e.g. 64-hex with -reapi_digest_function=blake3).
+func (c *Command) parseBytestreamURI(uri string) (string, error) {
+	bsurl, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("invalid bytestream uri: %w", err)
+	}
+	c.reopt.Address = bsurl.Host
+	elems := strings.Split(strings.TrimPrefix(bsurl.EscapedPath(), "/"), "/")
+	// projects/<project>/instances/<instance>/blobs/[<digest_function>/]<hash>/<size>
+	if len(elems) != 7 && len(elems) != 8 {
+		return "", fmt.Errorf("invalid bytestream uri: path=%q", strings.Join(elems, "/"))
+	}
+	if elems[0] != "projects" || elems[2] != "instances" || elems[4] != "blobs" {
+		return "", fmt.Errorf("invalid bytestream uri: path=%q", strings.Join(elems, "/"))
+	}
+	c.projectID = elems[1]
+	c.reopt.Instance = path.Join(elems[0:4]...)
+	rest := elems[5:]
+	if len(rest) == 3 {
+		fn, recognized, err := digest.FunctionByName(rest[0])
+		if err != nil {
+			return "", fmt.Errorf("invalid bytestream uri: %w", err)
+		}
+		if !recognized {
+			return "", fmt.Errorf("invalid bytestream uri: %q is not a digest function: path=%q", rest[0], strings.Join(elems, "/"))
+		}
+		c.reopt.DigestFunction = fn.String()
+		rest = rest[1:]
+	} else {
+		fn, err := reapi.ParseDigestFunction(c.reopt.DigestFunction)
+		if err != nil {
+			return "", err
+		}
+		if fn.HexLen() != len(rest[0]) {
+			c.reopt.DigestFunction = digest.InferOmitted(len(rest[0])).String()
+		}
+	}
+	return path.Join(rest...), nil
+}
+
 func (c *Command) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer signals.HandleInterrupt(ctx, cancel)()
@@ -108,24 +160,23 @@ func (c *Command) run(ctx context.Context) error {
 	if c.Flags.NArg() == 0 {
 		return fmt.Errorf("no digest nor bytestream uri: %w", flag.ErrHelp)
 	}
+	formatter := func(m proto.Message) string { return fmt.Sprint(m) }
+	switch c.format {
+	case "raw", "":
+	case "proto":
+		formatter = prototext.Format
+	case "json":
+		formatter = protojson.Format
+	default:
+		return fmt.Errorf("unsupported format %q: %w", c.format, flag.ErrHelp)
+	}
 	var digestStr string
 	if strings.HasPrefix(c.Flags.Arg(0), "bytestream://") {
-		bsurl, err := url.Parse(c.Flags.Arg(0))
+		var err error
+		digestStr, err = c.parseBytestreamURI(c.Flags.Arg(0))
 		if err != nil {
-			return fmt.Errorf("invalid bytestream uri: %w", err)
+			return err
 		}
-		c.reopt.Address = bsurl.Host
-		elems := strings.Split(strings.TrimPrefix(bsurl.EscapedPath(), "/"), "/")
-		// projects/<project>/instances/<instance>/blobs/<hash>/<size>
-		if len(elems) != 7 {
-			return fmt.Errorf("invlaid bytestream uri: path=%q", strings.Join(elems, "/"))
-		}
-		if elems[0] != "projects" || elems[2] != "instances" || elems[4] != "blobs" {
-			return fmt.Errorf("invlaid bytestream uri: path=%q", strings.Join(elems, "/"))
-		}
-		c.projectID = elems[1]
-		c.reopt.Instance = path.Join(elems[0:4]...)
-		digestStr = path.Join(elems[5:]...)
 	} else {
 		digestStr = c.Flags.Arg(0)
 	}
@@ -137,7 +188,7 @@ func (c *Command) run(ctx context.Context) error {
 		return fmt.Errorf("reapi option is invalid: %w", err)
 	}
 	if c.reopt.NeedCred() {
-		credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts)
+		credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts())
 		if err != nil {
 			return err
 		}
@@ -168,7 +219,7 @@ func (c *Command) run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to get action result for action digest %s. %w", d, err)
 		}
-		fmt.Println(prototext.Format(ar))
+		fmt.Println(formatter(ar))
 		unknowns := ar.ProtoReflect().GetUnknown()
 		if len(unknowns) > 0 {
 			return fmt.Errorf("unknown fields in marshaled proto: %v", unknowns)
@@ -230,6 +281,23 @@ func (c *Command) run(ctx context.Context) error {
 			return fmt.Errorf("error from exporter.ExportTree: %w", err)
 		}
 		return nil
+	case "action-list":
+		for action, err := range client.ActionCacheMap().List(ctx, d.String()) {
+			if err != nil {
+				return fmt.Errorf("failed to list actions for %s: %w", d.String(), err)
+			}
+			if c.format == "" {
+				data, err := blob.FromProtoMessage(digest.SHA256, action)
+				if err != nil {
+					return fmt.Errorf("failed to calculate action digest: %w", err)
+				}
+				fmt.Printf("action_digest: %s\n", data.Digest())
+			} else {
+				fmt.Println(formatter(action))
+				fmt.Println()
+			}
+		}
+		return nil
 	default:
 		var w strings.Builder
 		c.Flags.SetOutput(&w)
@@ -251,7 +319,7 @@ func (c *Command) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal %s as %T: %w", d, pmsg, err)
 	}
-	fmt.Println(pmsg)
+	fmt.Println(formatter(pmsg))
 	return nil
 }
 

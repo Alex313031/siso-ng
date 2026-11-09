@@ -17,7 +17,7 @@ import (
 )
 
 // CheckCmd creates new CheckCommand.
-func CheckCmd(authOpts cred.Options) *CheckCommand {
+func CheckCmd(authOpts func() cred.Options) *CheckCommand {
 	return &CheckCommand{
 		authOpts: authOpts,
 	}
@@ -38,7 +38,7 @@ func (*CheckCommand) Usage() string {
 
 // CheckCommand implements auth-check subcommands.
 type CheckCommand struct {
-	authOpts   cred.Options
+	authOpts   func() cred.Options
 	projectID  string
 	reopt      *reapi.Option
 	checkREAPI bool
@@ -67,7 +67,7 @@ func (c *CheckCommand) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...
 	}
 	var credential cred.Cred
 	if c.reopt.NeedCred() {
-		credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts)
+		credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "auth error: %v\n", err)
 			return subcommands.ExitFailure

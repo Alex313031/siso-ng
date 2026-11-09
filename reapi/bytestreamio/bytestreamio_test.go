@@ -25,6 +25,8 @@ type stubByteStreamReadClient struct {
 	resourceName string
 	data         []byte
 	chunksize    int
+	readLimit    int64
+	callOpts     []grpc.CallOption
 }
 
 func (c *stubByteStreamReadClient) Read(ctx context.Context, req *pb.ReadRequest, opts ...grpc.CallOption) (pb.ByteStream_ReadClient, error) {
@@ -34,12 +36,22 @@ func (c *stubByteStreamReadClient) Read(ctx context.Context, req *pb.ReadRequest
 	if req.ReadOffset != 0 {
 		return nil, fmt.Errorf("bad read offset=%d; want=%d", req.ReadOffset, 0)
 	}
-	if req.ReadLimit != 0 {
-		return nil, fmt.Errorf("bad read limit=%d; want=%d", req.ReadLimit, 0)
+	if req.ReadLimit != c.readLimit {
+		return nil, fmt.Errorf("bad read limit=%d; want=%d", req.ReadLimit, c.readLimit)
 	}
+	c.callOpts = opts
 	return &stubReadClient{
 		c: c,
 	}, nil
+}
+
+func hasStaticMethod(opts []grpc.CallOption) bool {
+	for _, opt := range opts {
+		if _, ok := opt.(grpc.StaticMethodCallOption); ok {
+			return true
+		}
+	}
+	return false
 }
 
 type stubReadClient struct {
@@ -84,6 +96,9 @@ func TestReader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !hasStaticMethod(c.callOpts) {
+		t.Error("Open did not pass grpc.StaticMethod()")
+	}
 	var out bytes.Buffer
 	if bytes.Equal(out.Bytes(), data) {
 		t.Fatal("data setup failed")
@@ -99,6 +114,22 @@ func TestReader(t *testing.T) {
 	}
 }
 
+func TestExists(t *testing.T) {
+	t.Parallel()
+	c := &stubByteStreamReadClient{
+		resourceName: "resource-name/1",
+		data:         []byte{0},
+		chunksize:    1,
+		readLimit:    1,
+	}
+	if err := Exists(t.Context(), c, c.resourceName); err != nil {
+		t.Fatal(err)
+	}
+	if !hasStaticMethod(c.callOpts) {
+		t.Error("Exists did not pass grpc.StaticMethod()")
+	}
+}
+
 type stubByteStreamWriteClient struct {
 	pb.ByteStreamClient
 	resourceName  string
@@ -107,9 +138,11 @@ type stubByteStreamWriteClient struct {
 	alreadyExists bool
 	finished      bool
 	committedSize *int64
+	callOpts      []grpc.CallOption
 }
 
 func (c *stubByteStreamWriteClient) Write(ctx context.Context, opts ...grpc.CallOption) (pb.ByteStream_WriteClient, error) {
+	c.callOpts = opts
 	return &stubWriteClient{
 		c: c,
 	}, nil
@@ -197,6 +230,9 @@ func TestWriter(t *testing.T) {
 	w, err := Create(ctx, c, resourceName, "testdata")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !hasStaticMethod(c.callOpts) {
+		t.Error("Create did not pass grpc.StaticMethod()")
 	}
 	buf := make([]byte, bufsize)
 	_, err = io.CopyBuffer(w, bytesReader{bytes.NewReader(data)}, buf)

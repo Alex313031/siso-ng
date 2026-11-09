@@ -31,3 +31,19 @@ func FormatDuration(d time.Duration) string {
 	fmt.Fprintf(&sb, "%02.02fs", d.Seconds())
 	return sb.String()
 }
+
+// FormatDurationSec formats duration in "Xs", "XmXXs" or "XhXmXXs".
+func FormatDurationSec(d time.Duration) string {
+	d = d.Round(1 * time.Second)
+	var sb strings.Builder
+	sb.Grow(32)
+
+	mins := d.Truncate(1 * time.Minute)
+	d = d - mins
+	if mins > 0 {
+		fmt.Fprintf(&sb, "%s%02ds", strings.TrimSuffix(mins.String(), "0s"), int(d.Seconds()))
+	} else {
+		fmt.Fprintf(&sb, "%ds", int(d.Seconds()))
+	}
+	return sb.String()
+}

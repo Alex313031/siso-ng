@@ -325,3 +325,133 @@ func TestResolveSymlinkPath(t *testing.T) {
 		}
 	}
 }
+
+func TestExpandSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no symlink test on windows")
+		return
+	}
+	ctx := t.Context()
+	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hfs, err := New(ctx, Option{})
+	if err != nil {
+		t.Fatalf("New=%v", err)
+	}
+	defer func() {
+		err := hfs.Close(ctx)
+		if err != nil {
+			t.Errorf("hfs.Close=%v", err)
+		}
+	}()
+
+	setupDir := func(base, dirname string) {
+		t.Helper()
+		fullpath := filepath.Join(base, dirname)
+		err := os.MkdirAll(fullpath, 0755)
+		if err != nil {
+			t.Fatalf("os.MkdirAll(%q, 0755)=%v; want nil err", fullpath, err)
+		}
+	}
+	setupFile := func(base, fname string) {
+		t.Helper()
+		setupDir(base, filepath.Dir(fname))
+		fullpath := filepath.Join(base, fname)
+		err := os.WriteFile(fullpath, nil, 0644)
+		if err != nil {
+			t.Fatalf("os.WriteFile(%q, nil, 0644)=%v; want nil err", fullpath, err)
+		}
+	}
+	setupSymlink := func(base, symlink, target string) {
+		t.Helper()
+		setupDir(base, filepath.Dir(symlink))
+		fullpath := filepath.Join(base, symlink)
+		err := os.Symlink(target, fullpath)
+		if err != nil {
+			t.Fatalf("os.Symlink(%q, %q)=%v; want nil err", target, fullpath, err)
+		}
+	}
+
+	setupFile(dir, "a/b/c.h")
+	setupSymlink(dir, "a/b/link.h", "c.h")
+
+	setupSymlink(dir, "system/core/include/utils", "../libutils/include/utils/")
+	setupSymlink(dir, "system/core/libutils/include/utils/Errors.h", "../../binder/include/utils/Errors.h")
+	setupFile(dir, "system/core/libutils/binder/include/utils/Errors.h")
+
+	otherDir := t.TempDir()
+	otherDir, err = filepath.EvalSymlinks(otherDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupFile(otherDir, "MacOSX.sdk/SDKSettings.json")
+	setupSymlink(dir, "build/xcode_links/MacOSX.sdk", filepath.Join(otherDir, "MacOSX.sdk"))
+
+	setupSymlink(dir, "sub/escaped_sdk", "../../other_sdk")
+
+	fsys := hfs.FileSystem(ctx, dir)
+
+	for _, tc := range []struct {
+		name string
+		path string
+		want []string
+	}{
+		{
+			name: "regular",
+			path: "a/b/c.h",
+			want: []string{
+				"a/b/c.h",
+			},
+		},
+		{
+			name: "symlink_file",
+			path: "a/b/link.h",
+			want: []string{
+				"a/b/link.h",
+				"a/b/c.h",
+			},
+		},
+		{
+			name: "intermediate_symlink_dir",
+			path: "system/core/include/utils/Errors.h",
+			want: []string{
+				"system/core/include/utils",
+				"system/core/libutils/include/utils/Errors.h",
+				"system/core/libutils/binder/include/utils/Errors.h",
+			},
+		},
+		{
+			name: "abs_escaped_symlink",
+			path: "build/xcode_links/MacOSX.sdk/SDKSettings.json",
+			want: []string{
+				"build/xcode_links/MacOSX.sdk",
+				"build/xcode_links/MacOSX.sdk/SDKSettings.json",
+			},
+		},
+		{
+			name: "rel_escaped_symlink",
+			path: "sub/escaped_sdk/foo.h",
+			want: []string{
+				"sub/escaped_sdk",
+				"sub/escaped_sdk/foo.h",
+			},
+		},
+		{
+			name: "nonexistent",
+			path: "nonexistent/foo.h",
+			want: []string{
+				"nonexistent/foo.h",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fsys.ExpandSymlinks(tc.path)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("fsys.ExpandSymlinks(%q) diff -want +got:\n%s", tc.path, diff)
+			}
+		})
+	}
+}

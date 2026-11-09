@@ -27,11 +27,13 @@ import (
 	log "github.com/golang/glog"
 	"github.com/google/uuid"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/cmdutil"
 	"go.chromium.org/build/siso/toolsupport/makeutil"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
@@ -44,13 +46,18 @@ type StepDef struct {
 	edge *ninjautil.Edge
 	next build.StepDef
 
+	shellOnce sync.Once
+	needShell bool
+
 	ruleReady bool
 	rule      StepRule
 	pure      bool
 
-	// from depfile/depslog
-	deps   iter.Seq[string] // workspace relative
-	deperr error
+	// from depfile/depslog, parsed once under depsOnce so concurrent
+	// callers (inputMtime, step.Inputs) share a single depfile read.
+	depsOnce sync.Once
+	deps     iter.Seq[path.Path] // workspace relative
+	deperr   error
 
 	envfile string // for ninja -t msvc -e <envfile> --
 
@@ -202,9 +209,47 @@ func (s *StepDef) ActionName() string {
 	return s.edge.RuleName()
 }
 
+// Returns if we need to use the hermetic global shell because
+// the command line is too complicated to exec directly.
+func (s *StepDef) usesShell() bool {
+	s.shellOnce.Do(func() {
+		if s.edge == nil {
+			return
+		}
+		if runtime.GOOS == "windows" {
+			// hermetic shells are not supported on windows currently.
+			s.needShell = false
+		} else {
+			cmdline := s.edge.Binding("command")
+			_, err := shutil.Split(cmdline)
+			s.needShell = err != nil
+		}
+	})
+	return s.needShell
+}
+
+// Adds the inputs for the global shell to inputs and returns the modified slice.
+// Seen is optional, if provided, it will be used to deduplicate paths. Otherwise,
+// an n^2 deduplication will be used.
+func (s *StepDef) addShellInputs(inputs []path.Path, seen map[path.Path]bool) []path.Path {
+	if s.usesShell() {
+		for _, in := range s.globals.shellInputs {
+			if seen != nil {
+				if !seen[in] {
+					seen[in] = true
+					inputs = append(inputs, in)
+				}
+			} else if !slices.Contains(inputs, in) {
+				inputs = append(inputs, in)
+			}
+		}
+	}
+	return inputs
+}
+
 // Args returns command line arguments of the step.
 func (s *StepDef) Args(ctx context.Context) []string {
-	args := stepArgs(s.edge)
+	args := s.stepArgs()
 	if len(args) > 3 && args[0] == "ninja" && args[1] == "-t" && args[2] == "msvc" {
 		flagSet := flag.NewFlagSet("ninja-msvc", flag.ContinueOnError)
 		tool := "msvc"
@@ -225,18 +270,25 @@ func (s *StepDef) Args(ctx context.Context) []string {
 	return args
 }
 
-func stepArgs(edge *ninjautil.Edge) []string {
-	cmdline := edge.Binding("command")
+func (s *StepDef) stepArgs() []string {
+	if s.edge == nil {
+		return nil
+	}
+	cmdline := s.edge.Binding("command")
 	if runtime.GOOS == "windows" {
-		args, err := cmdutil.Split(cmdline)
-		if err != nil {
+		args, err := cmdutil.Split(cmdline) //nolint:staticcheck // SA4023: cmdutil.Split can return nil on windows.
+		if err != nil {                     //nolint:staticcheck // SA4023: cmdutil.Split can return nil on windows.
 			return []string{"cmd.exe", "/C", cmdline}
 		}
 		return args
 	}
 	args, err := shutil.Split(cmdline)
 	if err != nil {
-		return []string{"/bin/sh", "-c", cmdline}
+		shell := "/bin/sh"
+		if s.globals.shellCmd != "" {
+			shell = s.globals.shellCmd
+		}
+		return []string{shell, "-c", cmdline}
 	}
 	return args
 }
@@ -311,15 +363,35 @@ func (s *StepDef) Binding(name string) string {
 		}
 		return s.edge.Binding(name)
 	case "restat_content":
-		if s.rule.RestatContent {
+		if s.rule.RestatContent != nil {
+			if *s.rule.RestatContent {
+				return "true"
+			}
+			return "false"
+		}
+		switch s.edge.Binding(name) {
+		case "":
+			return ""
+		case "false", "0":
+			return "false"
+		default:
 			return "true"
 		}
-		return ""
 	case "impure":
 		if s.rule.Impure {
 			return "true"
 		}
 		return ""
+	case "sandbox_disabled":
+		if s.rule.SandboxDisabled {
+			return "true"
+		}
+		return s.edge.Binding(name)
+	case "cache_disabled":
+		if s.rule.CacheDisabled {
+			return "true"
+		}
+		return s.edge.Binding(name)
 	case "timeout":
 		return s.rule.Timeout
 	case "exec_timeout":
@@ -338,21 +410,21 @@ func (s *StepDef) Binding(name string) string {
 }
 
 // Depfile returns workspace relative depfile path or empty if not set.
-func (s *StepDef) Depfile(ctx context.Context) string {
+func (s *StepDef) Depfile(ctx context.Context) path.Path {
 	depfile := s.edge.UnescapedBinding("depfile")
 	if depfile == "" {
 		return ""
 	}
-	return s.globals.path.MaybeFromRelative(ctx, depfile)
+	return path.New(s.globals.path.MaybeFromRelative(ctx, depfile))
 }
 
 // Rspfile returns workspace relative rspfile path or empty if not set.
-func (s *StepDef) Rspfile(ctx context.Context) string {
+func (s *StepDef) Rspfile(ctx context.Context) path.Path {
 	rspfile := s.edge.UnescapedBinding("rspfile")
 	if rspfile == "" {
 		return ""
 	}
-	return s.globals.path.MaybeFromRelative(ctx, rspfile)
+	return path.New(s.globals.path.MaybeFromRelative(ctx, rspfile))
 }
 
 func edgeSolibs(edge *ninjautil.Edge) iter.Seq[string] {
@@ -374,12 +446,12 @@ func edgeSolibs(edge *ninjautil.Edge) iter.Seq[string] {
 }
 
 // Inputs returns inputs of the step.
-func (s *StepDef) Inputs(ctx context.Context) []string {
+func (s *StepDef) Inputs(ctx context.Context) []path.Path {
 	ctx, span := trace.NewSpan(ctx, "stepdef-inputs")
 	defer span.Close(nil)
 
-	seen := make(map[string]bool)
-	var targets []string
+	seen := make(map[path.Path]bool)
+	var targets []path.Path
 	globals := s.globals
 	for _, in := range s.edge.Inputs() {
 		p := globals.targetPath(in)
@@ -393,15 +465,16 @@ func (s *StepDef) Inputs(ctx context.Context) []string {
 		if s.rule.Debug {
 			clog.Infof(ctx, "solib %s", p)
 		}
-		p := globals.path.MaybeFromRelative(ctx, p)
-		if seen[p] {
+		pp := path.New(globals.path.MaybeFromRelative(ctx, p))
+		if seen[pp] {
 			continue
 		}
-		seen[p] = true
-		targets = append(targets, p)
+		seen[pp] = true
+		targets = append(targets, pp)
 	}
 	targets = fixInputs(ctx, s, targets, s.rule.ExcludeInputPatterns)
 	targets = append(targets, s.ToolInputs(ctx)...)
+	targets = s.addShellInputs(targets, seen)
 	if s.rule.Debug {
 		clog.Infof(ctx, "targets=%q", targets)
 	}
@@ -409,7 +482,7 @@ func (s *StepDef) Inputs(ctx context.Context) []string {
 }
 
 // TriggerInputs returns inputs of the step that would trigger the step's action.
-func (s *StepDef) TriggerInputs(ctx context.Context) []string {
+func (s *StepDef) TriggerInputs(ctx context.Context) []path.Path {
 	globals := s.globals
 	inputs := s.edge.TriggerInputs()
 	// map dedup is not fast enough here.
@@ -431,32 +504,85 @@ func (s *StepDef) TriggerInputs(ctx context.Context) []string {
 	slices.SortFunc(inIDs, func(a, b idxid) int {
 		return cmp.Compare(a.idx, b.idx)
 	})
-	targets := make([]string, 0, len(inIDs))
+	targets := make([]path.Path, 0, len(inIDs)+len(globals.shellInputs))
 	for _, i := range inIDs {
 		in := inputs[i.idx]
 		p := globals.targetPath(in)
 		targets = append(targets, p)
 	}
+	targets = s.addShellInputs(targets, nil)
 	return targets
 }
 
-// DepInputs returns inputs stored in depfile / depslog.
-func (s *StepDef) DepInputs(ctx context.Context) (iter.Seq[string], error) {
+// ExpandedTriggerInputs returns trigger inputs of the step with phony targets
+// expanded recursively to their underlying trigger inputs.
+func (s *StepDef) ExpandedTriggerInputs(ctx context.Context) []path.Path {
+	globals := s.globals
+	inputs := s.edge.TriggerInputs()
+	type idxid struct {
+		idx, id int
+	}
+	inIDs := make([]idxid, 0, len(inputs))
+	for i, in := range inputs {
+		inIDs = append(inIDs, idxid{idx: i, id: in.ID()})
+	}
+	slices.SortStableFunc(inIDs, func(a, b idxid) int {
+		return cmp.Compare(a.id, b.id)
+	})
+	inIDs = slices.CompactFunc(inIDs, func(a, b idxid) bool {
+		return a.id == b.id
+	})
+	slices.SortFunc(inIDs, func(a, b idxid) int {
+		return cmp.Compare(a.idx, b.idx)
+	})
+	targets := make([]path.Path, 0, len(inIDs)+len(globals.shellInputs))
+	var phonyEdges []*ninjautil.Edge
+	for _, i := range inIDs {
+		in := inputs[i.idx]
+		if inEdge, ok := in.InEdge(); ok && inEdge.IsPhony() {
+			phonyEdges = append(phonyEdges, inEdge)
+			continue
+		}
+		p := globals.targetPath(in)
+		targets = append(targets, p)
+	}
+	if len(phonyEdges) > 0 {
+		seen := seenSetPool.Get().(map[path.Path]bool)
+		defer func() {
+			clear(seen)
+			seenSetPool.Put(seen)
+		}()
+		for _, p := range targets {
+			seen[p] = true
+		}
+		visited := make(map[*ninjautil.Edge]bool)
+		for _, inEdge := range phonyEdges {
+			p := globals.targetPath(inEdge.Outputs()[0])
+			targets = replacePhony(ctx, globals, visited, seen, p, inEdge, s.rule.Debug, targets)
+		}
+	}
+	targets = s.addShellInputs(targets, nil)
+	return targets
+}
+
+// DepInputs returns inputs stored in depfile / depslog. The parse runs
+// once per StepDef; concurrent callers share the result via depsOnce.
+func (s *StepDef) DepInputs(ctx context.Context) (iter.Seq[path.Path], error) {
 	ctx, span := trace.NewSpan(ctx, "stepdef-dep-inputs")
 	defer span.Close(nil)
-	if s.deps == nil && s.deperr == nil {
+	s.depsOnce.Do(func() {
 		s.deps, s.deperr = depInputs(ctx, s)
-	}
+	})
 	return s.deps, s.deperr
 }
 
 type depsPath struct {
 	path      string
-	canonpath string
+	canonpath path.Path
 }
 
 // depInputs returns deps inputs of the step.
-func depInputs(ctx context.Context, s *StepDef) (iter.Seq[string], error) {
+func depInputs(ctx context.Context, s *StepDef) (iter.Seq[path.Path], error) {
 	var deps []string
 	var err error
 	switch s.edge.Binding("deps") {
@@ -485,7 +611,7 @@ func depInputs(ctx context.Context, s *StepDef) (iter.Seq[string], error) {
 		default:
 			return nil, fmt.Errorf("wrong deps log state for %q: state=%s %v", out, state, err)
 		}
-		return func(yield func(string) bool) {
+		return func(yield func(path.Path) bool) {
 			for _, depID := range depIDs {
 				if depID < 0 || depID >= len(s.globals.depsPaths) {
 					in, err := s.globals.depsLog.Path(depID)
@@ -493,8 +619,7 @@ func depInputs(ctx context.Context, s *StepDef) (iter.Seq[string], error) {
 						clog.Warningf(ctx, "unexpected dep id=%d for %q: %v", depID, out, err)
 						continue
 					}
-					in = s.globals.path.MaybeFromRelative(ctx, in)
-					if !yield(in) {
+					if !yield(s.globals.path.FromRelativePath(ctx, in)) {
 						return
 					}
 					continue
@@ -508,14 +633,13 @@ func depInputs(ctx context.Context, s *StepDef) (iter.Seq[string], error) {
 					}
 					dp = &depsPath{
 						path:      in,
-						canonpath: s.globals.path.MaybeFromRelative(ctx, in),
+						canonpath: s.globals.path.FromRelativePath(ctx, in),
 					}
 					// dp should be the same for depID, so
 					// no need to use compareAndSwap.
 					s.globals.depsPaths[depID].Store(dp)
 				}
-				in := dp.canonpath
-				if !yield(in) {
+				if !yield(dp.canonpath) {
 					return
 				}
 			}
@@ -525,44 +649,43 @@ func depInputs(ctx context.Context, s *StepDef) (iter.Seq[string], error) {
 		// deps info is in depfile
 		depfile := s.edge.UnescapedBinding("depfile")
 		if depfile == "" {
-			return func(yield func(string) bool) {}, nil
+			return func(yield func(path.Path) bool) {}, nil
 		}
-		df := s.globals.path.MaybeFromRelative(ctx, depfile)
+		df := path.New(s.globals.path.MaybeFromRelative(ctx, depfile))
 		if s.edge.Binding("generator") != "" {
 			// e.g. rule gn.
 			// generator runs locally, so believe a local file
 			// rather than a file in hashfs.
-			s.globals.hashFS.Forget(ctx, s.globals.path.WorkspaceRoot, []string{df})
+			s.globals.hashFS.Forget(ctx, s.globals.path.WorkspaceRoot, []path.Path{df})
 		}
 		_, err := s.globals.hashFS.Stat(ctx, s.globals.path.WorkspaceRoot, df)
 		if err != nil {
 			return nil, fmt.Errorf("%w: no depfile %s: %w", build.ErrMissingDeps, depfile, err)
 		}
 		fsys := s.globals.hashFS.FileSystem(ctx, s.globals.path.WorkspaceRoot)
-		deps, err = makeutil.ParseDepsFile(ctx, fsys, df)
+		deps, err = makeutil.ParseDepsFile(ctx, fsys, string(df))
 		if err != nil {
 			return nil, fmt.Errorf("%w: failed to load depfile %s: %w", build.ErrMissingDeps, df, err)
 		}
 		if log.V(1) {
 			clog.Infof(ctx, "depfile %s: %d", depfile, len(deps))
 		}
-		return func(yield func(string) bool) {
+		return func(yield func(path.Path) bool) {
 			for _, in := range deps {
-				in = s.globals.path.MaybeFromRelative(ctx, in)
-				if !yield(in) {
+				if !yield(s.globals.path.FromRelativePath(ctx, in)) {
 					return
 				}
 			}
 		}, nil
 	}
-	return func(yield func(string) bool) {}, nil
+	return func(yield func(path.Path) bool) {}, nil
 }
 
 // DepsBaseInputs returns inputs of the step.
 // If includeOrderOnly is false, it will be combined with scandeps results.
 // If includeOrderOnly is true, it will be trimmed down by scandeps results, or depfile.
-func (s *StepDef) DepsBaseInputs(ctx context.Context, toolInputs []string, includeOrderOnly bool) []string {
-	var inputs []string
+func (s *StepDef) DepsBaseInputs(ctx context.Context, toolInputs []path.Path, includeOrderOnly bool) []path.Path {
+	var inputs []path.Path
 	// always use toolInputs.
 	if s.rule.Debug {
 		clog.Infof(ctx, "deps base tool inputs: %q order_only=%t", toolInputs, includeOrderOnly)
@@ -570,8 +693,8 @@ func (s *StepDef) DepsBaseInputs(ctx context.Context, toolInputs []string, inclu
 	inputs = append(inputs, toolInputs...)
 	// TODO: per rule?
 	filter := s.globals.stepConfig.Scandeps.stepInputsFilter
-	seen := make(map[string]bool)
-	var stepInputs []string
+	seen := make(map[path.Path]bool)
+	var stepInputs []path.Path
 	var nodes []*ninjautil.Node
 	// need to expand phony targets here
 	if includeOrderOnly {
@@ -581,10 +704,11 @@ func (s *StepDef) DepsBaseInputs(ctx context.Context, toolInputs []string, inclu
 		stepInputs = s.TriggerInputs(ctx)
 		nodes = s.edge.TriggerInputs()
 	}
+	visited := make(map[*ninjautil.Edge]bool)
 	for _, in := range nodes {
 		p := s.globals.targetPath(in)
 		if inEdge, ok := in.InEdge(); ok && inEdge.IsPhony() {
-			stepInputs = replacePhony(ctx, s.globals, seen, p, inEdge, s.rule.Debug, stepInputs)
+			stepInputs = replacePhony(ctx, s.globals, visited, seen, p, inEdge, s.rule.Debug, stepInputs)
 			if s.rule.Debug {
 				clog.Infof(ctx, "deps base input: expand phony %q", in)
 			}
@@ -598,14 +722,13 @@ func (s *StepDef) DepsBaseInputs(ctx context.Context, toolInputs []string, inclu
 			}
 		}
 	}
-	seen = make(map[string]bool)
+	seen = make(map[path.Path]bool)
 	for _, in := range stepInputs {
-		in = filepath.ToSlash(in)
 		if seen[in] {
 			continue
 		}
 		seen[in] = true
-		if !filter(ctx, in, s.rule.Debug) {
+		if !filter(ctx, string(in), s.rule.Debug) {
 			if s.rule.Debug {
 				clog.Infof(ctx, "deps base inputs ignored: %s", in)
 			}
@@ -620,24 +743,26 @@ func (s *StepDef) DepsBaseInputs(ctx context.Context, toolInputs []string, inclu
 }
 
 // ToolInputs returns tool inputs of the step.
-func (s *StepDef) ToolInputs(ctx context.Context) []string {
+func (s *StepDef) ToolInputs(ctx context.Context) []path.Path {
 	ctx, span := trace.NewSpan(ctx, "stepdef-tool-inputs")
 	defer span.Close(nil)
 
-	var inputs []string
+	inputs := make([]path.Path, 0, len(s.rule.Inputs)+len(s.globals.shellInputs))
 	for _, in := range s.rule.Inputs {
 		inputs = append(inputs, fromConfigPath(ctx, s.globals.path, in))
 	}
-	return s.globals.stepConfig.ExpandInputs(ctx, s.globals.path, s.globals.hashFS, inputs)
+	inputs = s.globals.stepConfig.ExpandInputs(ctx, s.globals.path, s.globals.hashFS, inputs)
+	inputs = s.addShellInputs(inputs, nil)
+	return inputs
 }
 
-func fixInputs(ctx context.Context, stepDef *StepDef, inputs, excludes []string) []string {
+func fixInputs(ctx context.Context, stepDef *StepDef, inputs []path.Path, excludes []string) []path.Path {
 	if stepDef.rule.Debug {
 		clog.Infof(ctx, "fix inputs=%d excludes=%d", len(inputs), len(excludes))
 	}
-	newInputs := make([]string, 0, len(inputs))
+	newInputs := make([]path.Path, 0, len(inputs))
 	for _, in := range inputs {
-		if stepDef.globals.phony[in] {
+		if stepDef.globals.phony[string(in)] {
 			_, err := stepDef.globals.hashFS.Stat(ctx, stepDef.globals.path.WorkspaceRoot, in)
 			if err != nil {
 				if errors.Is(err, fs.ErrNotExist) {
@@ -657,7 +782,7 @@ func fixInputs(ctx context.Context, stepDef *StepDef, inputs, excludes []string)
 	if len(excludes) == 0 {
 		return inputs
 	}
-	rm := make(map[string]bool)
+	rm := make(map[path.Path]bool)
 	for _, e := range excludes {
 		var m func(in string) bool
 		if !strings.Contains(e, "/") {
@@ -686,7 +811,7 @@ func fixInputs(ctx context.Context, stepDef *StepDef, inputs, excludes []string)
 			}
 		}
 		for _, in := range inputs {
-			if m(in) {
+			if m(string(in)) {
 				rm[in] = true
 				if stepDef.rule.Debug {
 					clog.Infof(ctx, "fix exclude %s by %s", in, e)
@@ -697,7 +822,7 @@ func fixInputs(ctx context.Context, stepDef *StepDef, inputs, excludes []string)
 	if len(rm) == 0 {
 		return inputs
 	}
-	r := make([]string, 0, len(inputs)-len(rm))
+	r := make([]path.Path, 0, len(inputs)-len(rm))
 	for _, in := range inputs {
 		if rm[in] {
 			continue
@@ -711,7 +836,7 @@ func fixInputs(ctx context.Context, stepDef *StepDef, inputs, excludes []string)
 }
 
 // ExpandedCaseSensitives returns expanded filenames if platform is case-sensitive.
-func (s StepDef) ExpandedCaseSensitives(ctx context.Context, inputs []string) []string {
+func (s *StepDef) ExpandedCaseSensitives(ctx context.Context, inputs []path.Path) []path.Path {
 	if s.Platform()["OSFamily"] == "Windows" {
 		// Nothing to do on case-insensitive platform.
 		return inputs
@@ -722,25 +847,24 @@ func (s StepDef) ExpandedCaseSensitives(ctx context.Context, inputs []string) []
 		return inputs
 	}
 	oldLen := len(inputs)
-	m := make(map[string]bool)
-	var expanded []string
+	m := make(map[path.Path]bool)
+	var expanded []path.Path
 	for _, f := range inputs {
-		f = filepath.ToSlash(f)
 		if m[f] {
 			continue
 		}
 		expanded = append(expanded, f)
 		m[f] = true
-		csf, ok := s.globals.caseSensitives[strings.ToLower(f)]
+		csf, ok := s.globals.caseSensitives[strings.ToLower(string(f))]
 		if !ok {
 			continue
 		}
-		for _, f := range csf {
-			if m[f] {
+		for _, cf := range csf {
+			if m[cf] {
 				continue
 			}
-			expanded = append(expanded, f)
-			m[f] = true
+			expanded = append(expanded, cf)
+			m[cf] = true
 		}
 	}
 	newLen := len(expanded)
@@ -751,7 +875,7 @@ func (s StepDef) ExpandedCaseSensitives(ctx context.Context, inputs []string) []
 }
 
 // expandLabels expands labels in given inputs.
-func (s *StepDef) expandLabels(ctx context.Context, inputs []string) []string {
+func (s *StepDef) expandLabels(ctx context.Context, inputs []path.Path) []path.Path {
 	ctx, span := trace.NewSpan(ctx, "stepdef-expand-labels")
 	defer span.Close(nil)
 
@@ -760,7 +884,7 @@ func (s *StepDef) expandLabels(ctx context.Context, inputs []string) []string {
 	}
 	var hasLabel bool
 	for _, input := range inputs {
-		if strings.Contains(input, ":") {
+		if strings.Contains(string(input), ":") {
 			hasLabel = true
 			break
 		}
@@ -769,19 +893,19 @@ func (s *StepDef) expandLabels(ctx context.Context, inputs []string) []string {
 		return uniqueFiles(inputs)
 	}
 	p := s.globals.path
-	seen := make(map[string]bool)
-	var expanded []string
+	seen := make(map[path.Path]bool)
+	var expanded []path.Path
 	for i := 0; i < len(inputs); i++ {
-		path := inputs[i]
-		if seen[path] {
+		pp := inputs[i]
+		if seen[pp] {
 			continue
 		}
-		seen[path] = true
-		if !strings.Contains(path, ":") {
-			expanded = append(expanded, path)
+		seen[pp] = true
+		if !strings.Contains(string(pp), ":") {
+			expanded = append(expanded, pp)
 			continue
 		}
-		cpath := toConfigPath(p, path)
+		cpath := toConfigPath(p, pp)
 		deps, ok := s.globals.stepConfig.InputDeps[cpath]
 		if !ok {
 			// TODO(b/266759797): make it hard error?
@@ -792,11 +916,17 @@ func (s *StepDef) expandLabels(ctx context.Context, inputs []string) []string {
 			clog.Infof(ctx, "expand %s", cpath)
 		}
 		for _, dep := range deps {
-			dep := fromConfigPath(ctx, p, dep)
-			inputs = append(inputs, dep)
+			inputs = append(inputs, fromConfigPath(ctx, p, dep))
 		}
 	}
 	return expanded
+}
+
+// seenSetPool pools the map[path.Path]bool dedup scratches used by
+// ExpandedInputs (~60k calls per build, ~1k entries each). Callers
+// must clear the map before returning it to the pool.
+var seenSetPool = sync.Pool{
+	New: func() any { return make(map[path.Path]bool, 1024) },
 }
 
 // ExpandedInputs returns expanded inputs
@@ -806,7 +936,7 @@ func (s *StepDef) expandLabels(ctx context.Context, inputs []string) []string {
 //   - Replace the inputs from replace steps.
 //   - Exclude by ExcludeInputPatterns.
 //     etc
-func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
+func (s *StepDef) ExpandedInputs(ctx context.Context) []path.Path {
 	ctx, span := trace.NewSpan(ctx, "stepdef-expanded-inputs")
 	defer span.Close(nil)
 
@@ -815,9 +945,13 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 	}
 	// it takes too much memory in later build stages.
 	// keep Inputs as is, and expand them when calculating digest ?
-	seen := make(map[string]bool)
+	seen := seenSetPool.Get().(map[path.Path]bool)
+	defer func() {
+		clear(seen)
+		seenSetPool.Put(seen)
+	}()
 	var phonyEdges []*ninjautil.Edge
-	var inputs []string
+	inputs := make([]path.Path, 0, 2*len(s.edge.Inputs()))
 	globals := s.globals
 	for _, in := range s.edge.Inputs() {
 		p := globals.targetPath(in)
@@ -838,8 +972,8 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 		}
 		inputs = append(inputs, p)
 	}
-	for p := range edgeSolibs(s.edge) {
-		p = globals.path.MaybeFromRelative(ctx, p)
+	for sp := range edgeSolibs(s.edge) {
+		p := path.New(globals.path.MaybeFromRelative(ctx, sp))
 		if seen[p] {
 			continue
 		}
@@ -848,7 +982,8 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 		}
 		inputs = append(inputs, p)
 	}
-	for _, p := range s.rule.Inputs {
+	for _, rp := range s.rule.Inputs {
+		p := path.Path(rp)
 		if seen[p] {
 			continue
 		}
@@ -864,9 +999,13 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 		}
 		// need to use different seen, so that replaces/accumulates
 		// works even if indirect inputs see/ignore the inputs.
-		iseen := make(map[string]bool)
+		iseen := seenSetPool.Get().(map[path.Path]bool)
+		defer func() {
+			clear(iseen)
+			seenSetPool.Put(iseen)
+		}()
 		maps.Copy(iseen, seen)
-		filter := s.rule.IndirectInputs.filter(ctx, "indirect_inputs")
+		filter := s.rule.IndirectInputs.Filter(ctx, "indirect_inputs")
 		for _, in := range s.edge.Inputs() {
 			edge, ok := in.InEdge()
 			if !ok {
@@ -876,18 +1015,21 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 		}
 		// and need to expand inputs for toolchain input etc.
 	}
-	for _, inEdge := range phonyEdges {
-		// replace phony inputs here before ExpandInput,
-		// since ExpandInputs removes non-exist inputs.
-		p := globals.targetPath(inEdge.Outputs()[0])
-		inputs = replacePhony(ctx, globals, seen, p, inEdge, s.rule.Debug, inputs)
+	if len(phonyEdges) > 0 {
+		visited := make(map[*ninjautil.Edge]bool)
+		for _, inEdge := range phonyEdges {
+			// replace phony inputs here before ExpandInput,
+			// since ExpandInputs removes non-exist inputs.
+			p := globals.targetPath(inEdge.Outputs()[0])
+			inputs = replacePhony(ctx, globals, visited, seen, p, inEdge, s.rule.Debug, inputs)
+		}
 	}
 
 	inputs = globals.stepConfig.ExpandInputs(ctx, globals.path, globals.hashFS, inputs)
-	var newInputs []string
+	var newInputs []path.Path
 	changed := false
 	for i := 0; i < len(inputs); i++ {
-		inpath := globals.path.MaybeToRelative(ctx, inputs[i])
+		inpath := globals.path.MaybeToRelative(ctx, string(inputs[i]))
 		innode, ok := globals.nstate.LookupNodeByPath(inpath)
 		if !ok {
 			newInputs = append(newInputs, inputs[i])
@@ -907,7 +1049,7 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 			}
 			clog.Infof(ctx, "check edgeRule for %s inputs=%d solibs=%d replace=%t accumulate=%t", inputs[i], len(er.edge.Inputs()), solibs, er.replace, er.accumulate)
 		}
-		var ins []string
+		var ins []path.Path
 		for _, in := range er.edge.Inputs() {
 			p := globals.targetPath(in)
 			if seen[p] {
@@ -929,14 +1071,14 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 			continue
 		}
 		newInputs = append(newInputs, inputs[i])
-		var solibsIns []string
+		var solibsIns []path.Path
 		for in := range edgeSolibs(er.edge) {
-			in = globals.path.MaybeFromRelative(ctx, in)
-			if seen[in] {
+			p := path.New(globals.path.MaybeFromRelative(ctx, in))
+			if seen[p] {
 				continue
 			}
-			seen[in] = true
-			solibsIns = append(solibsIns, in)
+			seen[p] = true
+			solibsIns = append(solibsIns, p)
 		}
 		if len(solibsIns) > 0 {
 			// solibsIns need to check recursively.
@@ -972,19 +1114,41 @@ func (s *StepDef) ExpandedInputs(ctx context.Context) []string {
 			changed = true
 		}
 	}
-	newInputs = fixInputs(ctx, s, newInputs, s.rule.ExcludeInputPatterns)
+	newInputsPaths := fixInputs(ctx, s, newInputs, s.rule.ExcludeInputPatterns)
+	newInputsPaths = s.addShellInputs(newInputsPaths, nil)
 	if changed {
-		inputs = make([]string, len(newInputs))
-		copy(inputs, newInputs)
+		result := make([]path.Path, len(newInputsPaths))
+		copy(result, newInputsPaths)
+		return result
 	}
 	if s.rule.Debug {
-		clog.Infof(ctx, "expanded inputs -> %d", len(inputs))
+		clog.Infof(ctx, "expanded inputs -> %d", len(newInputsPaths))
 	}
-	return inputs
+	return newInputsPaths
 }
 
-func replacePhony(ctx context.Context, globals *globals, seen map[string]bool, target string, edge *ninjautil.Edge, debug bool, inputs []string) []string {
-	for _, in := range edge.TriggerInputs() {
+func replacePhony(ctx context.Context, globals *globals, visited map[*ninjautil.Edge]bool, seen map[path.Path]bool, target path.Path, edge *ninjautil.Edge, debug bool, inputs []path.Path) []path.Path {
+	if visited[edge] {
+		return inputs
+	}
+	visited[edge] = true
+	edgeInputs := edge.TriggerInputs()
+	if len(edgeInputs) == 0 {
+		// empty phony target.
+		// https://ninja-build.org/manual.html#_the_literal_phony_literal_rule
+		// phony can also be used to create dummy targets for files
+		// which may not exist at build time.
+		// If a phony build statement is written without any
+		// dependencies, the target will be considered out of date
+		// if it does not exist.
+		// so, phony target may exist as file, or may not.
+		_, err := globals.hashFS.Stat(ctx, globals.path.WorkspaceRoot, target)
+		if err == nil {
+			inputs = append(inputs, target)
+		}
+		return inputs
+	}
+	for _, in := range edgeInputs {
 		p := globals.targetPath(in)
 		if seen[p] {
 			continue
@@ -994,7 +1158,7 @@ func replacePhony(ctx context.Context, globals *globals, seen map[string]bool, t
 			clog.Infof(ctx, "input from ninja(phony): %s -> %s", target, p)
 		}
 		if inEdge, ok := in.InEdge(); ok && inEdge.IsPhony() {
-			inputs = replacePhony(ctx, globals, seen, p, inEdge, debug, inputs)
+			inputs = replacePhony(ctx, globals, visited, seen, p, inEdge, debug, inputs)
 			continue
 		}
 		inputs = append(inputs, p)
@@ -1003,7 +1167,7 @@ func replacePhony(ctx context.Context, globals *globals, seen map[string]bool, t
 }
 
 // appendIndirectInputs appends indirect inputs edge into inputs that matches with filter function, and updates seen.
-func (s *StepDef) appendIndirectInputs(ctx context.Context, filter func(context.Context, string, bool) bool, edge *ninjautil.Edge, inputs []string, seen map[string]bool) []string {
+func (s *StepDef) appendIndirectInputs(ctx context.Context, filter func(context.Context, string, bool) bool, edge *ninjautil.Edge, inputs []path.Path, seen map[path.Path]bool) []path.Path {
 	edgeName := edge.RuleName()
 	globals := s.globals
 	if !edge.IsPhony() {
@@ -1014,7 +1178,7 @@ func (s *StepDef) appendIndirectInputs(ctx context.Context, filter func(context.
 				continue
 			}
 			seen[p] = true
-			if !filter(ctx, filepath.ToSlash(p), s.rule.Debug) {
+			if !filter(ctx, string(p), s.rule.Debug) {
 				if s.rule.Debug {
 					clog.Infof(ctx, "input from ninja indirect[output] ignored: %s: %s", edgeName, p)
 				}
@@ -1037,7 +1201,7 @@ func (s *StepDef) appendIndirectInputs(ctx context.Context, filter func(context.
 		if ok {
 			nextEdges = append(nextEdges, edge)
 		}
-		if !filter(ctx, filepath.ToSlash(p), s.rule.Debug) {
+		if !filter(ctx, string(p), s.rule.Debug) {
 			if s.rule.Debug {
 				clog.Infof(ctx, "input from ninja indirect[input] ignored: %s: %s", edgeName, p)
 			}
@@ -1055,21 +1219,30 @@ func (s *StepDef) appendIndirectInputs(ctx context.Context, filter func(context.
 }
 
 // RemoteInputs returns remote input mappings.
-func (s *StepDef) RemoteInputs() map[string]string {
-	return s.rule.RemoteInputs
+func (s *StepDef) RemoteInputs() map[path.Path]path.Path {
+	if len(s.rule.RemoteInputs) == 0 {
+		return nil
+	}
+	m := make(map[path.Path]path.Path, len(s.rule.RemoteInputs))
+	for k, v := range s.rule.RemoteInputs {
+		m[path.FromClean(k)] = path.FromClean(v)
+	}
+	return m
 }
 
-// CheckInputDeps checks dep can be found in its direct/indirect inputs.
-// Returns true if it is unknown bad deps, false otherwise.
-func (s *StepDef) CheckInputDeps(ctx context.Context, depInputs []string) (bool, error) {
-	deps := make(map[string]bool)
+// CheckMissingDeps checks if depInputs can be found in direct/indirect inputs.
+// It returns whether any missing dependency is a known issue, and an error describing
+// any missing dependencies found.
+func (s *StepDef) CheckMissingDeps(ctx context.Context, depInputs []path.Path) (known bool, err error) {
+	deps := make(map[path.Path]bool)
 	for _, dep := range depInputs {
 		deps[dep] = true
 	}
-	seen := make(map[string]bool)
-	// check input deps from s.edge's inputs.
+	visited := make(map[*ninjautil.Edge]bool)
+	seen := make(map[path.Path]bool)
+	// resolve deps from s.edge's inputs.
 	// it doesn't check output of s.edge.
-	edges := checkInputDep(s.globals, s.edge, false, deps, seen)
+	edges := resolveEdgeDeps(s.globals, s.edge, false, deps, visited, seen)
 	// avoid recursion for memory efficiency (e.g. avoid deep stack)
 	for len(edges) > 0 {
 		edge := edges[0]
@@ -1078,8 +1251,8 @@ func (s *StepDef) CheckInputDeps(ctx context.Context, depInputs []string) (bool,
 		copy(edges, remain)
 		edges[len(edges)-1] = nil
 		edges = edges[:len(edges)-1]
-		// check input deps for edge's inputs and outputs.
-		edges = append(edges, checkInputDep(s.globals, edge, true, deps, seen)...)
+		// resolve deps for edge's inputs and outputs.
+		edges = append(edges, resolveEdgeDeps(s.globals, edge, true, deps, visited, seen)...)
 		if len(deps) == 0 {
 			return false, nil
 		}
@@ -1087,25 +1260,27 @@ func (s *StepDef) CheckInputDeps(ctx context.Context, depInputs []string) (bool,
 	if len(deps) == 0 {
 		return false, nil
 	}
-	depInputs = depInputs[:0]
 	bpath := s.globals.path
+	var remaining []string
 	for in := range deps {
-		depInputs = append(depInputs, bpath.MaybeToRelative(ctx, in))
+		remaining = append(remaining, bpath.MaybeToRelative(ctx, string(in)))
 	}
-	sort.Strings(depInputs)
+	sort.Strings(remaining)
 	var outputPath string
 	if len(s.edge.Outputs()) > 0 {
-		out := bpath.MaybeFromRelative(ctx, s.edge.Outputs()[0].Path())
+		out := path.New(bpath.MaybeFromRelative(ctx, s.edge.Outputs()[0].Path()))
 		outputPath = toConfigPath(bpath, out)
 	}
-	v, ok := s.globals.stepConfig.BadDeps[outputPath]
-	if ok {
-		return false, fmt.Errorf("deps inputs have no dependencies from %q to %q - %s", outputPath, depInputs, v)
+	reason := "unknown"
+	v, known := s.globals.stepConfig.MissingDeps[outputPath]
+	if known {
+		reason = v
 	}
-	return true, fmt.Errorf("deps inputs have no dependencies from %q to %q - unknown", outputPath, depInputs)
+	desc := fmt.Sprintf("deps inputs have no dependencies from %q to %q - %s", outputPath, remaining, reason)
+	return known, errors.New(desc)
 }
 
-func checkInputDep(globals *globals, edge *ninjautil.Edge, checkOutputs bool, deps, seen map[string]bool) []*ninjautil.Edge {
+func resolveEdgeDeps(globals *globals, edge *ninjautil.Edge, checkOutputs bool, deps map[path.Path]bool, visited map[*ninjautil.Edge]bool, seen map[path.Path]bool) []*ninjautil.Edge {
 	if len(deps) == 0 {
 		return nil
 	}
@@ -1126,6 +1301,10 @@ func checkInputDep(globals *globals, edge *ninjautil.Edge, checkOutputs bool, de
 		if !ok {
 			continue
 		}
+		if _, ok := visited[inEdge]; ok {
+			continue
+		}
+		visited[inEdge] = true
 		edges = append(edges, inEdge)
 	}
 	if checkOutputs {
@@ -1158,7 +1337,7 @@ func (s *StepDef) Handle(ctx context.Context, cmd *execute.Cmd) error {
 		// if handler is not set, expand later by depsExpandInput in build/builder.go
 		inputs := s.ExpandedInputs(ctx)
 		clog.Infof(ctx, "cmd.expandedInputs %d", len(inputs))
-		return inputs
+		return path.Strings(inputs)
 	})
 	if err != nil {
 		return err
@@ -1170,9 +1349,9 @@ func (s *StepDef) Handle(ctx context.Context, cmd *execute.Cmd) error {
 }
 
 // Outputs returns outputs of the step.
-func (s *StepDef) Outputs(ctx context.Context) []string {
-	seen := make(map[string]bool)
-	var targets []string
+func (s *StepDef) Outputs(ctx context.Context) []path.Path {
+	seen := make(map[path.Path]bool)
+	var targets []path.Path
 	globals := s.globals
 	for _, out := range s.edge.Outputs() {
 		p := globals.targetPath(out)
@@ -1182,12 +1361,12 @@ func (s *StepDef) Outputs(ctx context.Context) []string {
 		seen[p] = true
 		targets = append(targets, p)
 	}
-	targets = append(targets, s.rule.Outputs...)
+	targets = append(targets, path.Paths(s.rule.Outputs)...)
 	return uniqueFiles(targets)
 }
 
 // LocalOutputs returns outputs of the step that should be written to local disk.
-func (s *StepDef) LocalOutputs(ctx context.Context) []string {
+func (s *StepDef) LocalOutputs(ctx context.Context) []path.Path {
 	if s.rule.OutputLocal {
 		return s.Outputs(ctx)
 	}
@@ -1204,6 +1383,12 @@ func (s *StepDef) Platform() map[string]string {
 	return s.rule.Platform
 }
 
+// IsRemoteRule reports whether the step is declared remote-executable
+// in the siso stepconfig.
+func (s *StepDef) IsRemoteRule() bool {
+	return s.rule.Remote
+}
+
 // Sandbox returns properties for action sandboxing.
 func (s *StepDef) Sandbox() map[string]string {
 	// disable sandbox for impure step, inputs/outputs are not fully specified.
@@ -1215,8 +1400,9 @@ func (s *StepDef) Sandbox() map[string]string {
 	if s.edge.Pool().Name() == "console" {
 		return nil
 	}
-	// disable sandbox if "sandbox_disabled" binding is explicitly set.
-	if s.edge.Binding("sandbox_disabled") == "true" {
+	// disable sandbox if "sandbox_disabled" is set in the ninja file
+	// or in the siso config rule.
+	if s.Binding("sandbox_disabled") == "true" {
 		return nil
 	}
 	return s.globals.stepConfig.Sandbox
@@ -1241,8 +1427,8 @@ func (s *StepDef) RuleFix(ctx context.Context, inadds, outadds []string) []byte 
 	rule := s.rule
 	rule.ActionName = s.ActionName()
 	var actionOut string
-	if len(s.Outputs(ctx)) > 0 {
-		actionOut = toConfigPath(s.globals.path, s.Outputs(ctx)[0])
+	if outs := s.Outputs(ctx); len(outs) > 0 {
+		actionOut = toConfigPath(s.globals.path, outs[0])
 	}
 	rule.ActionOuts = nil
 	rule.CommandPrefix = strings.Join(s.Args(ctx), " ")
@@ -1252,16 +1438,14 @@ func (s *StepDef) RuleFix(ctx context.Context, inadds, outadds []string) []byte 
 	rule.Inputs = nil
 	deps := rule.OutputsMap[actionOut]
 	for _, in := range inadds {
-		in = toConfigPath(s.globals.path, in)
-		deps.Inputs = append(deps.Inputs, in)
+		deps.Inputs = append(deps.Inputs, toConfigPath(s.globals.path, path.FromClean(in)))
 	}
-	deps.Inputs = uniqueFiles(deps.Inputs)
+	deps.Inputs = uniqueFileStrings(deps.Inputs)
 	sort.Strings(deps.Inputs)
 	for _, out := range outadds {
-		out = toConfigPath(s.globals.path, out)
-		deps.Outputs = append(deps.Outputs, out)
+		deps.Outputs = append(deps.Outputs, toConfigPath(s.globals.path, path.FromClean(out)))
 	}
-	deps.Outputs = uniqueFiles(deps.Outputs)
+	deps.Outputs = uniqueFileStrings(deps.Outputs)
 	sort.Strings(deps.Outputs)
 	rule.OutputsMap = map[string]StepDeps{
 		actionOut: deps,
@@ -1273,7 +1457,20 @@ func (s *StepDef) RuleFix(ctx context.Context, inadds, outadds []string) []byte 
 	return ruleBuf
 }
 
-func uniqueFiles(files []string) []string {
+func uniqueFiles(files []path.Path) []path.Path {
+	seen := make(map[path.Path]bool)
+	ret := files[:0] // reuse the same backing store.
+	for _, f := range files {
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
+		ret = append(ret, f)
+	}
+	return ret
+}
+
+func uniqueFileStrings(files []string) []string {
 	seen := make(map[string]bool)
 	ret := files[:0] // reuse the same backing store.
 	for _, f := range files {
@@ -1287,11 +1484,11 @@ func uniqueFiles(files []string) []string {
 }
 
 // AuxiliaryLogOutputFiles returns output files that siso explicitly logs digest of.
-func (s *StepDef) AuxiliaryLogOutputFiles(ctx context.Context) []string {
-	return s.rule.AuxiliaryLogOutputFiles
+func (s *StepDef) AuxiliaryLogOutputFiles(ctx context.Context) []path.Path {
+	return path.Paths(s.rule.AuxiliaryLogOutputFiles)
 }
 
 // AuxiliaryLogOutputDirs returns output directories that siso explicitly logs digest of.
-func (s *StepDef) AuxiliaryLogOutputDirs(ctx context.Context) []string {
-	return s.rule.AuxiliaryLogOutputDirs
+func (s *StepDef) AuxiliaryLogOutputDirs(ctx context.Context) []path.Path {
+	return path.Paths(s.rule.AuxiliaryLogOutputDirs)
 }

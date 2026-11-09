@@ -18,7 +18,7 @@ import (
 
 // embeds these Starlark files for @builtin.
 //
-//go:embed encoding.star path.star runtime.star struct.star lib/gn.star
+//go:embed encoding.star path.star runtime.star struct.star time.star lib/gn.star
 var builtinStar embed.FS
 
 func builtinModule() map[string]starlark.Value {

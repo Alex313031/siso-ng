@@ -342,3 +342,72 @@ build out/prog: link out/foo.o out/bar.o
 		t.Errorf("second Close: %v", err)
 	}
 }
+
+func TestState_OutEdges(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	manifest := `
+rule cc
+  command = clang -c $in -o $out
+rule link
+  command = clang++ $in -o $out
+
+build a.o: cc a.cc | common.h
+build b.o: cc b.cc | common.h
+build prog: link a.o b.o
+`
+	if err := os.WriteFile(filepath.Join(dir, "build.ninja"), []byte(manifest), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := NewState()
+	p := NewManifestParser(state)
+	p.SetWd(dir)
+	if err := p.Load(ctx, "build.ninja"); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if state.outEdges != nil || state.outEdgeIdx != nil {
+		t.Fatalf("outEdges built eagerly during Load")
+	}
+
+	prog, ok := state.LookupNodeByPath("prog")
+	if !ok {
+		t.Fatal("missing prog")
+	}
+	if prog.HasOut() {
+		t.Errorf("prog.HasOut() = true; want false")
+	}
+	if outs := state.OutEdges(prog); len(outs) != 0 {
+		t.Errorf("state.OutEdges(prog) = %v; want empty", outs)
+	}
+	if state.outEdges != nil {
+		t.Errorf("OutEdges on node with HasOut()==false triggered buildOutEdges")
+	}
+
+	for _, tc := range []struct {
+		path string
+		want []string
+	}{
+		{path: "common.h", want: []string{"a.o", "b.o"}},
+		{path: "a.cc", want: []string{"a.o"}},
+		{path: "b.cc", want: []string{"b.o"}},
+		{path: "a.o", want: []string{"prog"}},
+		{path: "b.o", want: []string{"prog"}},
+	} {
+		n, ok := state.LookupNodeByPath(tc.path)
+		if !ok {
+			t.Fatalf("missing %s", tc.path)
+		}
+		if !n.HasOut() {
+			t.Errorf("%s.HasOut() = false; want true", tc.path)
+		}
+		var got []string
+		for _, edge := range state.OutEdges(n) {
+			for _, out := range edge.Outputs() {
+				got = append(got, out.Path())
+			}
+		}
+		if diff := cmp.Diff(tc.want, got); diff != "" {
+			t.Errorf("state.OutEdges(%s) diff (-want +got):\n%s", tc.path, diff)
+		}
+	}
+}

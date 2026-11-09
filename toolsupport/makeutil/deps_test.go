@@ -5,10 +5,36 @@
 package makeutil
 
 import (
+	"bytes"
+	"runtime"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 )
+
+// TestNextTokenSlowDoesNotOverAllocate: a short escaped token followed by a
+// huge tail must allocate ~its own size, not the tail's (String() returns the
+// builder buffer uncopied, so an oversized builder would be retained).
+func TestNextTokenSlowDoesNotOverAllocate(t *testing.T) {
+	tail := bytes.Repeat([]byte("some/long/path/file.o "), 100000) // ~2 MB
+	s := append([]byte(`a\ b `), tail...)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	tok, rest := nextToken(s)
+	runtime.ReadMemStats(&after)
+
+	if tok != "a b" {
+		t.Fatalf("nextToken token = %q; want %q", tok, "a b")
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64*1024 {
+		t.Errorf("nextToken allocated %d bytes for a 3-byte token; slow path sized the builder to the whole input (len=%d)", alloc, len(s))
+	}
+	// sanity: the rest still parses to the expected first tail token.
+	if next, _ := nextToken(rest); next != "some/long/path/file.o" {
+		t.Errorf("rest first token = %q; want %q", next, "some/long/path/file.o")
+	}
+}
 
 func TestParseDeps(t *testing.T) {
 	for _, tc := range []struct {

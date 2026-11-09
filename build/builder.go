@@ -35,8 +35,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build/metadata"
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/execute/localexec"
@@ -47,10 +49,9 @@ import (
 	"go.chromium.org/build/siso/o11y/iometrics"
 	"go.chromium.org/build/siso/o11y/monitoring"
 	sisopprof "go.chromium.org/build/siso/o11y/pprof"
-	"go.chromium.org/build/siso/o11y/resultstore"
 	"go.chromium.org/build/siso/o11y/trace"
+	sisopath "go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/merkletree"
 	"go.chromium.org/build/siso/scandeps"
 	"go.chromium.org/build/siso/sync/semaphore"
@@ -66,6 +67,17 @@ const (
 	logLabelKeyID         = "id"
 	logLabelKeyBacktraces = "backtraces"
 )
+
+// A ResultSink records results of the invocation.
+// It implements io.Writer for writing a transcript of the invocation.
+type ResultSink interface {
+	io.Writer
+	// UploadBuildNinja uploads Build Ninja files to this result sink.
+	UploadBuildNinja(ctx context.Context, d digest.Digest) error
+	// UploadBuildConfig records and uploads config files to this result sink.
+	// Can be called again when manifest reloaded, which regenerates the configuration.
+	UploadBuildConfig(ctx context.Context, properties map[string]string, ents []merkletree.Entry) error
+}
 
 // chromium recipe module expects this string.
 const ninjaNoWorkToDo = "ninja: no work to do.\n"
@@ -85,7 +97,9 @@ type Options struct {
 	RECacheEnableRead  bool
 	RECacheEnableWrite bool
 	ActionSalt         []byte
+	LocalActionSalt    []byte
 
+	LocallyNeeded        *LocallyNeededSet
 	Cache                *Cache
 	NinjaLogWriter       io.Writer
 	FailureSummaryWriter io.Writer
@@ -97,8 +111,8 @@ type Options struct {
 	Pprof                string
 	Tracer               *trace.Tracer
 	TraceExporter        *trace.Exporter
-	PprofUploader        *sisopprof.Uploader
-	ResultstoreUploader  *resultstore.Uploader
+	PprofUploader        sisopprof.Uploader
+	ResultSink           ResultSink
 
 	// Clobber forces to rebuild ignoring existing generated files.
 	Clobber bool
@@ -143,7 +157,51 @@ type Options struct {
 
 	// LastFailureTargets is a list of targets that failed in the previous build.
 	LastFailureTargets []string
+
+	// WeightsFile is an optional path to a JSON(.gz) file specifying positive
+	// integer step weights for critical-path step scheduling.
+	WeightsFile string
+
+	// BuildLabel to attach to output files
+	BuildLabel string
+
+	// MissingDeps specifies how to handle missing dependencies:
+	// "ignore" (default), "warn", "error", or "fatal".
+	MissingDeps MissingDepsMode
 }
+
+// EnvConfig is a config for environment variables.
+type EnvConfig struct {
+	// Inherits lists environment variable names to inherit from Siso's environment.
+	// Mutually exclusive with Excludes.
+	Inherits []string `json:"inherits,omitempty"`
+
+	// Excludes lists environment variable names that are not passed to step commands
+	// when inheriting Siso's environment. Mutually exclusive with Inherits.
+	Excludes []string `json:"excludes,omitempty"`
+
+	// CacheKeyOmits lists environment variable names that are passed to step commands,
+	// but not included in cache keys (e.g. two-phase caching).
+	CacheKeyOmits []string `json:"cache_key_omits,omitempty"`
+
+	// CacheKeySubstitutions maps strings to their replacements when normalizing
+	// environment variable values for cache keys.
+	CacheKeySubstitutions map[string]string `json:"cache_key_substitutions,omitempty"`
+
+	// CacheKeyTrimPrefixes lists prefixes to strip from normalized environment
+	// variable values when the value does not contain a path list separator.
+	CacheKeyTrimPrefixes []string `json:"cache_key_trim_prefixes,omitempty"`
+}
+
+// MissingDepsMode specifies how to handle missing dependencies.
+type MissingDepsMode string
+
+const (
+	MissingDepsIgnore MissingDepsMode = "ignore"
+	MissingDepsWarn   MissingDepsMode = "warn"
+	MissingDepsError  MissingDepsMode = "error"
+	MissingDepsFatal  MissingDepsMode = "fatal"
+)
 
 // Builder is a builder.
 type Builder struct {
@@ -169,8 +227,8 @@ type Builder struct {
 	plan  *plan
 	stats *stats
 
-	// record target's state.
-	targets sync.Map
+	// record target's state, keyed by clean (slash-normalized) target path.
+	targets targetMap
 
 	stepSema *semaphore.Semaphore
 
@@ -202,10 +260,20 @@ type Builder struct {
 	reStatMu                  sync.Mutex
 	reSchedStat, reWorkerStat semaphore.Stat
 
-	actionSalt []byte
+	actionSalt      []byte
+	localActionSalt []byte
+
+	locallyNeeded *LocallyNeededSet
 
 	cacheSema *semaphore.Semaphore
 	cache     *Cache
+
+	// two phase caching
+	twoPhaseCachingSema *semaphore.Semaphore
+	twoPhaseCaching     twoPhaseCaching
+	// dirSpecs caches what matchInputRoot derives from a Directory at a
+	// path. dirSpecKey -> *dirSpec. See dirspec.go.
+	dirSpecs sync.Map
 
 	explainWriter        io.Writer
 	ninjaLogWriter       io.Writer
@@ -217,14 +285,31 @@ type Builder struct {
 	traceExporter        *trace.Exporter
 	tracer               *trace.Tracer
 	traceStats           *traceStats
+	traceDeps            *depRecorder
 	tracePprof           *tracePprof
-	pprofUploader        *sisopprof.Uploader
-	resultstoreUploader  *resultstore.Uploader
+	pprofUploader        sisopprof.Uploader
+	resultSink           ResultSink
 
 	tracePidPreproc, tracePidLocal, tracePidRemote, tracePidWorker int64
 
 	// envfiles: filename -> *envfile
 	envFiles sync.Map
+
+	// env is the environment variables inherited by local build steps.
+	env []string
+
+	// envCacheKeyOmits are environment variable names omitted when recording environment variables in cache keys.
+	envCacheKeyOmits map[string]bool
+
+	// envCacheKeySubstitutions maps strings to their replacements when normalizing environment variable values for cache keys.
+	envCacheKeySubstitutions map[string]string
+
+	// envCacheKeyTrimPrefixes are prefixes stripped from normalized environment variable values when they do not contain a path list separator.
+	envCacheKeyTrimPrefixes []string
+
+	// envHash is a hash of the normalized, non-omitted environment variables in env,
+	// used to invalidate local steps on incremental builds when environment variables change.
+	envHash []byte
 
 	clobber bool
 
@@ -239,8 +324,12 @@ type Builder struct {
 
 	failures failures
 
-	numFallback        atomic.Int64
-	maxFallbackAllowed int64
+	// hasDeferredMissingDepsErrors tracks whether any step encountered missing
+	// dependency errors in "error" mode. Failure is deferred to the end of the build
+	// so that all missing dependency errors across the build can be discovered.
+	hasDeferredMissingDepsErrors atomic.Bool
+	numFallback                  atomic.Int64
+	maxFallbackAllowed           int64
 
 	// ninja debug modes
 	keepRSP     bool
@@ -249,6 +338,10 @@ type Builder struct {
 	rebuildManifest string
 
 	lastFailureTargets map[string]struct{}
+	weightsFile        string
+
+	buildLabel  string
+	missingDeps MissingDepsMode
 }
 
 // New creates new builder.
@@ -256,6 +349,11 @@ func New(ctx context.Context, graph Graph, opts Options) (_ *Builder, err error)
 	logger := clog.FromContext(ctx)
 	if logger != nil {
 		logger.Formatter = logFormat
+	}
+	// The hashfs digests become remote-execution cache keys, so the local
+	// filesystem and the REAPI backend must hash with the same function.
+	if opts.REAPIClient != nil && opts.HashFS.DigestFunction() != opts.REAPIClient.DigestFunction() {
+		return nil, fmt.Errorf("content digest function mismatch: hashfs=%s reapi=%s", opts.HashFS.DigestFunction(), opts.REAPIClient.DigestFunction())
 	}
 	start := opts.StartTime
 	if start.IsZero() {
@@ -369,12 +467,19 @@ func New(ctx context.Context, graph Graph, opts Options) (_ *Builder, err error)
 		reCacheEnableRead:  opts.RECacheEnableRead || experiments.Enabled("simulate-remote-cache-misses", "simulate cache miss"),
 		reCacheEnableWrite: opts.RECacheEnableWrite,
 		actionSalt:         opts.ActionSalt,
+		localActionSalt:    opts.LocalActionSalt,
 		reapiclient:        opts.REAPIClient,
 		reSchedStat:        semaphore.Stat{Name: "re:sched"},
 		reWorkerStat:       semaphore.Stat{Name: "re:worker"},
 
-		cacheSema:             semaphore.New("cache", opts.Limits.Cache),
-		cache:                 opts.Cache,
+		locallyNeeded: opts.LocallyNeeded,
+		cacheSema:     semaphore.New("cache", opts.Limits.Cache),
+		cache:         opts.Cache,
+
+		// TODO(b/539291862): revisit limit configuration.
+		// This limit is needed to avoid too many concurrent gRPC
+		// calls (i.e. protect from gRPC stream saturation).
+		twoPhaseCachingSema:   semaphore.New("two-phase-cache", opts.Limits.TwoPhaseCache),
 		failureSummaryWriter:  opts.FailureSummaryWriter,
 		failedCommandsWriter:  opts.FailedCommandsWriter,
 		outputLogWriter:       opts.OutputLogWriter,
@@ -385,9 +490,10 @@ func New(ctx context.Context, graph Graph, opts Options) (_ *Builder, err error)
 		traceExporter:         opts.TraceExporter,
 		tracer:                opts.Tracer,
 		traceStats:            newTraceStats(),
+		traceDeps:             newDepRecorder(ctx, opts.Tracer),
 		tracePprof:            newTracePprof(opts.Pprof),
 		pprofUploader:         opts.PprofUploader,
-		resultstoreUploader:   opts.ResultstoreUploader,
+		resultSink:            opts.ResultSink,
 		clobber:               opts.Clobber,
 		fastExit:              opts.FastExit,
 		prepare:               opts.Prepare,
@@ -402,6 +508,38 @@ func New(ctx context.Context, graph Graph, opts Options) (_ *Builder, err error)
 		rebuildManifest:       opts.RebuildManifest,
 		UploadBuildNinjaFiles: opts.UploadBuildNinjaFiles,
 		lastFailureTargets:    make(map[string]struct{}),
+		weightsFile:           opts.WeightsFile,
+		buildLabel:            opts.BuildLabel,
+		missingDeps:           opts.MissingDeps,
+	}
+	if envCfg := graph.EnvConfig(ctx); envCfg != nil {
+		if len(envCfg.Inherits) > 0 {
+			for _, k := range envCfg.Inherits {
+				if v, ok := os.LookupEnv(k); ok {
+					b.env = append(b.env, k+"="+v)
+				}
+			}
+		} else {
+			excludes := make(map[string]bool, len(envCfg.Excludes))
+			for _, k := range envCfg.Excludes {
+				excludes[k] = true
+			}
+			for _, kv := range os.Environ() {
+				k, _, _ := strings.Cut(kv, "=")
+				if !excludes[k] {
+					b.env = append(b.env, kv)
+				}
+			}
+		}
+		if len(envCfg.CacheKeyOmits) > 0 {
+			b.envCacheKeyOmits = make(map[string]bool, len(envCfg.CacheKeyOmits))
+			for _, k := range envCfg.CacheKeyOmits {
+				b.envCacheKeyOmits[k] = true
+			}
+		}
+		b.envCacheKeySubstitutions = envCfg.CacheKeySubstitutions
+		b.envCacheKeyTrimPrefixes = envCfg.CacheKeyTrimPrefixes
+		b.envHash = calculateEnvHash(b.env, b.envCacheKeySubstitutions, b.envCacheKeyTrimPrefixes, b.envCacheKeyOmits)
 	}
 	for _, t := range opts.LastFailureTargets {
 		b.lastFailureTargets[t] = struct{}{}
@@ -411,10 +549,19 @@ func New(ctx context.Context, graph Graph, opts Options) (_ *Builder, err error)
 	}
 	if b.reapiclient != nil {
 		reapiVer := b.reapiclient.APIVersion()
-		clog.Infof(ctx, "reapi version=%v; output_paths=%t action.platform=%t", reapiVer, reapi.UseOutputPaths(reapiVer), reapi.UseActionForPlatformProperties(reapiVer))
+		clog.Infof(ctx, "reapi version=%v; output_paths=%t action.platform=%t", reapiVer, reapiVer.UseOutputPaths(), reapiVer.UseActionForPlatformProperties())
 	}
 	if experiments.Enabled("ignore-missing-out-in-depfile", "ignore missing out error in depfile") {
 		makeutil.IgnoreMissingOut = true
+	}
+	if experiments.Enabled("two-phase-caching", "") {
+		if b.reapiclient != nil {
+			rt := reapiTwoPhaseCaching{
+				b:              b,
+				actionCacheMap: b.reapiclient.ActionCacheMap(),
+			}
+			b.twoPhaseCaching = rt
+		}
 	}
 	return b, nil
 }
@@ -439,11 +586,12 @@ func (b *Builder) SemaStats() []semaphore.Stat {
 	stats := []semaphore.Stat{
 		b.cache.sema.Stat(),
 		b.cacheSema.Stat(),
+		b.twoPhaseCachingSema.Stat(),
 		scandeps.CPPScanSema.Stat(),
 		b.fastLocalSema.Stat(),
-		hashfs.DigestSemaphore.Stat(),
+		b.hashFS.DigestSemaphore().Stat(),
 		localexec.ForkSema.Stat(),
-		hashfs.FlushSemaphore.Stat(),
+		b.hashFS.ActiveFlushGate().Stat(),
 		b.localSema.Stat(),
 		osfs.LstatSemaphore.Stat(),
 	}
@@ -456,6 +604,7 @@ func (b *Builder) SemaStats() []semaphore.Stat {
 		b.reWorkerStat,
 		reapi.FileSemaphore.Stat(),
 		remoteexec.Semaphore.Stat(), // remoteexec-digest
+		b.reapiclient.UploadSemaphore().Stat(),
 		b.rewrapSema.Stat(),
 		b.remoteSema.Stat(),
 		b.scanDepsSema.Stat(),
@@ -470,6 +619,9 @@ var ErrManifest = errors.New("manifest error")
 
 // ErrManifestModified is an error to indicate that manifest is modified.
 var ErrManifestModified = errors.New("manifest modified")
+
+// ErrMissingDepsViolation is an error to indicate that the build failed due to missing dependency violations.
+var ErrMissingDepsViolation = errors.New("missing dependency violations")
 
 // Build builds args with the name.
 func (b *Builder) Build(ctx context.Context, name string, args ...string) (err error) {
@@ -503,7 +655,7 @@ func (b *Builder) Build(ctx context.Context, name string, args ...string) (err e
 	if b.rebuildManifest == "" {
 		// record build files in hashfs. b/489164002
 		for _, fname := range b.graph.Filenames() {
-			_, err = b.hashFS.Stat(ctx, b.path.AbsBase(), fname)
+			_, err = b.hashFS.Stat(ctx, b.path.AbsBase(), sisopath.New(fname))
 			if err != nil {
 				clog.Warningf(ctx, "failed to stat build file %q: %v", fname, err)
 			}
@@ -520,22 +672,35 @@ func (b *Builder) Build(ctx context.Context, name string, args ...string) (err e
 
 	// scheduling
 	// TODO: run asynchronously?
-	knownTargetWeights := make(map[Target]int)
-	if len(b.lastFailureTargets) > 0 {
-		targets, err := b.graph.Targets(ctx, slices.Collect(maps.Keys(b.lastFailureTargets))...)
-		if err != nil {
-			clog.Warningf(ctx, "failed to get targets for known weights: %v", err)
-		}
-		for _, t := range targets {
-			knownTargetWeights[t] = math.MaxInt
+	var sw *stepWeights
+	var weightsStart time.Time
+	if b.rebuildManifest == "" && b.weightsFile != "" {
+		weightsStart = time.Now()
+		var werr error
+		sw, werr = loadStepWeights(b.weightsFile)
+		if werr != nil {
+			clog.Warningf(ctx, "failed to load weights file %q: %v", b.weightsFile, werr)
 		}
 	}
+	var failedTargets []Target
+	if len(b.lastFailureTargets) > 0 {
+		var err error
+		failedTargets, err = b.graph.Targets(ctx, slices.Collect(maps.Keys(b.lastFailureTargets))...)
+		if err != nil {
+			clog.Warningf(ctx, "failed to get last failure targets: %v", err)
+		}
+	}
+	stepWeightFn, matchedWeights := newStepWeightFn(b.graph, sw, failedTargets)
+	if sw != nil {
+		clog.Infof(ctx, "loaded %d output weights (%d matched graph targets), %d action rules (default=%d) from %q in %s", len(sw.outputs), matchedWeights, len(sw.rules), sw.defaultWeight, b.weightsFile, time.Since(weightsStart))
+	}
 	schedOpts := schedulerOption{
-		NumTargets:   b.graph.NumTargets(),
-		Path:         b.path,
-		HashFS:       b.hashFS,
-		Prepare:      b.prepare,
-		KnownWeights: knownTargetWeights,
+		NumTargets:    b.graph.NumTargets(),
+		Path:          b.path,
+		HashFS:        b.hashFS,
+		Prepare:       b.prepare,
+		StepWeight:    stepWeightFn,
+		LocallyNeeded: b.locallyNeeded,
 	}
 	sched := newScheduler(ctx, schedOpts)
 	err = schedule(ctx, sched, b.graph, args...)
@@ -583,7 +748,7 @@ func (b *Builder) Build(ctx context.Context, name string, args ...string) (err e
 
 	var mftime time.Time
 	if b.rebuildManifest != "" {
-		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, b.path.MaybeFromRelative(ctx, b.rebuildManifest))
+		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, sisopath.New(b.path.MaybeFromRelative(ctx, b.rebuildManifest)))
 		if err == nil {
 			mftime = fi.ModTime()
 			clog.Infof(ctx, "manifest %s: %s", b.rebuildManifest, mftime)
@@ -592,7 +757,7 @@ func (b *Builder) Build(ctx context.Context, name string, args ...string) (err e
 	defer func() {
 		stat = b.Stats()
 		if b.rebuildManifest != "" {
-			fi, mferr := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, b.path.MaybeFromRelative(ctx, b.rebuildManifest))
+			fi, mferr := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, sisopath.New(b.path.MaybeFromRelative(ctx, b.rebuildManifest)))
 			if mferr != nil {
 				clog.Warningf(ctx, "failed to stat %s: %v", b.rebuildManifest, mferr)
 				err = fmt.Errorf("%w: missing manifest %s: %v", ErrManifest, b.rebuildManifest, mferr)
@@ -633,43 +798,53 @@ func (b *Builder) Build(ctx context.Context, name string, args ...string) (err e
 				restat.ROps, restat.RErrs, ui.NumBytes(restat.RBytes),
 				restat.WOps, restat.WErrs, ui.NumBytes(restat.WBytes))
 		}
-		msg := fmt.Sprintf("\nlocal:%d remote:%d cache:%d cache-write:%d(err:%d) fallback:%d retry:%d skip:%d\n",
-			stat.Local+stat.NoExec, stat.Remote, stat.CacheHit, stat.CacheWrite, stat.CacheWriteErr, stat.LocalFallback, stat.RemoteRetry, stat.Skipped) +
+		msg := fmt.Sprintf("\nnoexec:%d local:%d remote:%d cache:%d skip:%d\n  cache-write:%d(err:%d) fallback:%d retry:%d\n",
+			stat.NoExec, stat.Local, stat.Remote, stat.CacheHit, stat.Skipped, stat.CacheWrite, stat.CacheWriteErr, stat.LocalFallback, stat.RemoteRetry) +
 			depsStatLine +
 			restatLine +
 			fsstatLine + "\n"
 		ui.Default.PrintLines("\n", msg)
-		if b.resultstoreUploader != nil {
-			b.resultstoreUploader.AddBuildLog(msg + "\n")
+		if b.resultSink != nil {
+			fmt.Fprintln(b.resultSink, msg)
 		}
 	}()
 	semas := []trace.Semaphore{
 		b.cache.sema,
+		b.cacheSema,
+		b.twoPhaseCachingSema,
 		b.localSema,
 		b.remoteSema,
 		b.rewrapSema,
 		b.stepSema,
-		hashfs.FlushSemaphore,
+		b.hashFS.ActiveFlushGate(),
 		hashfs.ForgetMissingsSemaphore,
 		osfs.LstatSemaphore,
-		localCacheSemaphore,
+		reapi.LocalCacheSemaphore,
 		reapi.FileSemaphore,
 		gccutil.Semaphore,
 		msvcutil.Semaphore,
 		remoteexec.Semaphore,
+	}
+	if sema := b.reapiclient.UploadSemaphore(); sema != nil {
+		semas = append(semas, sema)
 	}
 	b.tracer.Start(ctx, semas, []*iometrics.IOMetrics{
 		b.hashFS.OS.IOMetrics,
 		b.reapiclient.IOMetrics(),
 		// TODO: cache iometrics?
 	})
-	defer b.tracer.Stop()
+	defer func() {
+		b.traceDeps.record() // queues events, so before the writer stops
+		b.tracer.Stop()
+	}()
 	b.tracePidPreproc = b.tracer.Process(ctx, "preproc")
 	b.tracePidLocal = b.tracer.Process(ctx, "local-exec")
 	b.tracePidRemote = b.tracer.Process(ctx, "remote-exec")
 	b.tracePidWorker = b.tracer.Process(ctx, "rbe")
 	b.tracePprof.SetMetadata(b.metadata)
-	b.pprofUploader.SetMetadata(ctx, b.metadata)
+	if b.pprofUploader != nil {
+		b.pprofUploader.SetMetadata(ctx, b.metadata)
+	}
 	defer func(ctx context.Context) {
 		perr := b.tracePprof.Close(ctx)
 		if perr != nil {
@@ -771,7 +946,7 @@ loop:
 					buf = buf[:runtime.Stack(buf, false)]
 					var out string
 					if outs := step.def.Outputs(ctx); len(outs) > 0 {
-						out = outs[0]
+						out = string(outs[0])
 					} else {
 						out = fmt.Sprintf("%p", step)
 					}
@@ -806,6 +981,10 @@ loop:
 		// report errStuck if it coulddn't progress.
 		// otherwise, report just number of errors.
 		if b.failures.n == 0 {
+			if b.hasDeferredMissingDepsErrors.Load() {
+				errdone <- fmt.Errorf("build failed due to %w", ErrMissingDepsViolation)
+				return
+			}
 			if canceled {
 				errdone <- context.Cause(ctx)
 				return
@@ -885,13 +1064,13 @@ func (b *Builder) uploadBuildNinja(ctx context.Context) {
 	started := time.Now()
 	inputs := b.graph.Filenames()
 	inputs = append(inputs, "args.gn")
-	ents, err := b.hashFS.Entries(ctx, b.path.AbsBase(), inputs)
+	ents, err := b.hashFS.Entries(ctx, b.path.AbsBase(), sisopath.Paths(inputs))
 	if err != nil {
 		clog.Warningf(ctx, "failed to get build files entries: %v", err)
 		return
 	}
-	ds := digest.NewStore()
-	tree := merkletree.NewPooled(ds)
+	ds := blob.NewStore()
+	tree := merkletree.NewPooled(b.hashFS.DigestFunction(), ds)
 	defer tree.Release()
 	for _, ent := range ents {
 		err := tree.Set(ent)
@@ -909,8 +1088,8 @@ func (b *Builder) uploadBuildNinja(ctx context.Context) {
 		clog.Warningf(ctx, "failed to upload build files tree %s: %v", d, err)
 		return
 	}
-	if b.resultstoreUploader != nil {
-		err := b.resultstoreUploader.SetFile(ctx, "build.ninja.dir", d)
+	if b.resultSink != nil {
+		err := b.resultSink.UploadBuildNinja(ctx, d)
 		if err != nil {
 			clog.Warningf(ctx, "failed to set build files tree %s: %v", d, err)
 		}
@@ -952,10 +1131,14 @@ func (b *Builder) recordNinjaLogs(ctx context.Context, s *Step) {
 	}
 
 	// Remove prefixed working directory path from Outputs.
-	outputs := make([]string, 0, len(s.cmd.Outputs))
-	outDir := s.cmd.WorkDir + "/"
+	outputs := make([]string, 0, len(s.cmd.Outputs)+len(s.cmd.OutputDirs))
+	outDir := string(s.cmd.WorkDir) + "/"
 	for _, output := range s.cmd.Outputs {
-		outputs = append(outputs, strings.TrimPrefix(output, outDir))
+		outputs = append(outputs, strings.TrimPrefix(string(output), outDir))
+	}
+	for _, output := range s.cmd.OutputDirs {
+		// Re-append trailing "/" to match ninja's target name convention.
+		outputs = append(outputs, strings.TrimPrefix(string(output), outDir)+"/")
 	}
 	ninjautil.WriteNinjaLogEntries(ctx, b.ninjaLogWriter, start, end, s.endTime, outputs, s.cmd.Args)
 }
@@ -976,7 +1159,7 @@ func stepLogEntry(ctx context.Context, logger *clog.Logger, step *Step, duration
 		Request: &http.Request{
 			Method: http.MethodPost,
 			URL: &url.URL{
-				Path: path.Join("/step", step.def.ActionName(), filepath.ToSlash(step.def.Outputs(ctx)[0])),
+				Path: path.Join("/step", step.def.ActionName(), string(step.def.Outputs(ctx)[0])),
 			},
 		},
 		Status: httpStatus,
@@ -1074,21 +1257,28 @@ func isCanceled(ctx context.Context, err error) bool {
 	return false
 }
 
-// dedupInputs deduplicates inputs.
-// For windows worker, which uses case insensitive file system, it also
-// deduplicates filenames with different cases, e.g. "Windows.h" vs "windows.h".
-// TODO(b/275452106): support Mac worker
+// caseInsensitiveDedupMapPool pools dedupInputs' collapse map.
+var caseInsensitiveDedupMapPool = sync.Pool{
+	New: func() any { return make(map[sisopath.Path]sisopath.Path, 1024) },
+}
+
+// dedupInputs collapses case-insensitive duplicates in cmd.Inputs for
+// Windows remote workers ("Windows.h" vs "windows.h" on NTFS); inputs
+// for other workers are already unique case-sensitively.
+// TODO(b/275452106): support Mac worker.
 func dedupInputs(ctx context.Context, cmd *execute.Cmd) {
-	// need to dedup input with different case in intermediate dir on win and mac?
-	caseInsensitive := cmd.Platform["OSFamily"] == "Windows"
-	m := make(map[string]string, len(cmd.Inputs))
+	if cmd.Platform["OSFamily"] != "Windows" {
+		return
+	}
+	m := caseInsensitiveDedupMapPool.Get().(map[sisopath.Path]sisopath.Path)
+	defer func() {
+		clear(m)
+		caseInsensitiveDedupMapPool.Put(m)
+	}()
 	lenBefore := len(cmd.Inputs)
 	inputs := cmd.Inputs[:0]
 	for _, input := range cmd.Inputs {
-		key := input
-		if caseInsensitive {
-			key = strings.ToLower(input)
-		}
+		key := sisopath.Path(strings.ToLower(string(input)))
 		if s, found := m[key]; found {
 			if log.V(1) {
 				clog.Infof(ctx, "dedup input %s (%s)", input, s)
@@ -1128,18 +1318,22 @@ func (b *Builder) outputs(ctx context.Context, step *Step) error {
 			// for deps=gcc,msvc, ninja will record it in
 			// deps log and remove depfile.
 		default:
-			outputs = append(outputs, step.cmd.Depfile)
+			// Clone first: outputs may share cmd.Outputs' backing array
+			// (spare capacity), so a bare append could corrupt it.
+			outputs = append(slices.Clone(outputs), step.cmd.Depfile)
 		}
 	}
 
-	localOutputs := step.def.LocalOutputs(ctx)
-	span.SetAttr("outputs-local", len(localOutputs))
-	seen := make(map[string]bool)
-	for _, o := range localOutputs {
+	defLocalOutputs := step.def.LocalOutputs(ctx)
+	span.SetAttr("outputs-local", len(defLocalOutputs))
+	seen := make(map[sisopath.Path]bool)
+	var localOutputs []sisopath.Path
+	for _, o := range defLocalOutputs {
 		if seen[o] {
 			continue
 		}
 		seen[o] = true
+		localOutputs = append(localOutputs, o)
 	}
 
 	clog.Infof(ctx, "outputs %d->%d", len(outputs), len(localOutputs))
@@ -1152,9 +1346,9 @@ func (b *Builder) outputs(ctx context.Context, step *Step) error {
 		}
 		seen[out] = true
 		var local bool
-		fullOut := out
+		fullOut := string(out)
 		if !filepath.IsAbs(fullOut) {
-			fullOut = filepath.Join(step.cmd.WorkspaceRoot, out)
+			fullOut = filepath.Join(step.cmd.WorkspaceRoot, fullOut)
 		}
 		if b.hashFS.NeedFlush(ctx, step.cmd.WorkspaceRoot, out) {
 			localOutputs = append(localOutputs, out)
@@ -1172,10 +1366,10 @@ func (b *Builder) outputs(ctx context.Context, step *Step) error {
 		}
 		fi, err := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, out)
 		if err != nil {
-			b.targets.Store(out, targetState{
+			b.targets.Store(string(out), targetState{
 				dirtyErr: err,
 			})
-			reqOut := slices.Contains(defOutputs, out)
+			reqOut := isRequiredOutput(out, defOutputs)
 			if reqOut {
 				if experiments.Enabled("ignore-missing-outputs", "") {
 					b.hashFS.AddMissingOutput(ctx, step.cmd.WorkspaceRoot, out)
@@ -1194,15 +1388,82 @@ func (b *Builder) outputs(ctx context.Context, step *Step) error {
 			}
 			continue
 		}
-		b.targets.Store(out, targetState{
+		b.targets.Store(string(out), targetState{
 			mtime:   fi.ModTime(),
 			changed: fi.IsChanged(),
 		})
 	}
-	if len(localOutputs) > 0 && !b.hashFS.OnCartFS() {
-		start := time.Now()
+	// Process directory outputs. A missing dir output is treated like a
+	// missing file output: hard-fail when declared (required), warn otherwise.
+	dirFsys := b.hashFS.FileSystem(ctx, step.cmd.WorkspaceRoot)
+	for _, dir := range step.cmd.OutputDirs {
+		targetKey := string(dir)
+		// A flush only adds files, so prune members the new tree dropped (the
+		// local exec path instead wipes pre-run via ResetDirOutput). Prune
+		// before anything walks the tree: a walk picks up still-on-disk files
+		// into hashfs, so a walk before the prune would count the stale
+		// members as part of the directory output. Not gated on NeedFlush: a
+		// tree materialized by an earlier build must be pruned even when this
+		// build leaves materialization to a consumer, because the on-demand
+		// flush walks the tree (expandFlushDirs) and nothing prunes there.
+		if err := b.hashFS.RemoveStaleDirMembers(ctx, step.cmd.WorkspaceRoot, string(dir)); err != nil {
+			return fmt.Errorf("prune stale dir output %s: %w", dir, err)
+		}
+		// Flush when output_local requests it; otherwise consumers materialize
+		// the current tree on demand. Like a file output, a tree that already
+		// exists on disk (an earlier build or a local consumer materialized
+		// it) is flushed too: the prune above only removes dropped members,
+		// so without a flush members whose contents changed would keep their
+		// old contents on disk.
+		local := b.hashFS.NeedFlush(ctx, step.cmd.WorkspaceRoot, dir)
+		if !local {
+			fullDir := sisopath.JoinRoot(step.cmd.WorkspaceRoot, dir)
+			if _, err := b.hashFS.OS.Lstat(ctx, string(fullDir)); err == nil {
+				clog.Infof(ctx, "output_local=false but local dir exists: %q", dir)
+				local = true
+			}
+		}
+		fi, err := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, dir)
+		if err != nil {
+			b.targets.Store(targetKey, targetState{
+				dirtyErr: err,
+			})
+			if isRequiredOutput(dir, defOutputs) {
+				if experiments.Enabled("ignore-missing-outputs", "") {
+					b.hashFS.AddMissingOutput(ctx, step.cmd.WorkspaceRoot, dir)
+				} else {
+					return fmt.Errorf("missing dir output %s: %w", dir, err)
+				}
+			}
+			clog.Warningf(ctx, "missing dir output %s: %v", dir, err)
+			continue
+		}
+		mtime, walkErr := effectiveMtime(dirFsys, string(dir), fi.ModTime(), true)
+		if walkErr != nil {
+			b.targets.Store(targetKey, targetState{
+				dirtyErr: walkErr,
+			})
+			// Can't fully read the output: hard-fail if required, else warn.
+			if isRequiredOutput(dir, defOutputs) && !experiments.Enabled("ignore-missing-outputs", "") {
+				return fmt.Errorf("walk dir output %s: %w", dir, walkErr)
+			}
+			clog.Warningf(ctx, "walk dir output %s: %v", dir, walkErr)
+		} else {
+			b.targets.Store(targetKey, targetState{
+				mtime:   mtime,
+				changed: fi.IsChanged(),
+			})
+		}
+		if local {
+			// Trailing slash marks a declared directory artifact so Flush
+			// materializes its whole tree, not just the directory node.
+			localOutputs = append(localOutputs, dir+"/")
+		}
+	}
+	if len(localOutputs) > 0 {
+		_, mspan := trace.NewSpan(ctx, spanMaterializeOutputs)
 		err := b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, localOutputs)
-		step.metrics.MaterializeOutputsTime = IntervalMetric(time.Since(start))
+		mspan.Close(nil)
 		if err != nil {
 			return fmt.Errorf("%w: %w", errFlushOutput, err)
 		}
@@ -1261,39 +1522,40 @@ var errFlushOutput = errors.New("failed to flush outputs to local")
 func (b *Builder) updateDeps(ctx context.Context, step *Step) error {
 	ctx, span := trace.NewSpan(ctx, "update-deps")
 	defer span.Close(nil)
-	if len(step.cmd.Outputs) == 0 {
+	if len(step.cmd.Outputs) == 0 || len(step.outputPaths) == 0 {
+		// A directory-only edge cannot carry a depfile or deps.
+		if step.cmd.Deps != "" || step.cmd.Depfile != "" {
+			return fmt.Errorf("update deps: %s declares deps=%q depfile=%q but has only directory outputs %v; deps require a file output to key on", step, step.cmd.Deps, step.cmd.Depfile, step.cmd.OutputDirs)
+		}
 		clog.Warningf(ctx, "update deps: no outputs")
 		return nil
 	}
-	output, err := filepath.Rel(step.cmd.WorkDir, step.cmd.Outputs[0])
+	outputInNinja := step.outputPaths[0]
+	outputPath := sisopath.Path(b.path.MaybeFromRelative(ctx, outputInNinja))
+	fi, err := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, outputPath)
 	if err != nil {
-		clog.Warningf(ctx, "update deps: failed to get rel %s,%s: %v", step.cmd.WorkDir, step.cmd.Outputs[0], err)
+		clog.Warningf(ctx, "update deps: missing outputs %s: %v", outputPath, err)
 		return nil
 	}
-	fi, err := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, step.cmd.Outputs[0])
-	if err != nil {
-		clog.Warningf(ctx, "update deps: missing outputs %s: %v", step.cmd.Outputs[0], err)
-		return nil
-	}
-	ents, err := b.hashFS.Entries(ctx, step.cmd.WorkspaceRoot, []string{step.cmd.Outputs[0]})
+	ents, err := b.hashFS.Entries(ctx, step.cmd.WorkspaceRoot, []sisopath.Path{outputPath})
 	if err != nil || len(ents) == 0 {
-		clog.Warningf(ctx, "update deps: failed to get output entry %q %d: %v", step.cmd.Outputs[0], len(ents), err)
+		clog.Warningf(ctx, "update deps: failed to get output entry %q %d: %v", outputPath, len(ents), err)
 		return nil
 	}
 	deps, err := depsAfterRun(ctx, b, step)
 	if err != nil {
 		return err
 	}
-	updated, err := step.def.RecordDeps(ctx, output, fi.ModTime(), ents[0].Data.Digest(), deps)
+	updated, err := step.def.RecordDeps(ctx, outputInNinja, fi.ModTime(), ents[0].Data.Digest(), deps)
 	if err != nil {
-		clog.Warningf(ctx, "update deps: failed to record deps %s, %s, %s, %s, %s: %v", output, base64.StdEncoding.EncodeToString(step.cmd.CmdHash), fi.ModTime(), ents[0].Data.Digest(), deps, err)
+		clog.Warningf(ctx, "update deps: failed to record deps %s, %s, %s, %s, %s: %v", outputInNinja, base64.StdEncoding.EncodeToString(step.cmd.CmdHash), fi.ModTime(), ents[0].Data.Digest(), deps, err)
 	}
-	clog.Infof(ctx, "update deps=%s: %s %s %d updated:%t pure:%t/%t->true", step.cmd.Deps, output, base64.StdEncoding.EncodeToString(step.cmd.CmdHash), len(deps), updated, step.cmd.Pure, step.cmd.Pure)
+	clog.Infof(ctx, "update deps=%s: %s %s %d updated:%t pure:%t/%t->true", step.cmd.Deps, outputInNinja, base64.StdEncoding.EncodeToString(step.cmd.CmdHash), len(deps), updated, step.cmd.Pure, step.cmd.Pure)
 	span.SetAttr("deps", len(deps))
 	span.SetAttr("updated", updated)
-	canonicalizedDeps := make([]string, 0, len(deps))
+	canonicalizedDeps := make([]sisopath.Path, 0, len(deps))
 	for _, dep := range deps {
-		canonicalizedDeps = append(canonicalizedDeps, b.path.MaybeFromRelative(ctx, dep))
+		canonicalizedDeps = append(canonicalizedDeps, b.path.FromRelativePath(ctx, dep))
 	}
 	depsFixCmd(ctx, b, step, canonicalizedDeps)
 	return nil
@@ -1307,11 +1569,11 @@ func (b *Builder) TraceEnabled() bool {
 	return b.tracer.Enabled() || b.traceExporter != nil || b.tracePprof.Enabled()
 }
 
-func (b *Builder) finalizeTrace(ctx context.Context, tc *trace.Context) {
+func (b *Builder) finalizeTrace(ctx context.Context, tc *trace.Context, step *Step) {
 	if tc == nil {
 		return
 	}
-	b.tracer.Record(b.traceEvents(ctx, tc))
+	b.tracer.Record(b.traceEvents(ctx, tc, step))
 	b.traceStats.update(tc)
 	b.traceExporter.Export(ctx, tc)
 	b.tracePprof.Add(ctx, tc)
@@ -1321,9 +1583,31 @@ func (b *Builder) ActiveSteps() []ActiveStepInfo {
 	return b.progress.ActiveSteps()
 }
 
+func (b *Builder) ProgressInfo() ProgressInfo {
+	stat := b.stats.stats()
+	return ProgressInfo{
+		Done:        stat.Done - stat.Skipped,
+		Total:       stat.Total - stat.Skipped,
+		Skipped:     stat.Skipped,
+		ActiveSteps: b.ActiveSteps(),
+	}
+}
+
 func (b *Builder) localFallbackEnabled(step *Step) bool {
 	if step != nil && step.def.Binding("strict_remote") == "true" {
 		return false
 	}
 	return !b.strictRemote && b.maxFallbackAllowed > 0 && !b.hashFS.OnCog()
+}
+
+func (b *Builder) missingDepsCheckEnabled() bool {
+	return b.missingDepsMode() != MissingDepsIgnore
+}
+
+func (b *Builder) missingDepsMode() MissingDepsMode {
+	switch b.missingDeps {
+	case MissingDepsIgnore, MissingDepsWarn, MissingDepsError, MissingDepsFatal:
+		return b.missingDeps
+	}
+	return MissingDepsIgnore
 }

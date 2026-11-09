@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/golang/glog"
@@ -24,6 +25,7 @@ import (
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/ui"
 )
 
@@ -58,6 +60,9 @@ type Graph interface {
 	// Targets may return known targets even if err != nil.
 	Targets(context.Context, ...string) ([]Target, error)
 
+	// LookupTarget returns the target ID for a build-dir-relative target path.
+	LookupTarget(string) (Target, bool)
+
 	// SpellcheckTarget returns the most similar target from given target.
 	SpellcheckTarget(string) (string, error)
 
@@ -84,6 +89,9 @@ type Graph interface {
 
 	// ClangScandeps returns clang scandeps mode.
 	ClangScandeps(context.Context) string
+
+	// EnvConfig returns environment configuration for build steps.
+	EnvConfig(context.Context) *EnvConfig
 
 	// StepLimits returns a map of maximum number of concurrent
 	// steps by pool name.
@@ -155,6 +163,61 @@ func (s scanState) String() string {
 	}
 }
 
+// LocallyNeededSet records the remote outputs a local step will read, so
+// -output_local_strategy=graph materializes just those. The scheduler fills it
+// at plan finalization (add); the hashfs OutputLocal predicate reads it (the
+// OutputLocal method, backed by Has).
+//
+// Keys are hashfs.MakeFullpath form: both add and Has go through MakeFullpath,
+// so they agree even when a target path is itself absolute.
+//
+// Until Freeze, Has returns false. The state load predicate is consulted
+// before the scheduler can fill the set; returning false keeps the CAS-only
+// outputs a prior graph build left off disk valid across invocations, instead
+// of forgetting them and re-running their producers. A genuinely-needed
+// missing output is still re-materialized at build time by the mtimecheck
+// skip-flush (or re-run if its CAS blob is gone). Freeze publishes the map.
+type LocallyNeededSet struct {
+	m     map[string]bool
+	ready atomic.Bool
+}
+
+// NewLocallyNeededSet returns an empty, not-yet-ready set.
+func NewLocallyNeededSet() *LocallyNeededSet {
+	return &LocallyNeededSet{m: make(map[string]bool)}
+}
+
+// OutputLocal is the hashfs OutputLocal predicate face. Bind it
+// (set.OutputLocal) so the predicate and the scheduler share this exact set.
+func (s *LocallyNeededSet) OutputLocal(_ context.Context, path string) bool {
+	return s.Has(path)
+}
+
+// Has reports whether path (hashfs.MakeFullpath form) is locally-needed. It
+// returns false until the set is frozen (see the type doc); a nil set (no
+// graph strategy) returns true.
+func (s *LocallyNeededSet) Has(path string) bool {
+	if s == nil {
+		return true
+	}
+	if !s.ready.Load() {
+		return false
+	}
+	return s.m[path]
+}
+
+// add records a locally-needed path (hashfs.MakeFullpath form). Single-
+// threaded classifier use only, before Freeze.
+func (s *LocallyNeededSet) add(path string) {
+	s.m[path] = true
+}
+
+// Freeze publishes the map; after it, Has reads the map instead of the
+// not-yet-frozen default (false).
+func (s *LocallyNeededSet) Freeze() {
+	s.ready.Store(true)
+}
+
 type targetInfo struct {
 	// scanState of the target.
 	scan scanState
@@ -164,6 +227,9 @@ type targetInfo struct {
 	source bool
 	// true if the target is generated output.
 	output bool
+	// true if explicitly requested; graph materializes a requested output
+	// even when an edge sibling has consumers.
+	requested bool
 	// true if the target is phony_output.
 	phonyOutput bool
 	// pointer to Step.
@@ -232,12 +298,20 @@ func (pq *priorityQueue) Pop() any {
 
 // schedulerOption is scheduler option.
 type schedulerOption struct {
-	NumTargets   int
-	Path         *Path
-	HashFS       *hashfs.HashFS
-	Prepare      bool
-	EnableTrace  bool
-	KnownWeights map[Target]int
+	NumTargets  int
+	Path        *Path
+	HashFS      *hashfs.HashFS
+	Prepare     bool
+	EnableTrace bool
+
+	// StepWeight, if non-nil, returns the intrinsic weight for a non-phony
+	// step; values < 1 are clamped to 1. When nil, non-phony steps have
+	// weight 1.
+	StepWeight func(*Step) int
+
+	// LocallyNeeded, if non-nil, is filled at plan finalization with the
+	// outputs a downstream local step consumes. Must be unfrozen when passed.
+	LocallyNeeded *LocallyNeededSet
 }
 
 // scheduler creates a plan.
@@ -248,6 +322,10 @@ type scheduler struct {
 	actionOutputDirs ensureActionOutputDirs
 
 	plan *plan
+
+	locallyNeeded *LocallyNeededSet
+
+	stepWeight func(*Step) int
 
 	// number of steps scheduled.
 	total int
@@ -266,12 +344,12 @@ type scheduler struct {
 	enableTrace bool
 }
 
-func targetPath(ctx context.Context, g Graph, t Target) string {
+func targetPath(ctx context.Context, g Graph, t Target) path.Path {
 	p, err := g.TargetPath(ctx, t)
 	if err != nil {
-		return fmt.Sprint(err)
+		return path.FromClean(fmt.Sprint(err))
 	}
-	return p
+	return path.FromClean(p)
 }
 
 // schedule schedules build plans for args from graph into sched.
@@ -301,14 +379,23 @@ func schedule(ctx context.Context, sched *scheduler, graph Graph, args ...string
 	if len(args) > 0 {
 		var targetNames []string
 		for _, t := range targets {
-			targetNames = append(targetNames, sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, t)))
+			targetNames = append(targetNames, sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, t))))
 		}
 		if !slices.Equal(args, targetNames) {
 			ui.Default.PrintLines(fmt.Sprintf("target: %q\n    ->  %q\n\n", args, targetNames))
 		}
 	}
-	sched.actionOutputDirs.init()
-	go sched.actionOutputDirs.run(ctx, sched.path)
+	// Mark requested outputs so the graph classifier materializes them per
+	// output (a requested target need not be a leaf). Safe here: nothing else
+	// touches plan.targets yet.
+	for _, t := range targets {
+		sched.plan.targets[t].requested = true
+	}
+
+	if !experiments.Enabled("disable-ensure-output-dirs", "") {
+		sched.actionOutputDirs.init()
+		go sched.actionOutputDirs.run(ctx, sched.path)
+	}
 
 	// validationQueue collects validation targets found during scheduling.
 	var validationQueue []Target
@@ -316,14 +403,14 @@ func schedule(ctx context.Context, sched *scheduler, graph Graph, args ...string
 		switch sched.plan.targets[t].scan {
 		case scanStateNotVisited:
 		case scanStateVisiting:
-			return fmt.Errorf("scan state %q: visiting", sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, t)))
+			return fmt.Errorf("scan state %q: visiting", sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, t))))
 		case scanStateDone, scanStateIgnored:
 			continue
 		}
 
 		validationQueue, err = scheduleTarget(ctx, sched, graph, t, nil, sched.prepare, validationQueue)
 		if err != nil {
-			return fmt.Errorf("failed in schedule %s: %w", sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, t)), err)
+			return fmt.Errorf("failed in schedule %s: %w", sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, t))), err)
 		}
 	}
 	if !sched.prepare {
@@ -333,17 +420,17 @@ func schedule(ctx context.Context, sched *scheduler, graph Graph, args ...string
 			switch sched.plan.targets[t].scan {
 			case scanStateNotVisited:
 			case scanStateVisiting:
-				return fmt.Errorf("scan state %q: visiting", sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, t)))
+				return fmt.Errorf("scan state %q: visiting", sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, t))))
 			case scanStateDone, scanStateIgnored:
 				continue
 			}
 			validationQueue, err = scheduleTarget(ctx, sched, graph, t, nil, false, validationQueue)
 			if err != nil {
-				return fmt.Errorf("failed in schedule %s: %w", sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, t)), err)
+				return fmt.Errorf("failed in schedule %s: %w", sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, t))), err)
 			}
 		}
 	}
-	return sched.finish(ctx, started)
+	return sched.finish(ctx, started, graph)
 }
 
 // DependencyCycleError is error type for dependency cycle.
@@ -376,7 +463,7 @@ func scheduleTarget(ctx context.Context, sched *scheduler, graph Graph, target T
 		}()
 	case scanStateVisiting:
 		return validationQueue, DependencyCycleError{
-			Targets: []string{sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, target))},
+			Targets: []string{sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, target)))},
 		}
 	case scanStateIgnored:
 		if ignore {
@@ -532,17 +619,15 @@ func scheduleTarget(ctx context.Context, sched *scheduler, graph Graph, target T
 			}
 			validationQueue, err = scheduleTarget(ctx, sched, graph, in, next, inIgnore, validationQueue)
 			if err != nil {
-				var cycleErr DependencyCycleError
-				if errors.As(err, &cycleErr) {
+				if cycleErr, ok := errors.AsType[DependencyCycleError](err); ok {
 					if len(cycleErr.Targets) <= 1 || cycleErr.Targets[0] != cycleErr.Targets[len(cycleErr.Targets)-1] {
-						cur := sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, in))
+						cur := sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, in)))
 						cycleErr.Targets = append(cycleErr.Targets, cur)
 					}
 					return validationQueue, cycleErr
 				}
-				var missingErr MissingSourceError
-				if errors.As(err, &missingErr) {
-					cur := sched.path.MaybeToRelative(ctx, targetPath(ctx, graph, in))
+				if missingErr, ok := errors.AsType[MissingSourceError](err); ok {
+					cur := sched.path.MaybeToRelative(ctx, string(targetPath(ctx, graph, in)))
 					missingErr.Deps = append(missingErr.Deps, cur)
 					return validationQueue, missingErr
 				}
@@ -602,12 +687,9 @@ func newScheduler(ctx context.Context, opt schedulerOption) *scheduler {
 	targets := make([]targetInfo, opt.NumTargets)
 	for i := range opt.NumTargets {
 		// Default weight is 1.
-		// If there is a known weight, it will be overridden.
+		// If StepWeight is set, non-phony steps override this in addStep.
 		// If the target is phony, it will be set to 0 during scheduling.
 		targets[i].weight = 1
-		if w, ok := opt.KnownWeights[Target(i)]; ok {
-			targets[i].weight = w
-		}
 	}
 	return &scheduler{
 		path:   opt.Path,
@@ -618,10 +700,80 @@ func newScheduler(ctx context.Context, opt schedulerOption) *scheduler {
 			targets:       targets,
 			targetsSorted: make([]Target, 0, opt.NumTargets),
 		},
+		locallyNeeded:     opt.LocallyNeeded,
+		stepWeight:        opt.StepWeight,
 		prepare:           opt.Prepare,
 		prepareHeaderOnly: prepareHeaderOnly,
 		enableTrace:       opt.EnableTrace,
 	}
+}
+
+// classifyLocallyNeeded fills s.locallyNeeded for -output_local_strategy=graph:
+// the remote outputs a local step will read, keyed in hashfs.MakeFullpath form.
+// The caller runs it only when locallyNeeded != nil.
+//
+// Handler-added outputs aren't in the graph yet; they fall back to the Lstat
+// check in Builder.outputs.
+func (s *scheduler) classifyLocallyNeeded(ctx context.Context, graph Graph) {
+	set := s.locallyNeeded
+	var root string
+	if s.path != nil {
+		root = s.path.WorkspaceRoot
+	}
+	// Per output, in reverse topological order: an output is locally-needed if
+	// it is an explicitly requested target, if a local (non-phony, non-remote)
+	// consumer reads it from disk, or if it feeds a phony/remote consumer that
+	// reaches a local one (reaches[c]; over-marks through remote consumers,
+	// wasting only bandwidth). Per output, not per step: keeps a compile's .o
+	// while dropping its unconsumed .dwo sibling, and keeps a requested output
+	// even when an edge sibling has consumers. reaches is indexed by dense
+	// Step.idnum (a slice, not a map).
+	reaches := make([]bool, s.total+1)
+	for _, primary := range slices.Backward(s.plan.targetsSorted) {
+		info := &s.plan.targets[primary]
+		step := info.step
+		if step == nil || info.edge == nil {
+			continue
+		}
+		// IsRemoteRule reads rule.Remote, zero until EnsureRule runs.
+		step.def.EnsureRule(ctx)
+		isRemote := step.def.IsRemoteRule()
+
+		anyNeeded := false
+		for _, o := range info.edge.Outputs {
+			needed := s.plan.targets[o].requested
+			for _, c := range s.plan.targets[o].waits {
+				if needed {
+					break
+				}
+				if c == nil || c.def == nil {
+					continue
+				}
+				// Local consumer, or a phony/remote one that reaches.
+				if (!c.def.IsPhony() && !c.def.IsRemoteRule()) || reaches[c.idnum] {
+					needed = true
+				}
+			}
+			if !needed {
+				continue
+			}
+			anyNeeded = true
+			if !isRemote {
+				continue
+			}
+			// Key as NeedFlush will: MakeFullpath, not a bare Join (it
+			// handles an already-absolute target path).
+			path, err := graph.TargetPath(ctx, o)
+			if err != nil {
+				clog.Warningf(ctx, "graph classify: TargetPath for output %v: %v", o, err)
+				continue
+			}
+			set.add(hashfs.MakeFullpath(root, path))
+		}
+		reaches[step.idnum] = anyNeeded
+	}
+	set.Freeze()
+	clog.Infof(ctx, "schedule: locally-needed outputs %d of %d steps", len(set.m), s.total)
 }
 
 // mark marks target (workspace relative) as source file.
@@ -630,16 +782,16 @@ func (s *scheduler) mark(ctx context.Context, graph Graph, target Target, next S
 	if err != nil {
 		return err
 	}
-	fi, err := s.hashFS.Stat(ctx, s.path.WorkspaceRoot, fname)
+	fi, err := s.hashFS.StatMtime(ctx, s.path.WorkspaceRoot, path.New(fname))
 	if err == nil && fi.Target() != "" {
 		// resolve symlink for source file.
 		fsys := s.hashFS.FileSystem(ctx, s.path.WorkspaceRoot)
-		_, err = fsys.Stat(fname)
+		_, err = fsys.StatMtime(fname)
 	}
 	if err != nil {
 		var neededBy string
 		if next != nil && len(next.Outputs(ctx)) > 0 {
-			neededBy = s.path.MaybeToRelative(ctx, next.Outputs(ctx)[0])
+			neededBy = s.path.MaybeToRelative(ctx, string(next.Outputs(ctx)[0]))
 		}
 		return MissingSourceError{
 			Target:   s.path.MaybeToRelative(ctx, fname),
@@ -657,33 +809,33 @@ func (s *scheduler) progressReport(format string, args ...any) {
 }
 
 // finish finishes the scheduling.
-func (s *scheduler) finish(ctx context.Context, started time.Time) error {
+func (s *scheduler) finish(ctx context.Context, started time.Time, graph Graph) error {
 	s.plan.mu.Lock()
 	defer s.plan.mu.Unlock()
 
 	// Propagate and accumulate weights in reverse topological order.
-	for i := len(s.plan.targetsSorted) - 1; i >= 0; i-- {
-		t := s.plan.targetsSorted[i]
+	for _, t := range slices.Backward(s.plan.targetsSorted) {
 		curTarget := &s.plan.targets[t]
-		if len(curTarget.waits) == 0 {
-			curTarget.criticalPathWeight = curTarget.weight
-			if curTarget.step != nil {
-				curTarget.step.weight = curTarget.criticalPathWeight
-			}
+		// Downstream steps may consume any sibling output in edge.Outputs,
+		// accumulating criticalPathWeight (which already includes
+		// outTarget.weight) onto that sibling rather than t. Including
+		// outTarget.weight in max also seeds terminal steps that have no
+		// downstream consumers (criticalPathWeight == 0).
+		var cpw int
+		for _, out := range curTarget.edge.Outputs {
+			outTarget := &s.plan.targets[out]
+			cpw = max(cpw, outTarget.criticalPathWeight, outTarget.weight)
+		}
+		curTarget.criticalPathWeight = cpw
+		if curTarget.step != nil {
+			curTarget.step.weight = cpw
 		}
 		for _, in := range append(curTarget.edge.Inputs, curTarget.edge.OrderOnly...) {
 			inTarget := &s.plan.targets[in]
 			if inTarget.source {
 				continue
 			}
-			if curTarget.criticalPathWeight == math.MaxInt || inTarget.weight == math.MaxInt {
-				// Avoid overflow if either of the weights above is max int.
-				inTarget.criticalPathWeight = math.MaxInt
-			} else {
-				// Otherwise, `curTarget.criticalPathWeight+inTarget.weight` should fit in the max int in practice.
-				// When inTarget.criticalPathWeight is already max int, it will be kept as is.
-				inTarget.criticalPathWeight = max(inTarget.criticalPathWeight, curTarget.criticalPathWeight+inTarget.weight)
-			}
+			inTarget.criticalPathWeight = max(inTarget.criticalPathWeight, addCriticalPathWeight(curTarget.criticalPathWeight, inTarget.weight))
 			if inTarget.step != nil {
 				inTarget.step.weight = inTarget.criticalPathWeight
 			}
@@ -695,6 +847,12 @@ func (s *scheduler) finish(ctx context.Context, started time.Time) error {
 			}
 			s.plan.addReady(step)
 		}
+	}
+
+	// graph strategy only (locallyNeeded is nil otherwise): classify
+	// locally-needed outputs before freeing targetsSorted.
+	if s.locallyNeeded != nil {
+		s.classifyLocallyNeeded(ctx, graph)
 	}
 
 	// free up s.plan.targetsSorted since it's not necessary anymore.
@@ -711,6 +869,13 @@ func (s *scheduler) finish(ctx context.Context, started time.Time) error {
 	}
 	s.progressReport("%6s schedule pending:%d+ready:%d (node:%d edge:%d)\n", ui.FormatDuration(d), npendings, nready, len(s.plan.targets), s.visited)
 	return err
+}
+
+func addCriticalPathWeight(a, b int) int {
+	if a == math.MaxInt || b == math.MaxInt || (b > 0 && a > math.MaxInt-b) {
+		return math.MaxInt
+	}
+	return a + b
 }
 
 // addStep adds a Step to the scheduler.
@@ -732,12 +897,27 @@ func (s *scheduler) addStep(ctx context.Context, step *Step, graph Graph, target
 	s.plan.targetsSorted = append(s.plan.targetsSorted, target)
 	if step.def.IsPhony() {
 		// It turned out that the step is phony, which doesn't have any weight.
-		s.plan.targets[target].weight = 0
+		for _, output := range step.outputs {
+			s.plan.targets[output].weight = 0
+		}
 	} else {
+		stepWeight := 1
+		if s.stepWeight != nil {
+			stepWeight = max(s.stepWeight(step), 1)
+		}
 		// don't add output for phony targets. https://crbug.com/1517575
 		for _, output := range step.outputs {
 			s.plan.targets[output].output = true
-			s.actionOutputDirs.ensure(targetPath(ctx, graph, output))
+			s.plan.targets[output].weight = stepWeight
+			tp := targetPath(ctx, graph, output)
+			// Clear a stale file sitting where a dir output now lives, so
+			// the action can create its directory there.
+			if IsDirTarget(string(tp)) {
+				if err := s.hashFS.ClearStaleFileForDirOutput(ctx, s.path.WorkspaceRoot, DirTargetPath(string(tp))); err != nil {
+					clog.Warningf(ctx, "clear stale file for dir output %s: %v", tp, err)
+				}
+			}
+			s.actionOutputDirs.ensure(tp)
 		}
 	}
 	if log.V(1) {
@@ -799,6 +979,7 @@ func (p *plan) hasReady() bool {
 
 // completeStep updates waiting pools and pushes unblocked steps to ready pool.
 func (p *plan) completeStep(ctx context.Context, step *Step) {
+	step.releaseTime = time.Now()
 	outs := step.outputs
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -819,7 +1000,7 @@ func (p *plan) completeStep(ctx context.Context, step *Step) {
 		for _, s := range p.targets[out].waits {
 			prevProcessed := step.String()
 			if step.metrics.skip || step.def.IsPhony() {
-				prevProcessed = step.prevStepID
+				prevProcessed = step.prevStepIDs[0]
 			}
 			if s.ReadyToRun(prevProcessed, out) {
 				nready++
@@ -893,11 +1074,12 @@ func (p *plan) dump(ctx context.Context, graph Graph) {
 	}
 	for _, s := range steps {
 		for _, o := range s.def.Outputs(ctx) {
-			if !waits[o] {
+			os := string(o)
+			if !waits[os] {
 				clog.Infof(ctx, "step %s output:%s no trigger", s, o)
 				continue
 			}
-			delete(waits, o)
+			delete(waits, os)
 		}
 	}
 	outs := make([]string, 0, len(waits))
@@ -924,20 +1106,20 @@ func suggestTargets(ctx context.Context, sched *scheduler, graph Graph, args ...
 			continue
 		}
 		target := strings.TrimSuffix(arg, "^")
-		_, err = sched.hashFS.Stat(ctx, sched.path.WorkspaceRoot, sched.path.MaybeFromRelative(ctx, target))
+		_, err = sched.hashFS.Stat(ctx, sched.path.WorkspaceRoot, path.New(sched.path.MaybeFromRelative(ctx, target)))
 		if err == nil {
 			// just missing ^?
-			target := filepath.ToSlash(target) + "^"
+			target := string(path.New(target)) + "^"
 			_, err = graph.Targets(ctx, target)
 			if err == nil {
 				suggests = append(suggests, target)
 				continue
 			}
 		}
-		_, err = sched.hashFS.Stat(ctx, sched.path.WorkspaceRoot, target)
+		_, err = sched.hashFS.Stat(ctx, sched.path.WorkspaceRoot, path.New(target))
 		if err == nil {
 			// wrong relative dir?
-			target := filepath.ToSlash(filepath.Join(rel, target) + "^")
+			target := filepath.Join(rel, target) + "^"
 			_, err = graph.Targets(ctx, target)
 			if err == nil {
 				suggests = append(suggests, target)
@@ -962,23 +1144,23 @@ func suggestTargets(ctx context.Context, sched *scheduler, graph Graph, args ...
 // to minimize mkdir operations.
 // if we create out dirs before each action concurrently,
 // need to check the dir many times and worry about race.
-// TODO: remove this once generator makes sure out dirs in gen time.
+// SISO_EXPERIMENTS=disable-ensure-output-dirs disables this.
 // gn: https://crbug.com/gn/461698357
-// soong: b/461917619
+// soong: b/461917619 - ok to disable
 type ensureActionOutputDirs struct {
-	req       chan string
+	req       chan path.Path
 	done      chan error
 	err       error
-	knownDirs map[string]struct{}
+	knownDirs map[path.Path]struct{}
 }
 
 func (e *ensureActionOutputDirs) init() {
-	e.req = make(chan string, 1000)
+	e.req = make(chan path.Path, 1000)
 	e.done = make(chan error)
-	e.knownDirs = make(map[string]struct{})
+	e.knownDirs = make(map[path.Path]struct{})
 }
 
-func (e *ensureActionOutputDirs) run(ctx context.Context, path *Path) {
+func (e *ensureActionOutputDirs) run(ctx context.Context, bpath *Path) {
 	defer func() {
 		e.done <- e.err
 	}()
@@ -991,28 +1173,31 @@ func (e *ensureActionOutputDirs) run(ctx context.Context, path *Path) {
 			if !ok {
 				return
 			}
-			dir := filepath.ToSlash(filepath.Dir(fname))
-			if !filepath.IsAbs(dir) {
-				dir = filepath.ToSlash(filepath.Join(path.WorkspaceRoot, dir))
+			// Make the parent of each output, not the output itself: a dir
+			// output is the action's to create, like a file. DirTargetPath
+			// strips the trailing slash so a dir target yields its parent.
+			dir := path.New(DirTargetPath(string(fname))).Dir()
+			if !dir.IsAbs() {
+				dir = path.JoinRoot(bpath.WorkspaceRoot, dir)
 			}
 			_, found := e.knownDirs[dir]
 			if found {
 				continue
 			}
-			err := os.MkdirAll(dir, 0755)
+			err := os.MkdirAll(dir.OSPath(), 0755)
 			if err != nil && e.err == nil {
 				e.err = err
 				continue
 			}
 			e.knownDirs[dir] = struct{}{}
-			dir = filepath.ToSlash(filepath.Dir(dir))
+			dir = dir.Dir()
 			for {
 				_, found := e.knownDirs[dir]
 				if found {
 					break
 				}
 				e.knownDirs[dir] = struct{}{}
-				pdir := filepath.ToSlash(filepath.Dir(dir))
+				pdir := dir.Dir()
 				if pdir == dir {
 					break
 				}
@@ -1022,11 +1207,17 @@ func (e *ensureActionOutputDirs) run(ctx context.Context, path *Path) {
 	}
 }
 
-func (e *ensureActionOutputDirs) ensure(fname string) {
+func (e *ensureActionOutputDirs) ensure(fname path.Path) {
+	if e.req == nil {
+		return
+	}
 	e.req <- fname
 }
 
 func (e *ensureActionOutputDirs) wait() error {
+	if e.req == nil {
+		return nil
+	}
 	close(e.req)
 	return <-e.done
 }

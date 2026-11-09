@@ -11,6 +11,8 @@ import (
 	"runtime"
 
 	"golang.org/x/sync/errgroup"
+
+	"go.chromium.org/build/siso/sync/semaphore"
 )
 
 // multipleRulesError is an error that multiple rules generates the same output.
@@ -28,8 +30,6 @@ type ManifestParser struct {
 	state *State
 	scope *fileScope
 
-	eg    *errgroup.Group
-	sema  chan struct{}
 	fsema chan struct{}
 	wd    string
 }
@@ -42,7 +42,11 @@ func NewManifestParser(state *State) *ManifestParser {
 	}
 }
 
-var loaderConcurrency = runtime.GOMAXPROCS(0)
+// maxLoaderConcurrency prevents Go GC scaling stalls when hundreds of
+// parsers allocate from a large graph at once.
+const maxLoaderConcurrency = 128
+
+var loaderConcurrency = min(runtime.GOMAXPROCS(0), maxLoaderConcurrency)
 
 // SetWd sets working directory to use for loading files.
 func (p *ManifestParser) SetWd(wd string) {
@@ -52,95 +56,91 @@ func (p *ManifestParser) SetWd(wd string) {
 // Load loads the Ninja manifest given an fname. Manifest mappings are
 // released before Load returns, on success or failure.
 func (p *ManifestParser) Load(ctx context.Context, fname string) (retErr error) {
-	if p.eg == nil {
-		p.eg, ctx = errgroup.WithContext(ctx)
-		p.sema = make(chan struct{}, loaderConcurrency)
-		p.fsema = make(chan struct{}, loaderConcurrency)
-	}
-	p.eg.Go(func() error {
-		return p.loadFile(ctx, fname)
-	})
+	p.fsema = make(chan struct{}, loaderConcurrency)
 	defer func() {
 		if cerr := p.state.Close(); cerr != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("release manifest mmaps: %w", cerr))
 		}
 	}()
-	if err := p.eg.Wait(); err != nil {
+	if err := p.loadFiles(ctx, fname); err != nil {
 		return err
 	}
-	p.state.nodes = p.state.nodeMap.freeze(ctx)
-	for _, edge := range p.state.edges {
-		for _, in := range edge.inputs {
-			if in.outs == nil {
-				in.outs = make([]*Edge, 0, in.nouts.Load())
-			}
-			in.outs = append(in.outs, edge)
-		}
-	}
-	return nil
+	var err error
+	p.state.nodes, p.state.dirOutputs, err = p.state.nodeMap.freeze(ctx)
+	return err
 }
 
-func (p *ManifestParser) loadFile(ctx context.Context, fname string) error {
+// loadFiles loads fname and its subninjas, parsing at most
+// loaderConcurrency files at once. A file's goroutine starts only after it
+// acquired a permit, so files waiting for one don't hold a goroutine each.
+func (p *ManifestParser) loadFiles(ctx context.Context, fname string) error {
+	eg, gctx := errgroup.WithContext(ctx)
+	sema := semaphore.New("ninja-load", loaderConcurrency)
+	var spawn func(fname string, scope *fileScope) error
+	spawn = func(fname string, scope *fileScope) error {
+		sctx, release, err := sema.WaitAcquire(gctx)
+		if err != nil {
+			return err
+		}
+		eg.Go(func() error {
+			subninjas, err := p.loadFile(sctx, fname, scope)
+			// Release the permit before waiting for the subninjas' permits,
+			// or parents holding every permit would wait for each other.
+			release(err)
+			if err != nil {
+				return err
+			}
+			for _, sub := range subninjas {
+				if err := spawn(sub, newFileScope(scope)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		return nil
+	}
+	if err := spawn(fname, p.scope); err != nil {
+		return err
+	}
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+	// The parser doesn't check ctx, so a cancellation during the last parses
+	// would go unnoticed otherwise.
+	return context.Cause(ctx)
+}
+
+func (p *ManifestParser) loadFile(ctx context.Context, fname string, scope *fileScope) ([]string, error) {
 	fp := &fileParser{
-		scope: p.scope,
+		scope: scope,
 		state: p.state,
 		sema:  p.fsema,
 		wd:    p.wd,
 	}
 	err := fp.parseFile(ctx, fname)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, fname := range fp.fileState.subninjas {
-		scope := newFileScope(fp.scope)
-		p.eg.Go(func() error {
-			p.sema <- struct{}{}
-			defer func() { <-p.sema }()
-			subparser := &ManifestParser{
-				state: p.state,
-				scope: scope,
-				eg:    p.eg,
-				sema:  p.sema,
-				fsema: p.fsema,
-				wd:    p.wd,
-			}
-			return subparser.loadFile(ctx, fname)
-		})
-	}
-	return nil
+	return fp.fileState.subninjas, nil
 }
 
 // LoadSingle loads the Ninja manifest given an fname, but not loads subninjas.
 func (p *ManifestParser) LoadSingle(ctx context.Context, fname string) (retErr error) {
-	if p.eg == nil {
-		p.eg, ctx = errgroup.WithContext(ctx)
-		p.sema = make(chan struct{}, loaderConcurrency)
-		p.fsema = make(chan struct{}, loaderConcurrency)
-	}
-	p.eg.Go(func() error {
-		fp := &fileParser{
-			scope: p.scope,
-			state: p.state,
-			sema:  p.fsema,
-		}
-		return fp.parseFile(ctx, fname)
-	})
+	p.fsema = make(chan struct{}, loaderConcurrency)
 	defer func() {
 		if cerr := p.state.Close(); cerr != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("release manifest mmaps: %w", cerr))
 		}
 	}()
-	if err := p.eg.Wait(); err != nil {
+	fp := &fileParser{
+		scope: p.scope,
+		state: p.state,
+		sema:  p.fsema,
+	}
+	if err := fp.parseFile(ctx, fname); err != nil {
 		return err
 	}
-	p.state.nodes = p.state.nodeMap.freeze(ctx)
-	for _, edge := range p.state.edges {
-		for _, in := range edge.inputs {
-			if in.outs == nil {
-				in.outs = make([]*Edge, 0, in.nouts.Load())
-			}
-			in.outs = append(in.outs, edge)
-		}
-	}
-	return nil
+	var err error
+	p.state.nodes, p.state.dirOutputs, err = p.state.nodeMap.freeze(ctx)
+	return err
 }

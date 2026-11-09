@@ -6,35 +6,24 @@ package build
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 
-	"go.chromium.org/build/siso/auth/cred"
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build/cachestore"
-	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 )
 
-func NewDataSource(ctx context.Context, credential cred.Cred, localCacheEnable bool, cacheDir string, reapiClient *reapi.Client) DataSource {
-	layeredCache := NewLayeredCache()
-	if localCacheEnable {
-		cache, err := NewLocalCache(cacheDir)
-		if err != nil {
-			clog.Warningf(ctx, "failed to create local cache - no local cache enabled: %v", err)
-		} else {
-			layeredCache.AddLayer(cache)
-			cache.GarbageCollectIfRequired(ctx)
-		}
-	}
-	if reapiClient != nil {
-		layeredCache.AddLayer(reapiClient.CacheStore())
-	}
+func NewDataSource(ctx context.Context, localCache *reapi.LocalCache, reapiClient *reapi.Client) DataSource {
 	var ds DataSource
 	ds.Client = reapiClient
-	ds.Cache = layeredCache
+	if localCache != nil {
+		localCache.GarbageCollectIfRequired(ctx)
+		ds.Cache = localCache
+	}
 	return ds
 }
 
@@ -52,14 +41,22 @@ func (ds DataSource) Close(ctx context.Context) error {
 	return ds.Client.Close()
 }
 
-// DigestData creates a new digest.Data from the given digest and filename,
-// using the DataSource to retrieve the actual data.
-func (ds DataSource) DigestData(ctx context.Context, d digest.Digest, fname string) digest.Data {
-	return digest.NewData(ds.Source(ctx, d, fname), d)
+// CacheStore returns cachestore for this data store.
+func (ds DataSource) CacheStore() cachestore.CacheStore {
+	if ds.Client != nil {
+		return ds.Client.CacheStore()
+	}
+	return ds.Cache
 }
 
-// Source returns a digest.Source for the given digest and filename.
-func (ds DataSource) Source(_ context.Context, d digest.Digest, fname string) digest.Source {
+// DigestData creates a new blob.Data from the given digest and filename,
+// using the DataSource to retrieve the actual data.
+func (ds DataSource) DigestData(ctx context.Context, d digest.Digest, fname string) blob.Data {
+	return blob.NewData(ds.Source(ctx, d, fname), d)
+}
+
+// Source returns a blob.Source for the given digest and filename.
+func (ds DataSource) Source(_ context.Context, d digest.Digest, fname string) blob.Source {
 	return source{
 		dataSource: ds,
 		d:          d,
@@ -87,11 +84,10 @@ func (s source) Open(ctx context.Context) (io.ReadCloser, error) {
 		// fallback
 	}
 	if s.dataSource.Client != nil {
-		r, err := s.dataSource.Client.GetReader(ctx, s.d, s.fname)
+		r, err = s.dataSource.Client.GetReader(ctx, s.d, s.fname)
 		if err == nil {
 			return r, nil
 		}
-		// fallback
 	}
 	// ctx may be deadline exceeded or canceled.
 	// if so, return such error.
@@ -99,17 +95,10 @@ func (s source) Open(ctx context.Context) (io.ReadCloser, error) {
 	if ctx.Err() != nil {
 		return nil, context.Cause(ctx)
 	}
-	// siso process runs at some directory, but
-	// s.fname may not be relative to the working directory.
-	// Actually, it is workspace relative if it is created by
-	// *Cmd.entriesFromResult, and failed to open as such path
-	// doesn't exist. return with better error message.
-	if !filepath.IsAbs(s.fname) {
-		return nil, fmt.Errorf("failed to fetch source %v for %q: %w", s.d, s.fname, err)
+	if err != nil {
+		return nil, err
 	}
-	// no reapi configured. use local file?
-	f, err := os.Open(s.fname)
-	return f, err
+	return nil, errors.New("no client or cache in datasource")
 }
 
 func (s source) String() string {

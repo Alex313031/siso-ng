@@ -56,8 +56,8 @@ func Write(f *os.File, size int) (data []byte, closer func() error, retErr error
 		}
 	}()
 
-	if err := f.Truncate(int64(size)); err != nil {
-		return nil, nil, fmt.Errorf("truncate %s: %w", f.Name(), err)
+	if err := allocate(f, int64(size)); err != nil {
+		return nil, nil, fmt.Errorf("allocate %s: %w", f.Name(), err)
 	}
 
 	data, err := unix.Mmap(int(f.Fd()), 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)

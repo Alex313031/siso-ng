@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/testing/protocmp"
 
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
@@ -122,25 +123,19 @@ type fakeCartfsServer struct {
 func fakeCartfsClient(ctx context.Context, t *testing.T, fake *fakeCartfsServer) *cartfsutil.Client {
 	t.Helper()
 	fake.t = t
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := lis.Addr().String()
-	t.Logf("fake cartfs at %s", addr)
+	lis := bufconn.Listen(1 << 20)
 	serv := grpc.NewServer()
 	cartfspb.RegisterCartfsServer(serv, fake)
-	done := make(chan error)
 	go func() {
-		done <- serv.Serve(lis)
+		_ = serv.Serve(lis)
 	}()
 	t.Cleanup(func() {
 		serv.Stop()
-		err := <-done
-		t.Logf("-- server finished: %v", err)
 	})
 
-	client, err := cartfsutil.New(ctx, addr)
+	client, err := cartfsutil.New(ctx, "passthrough:///bufnet", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+		return lis.DialContext(ctx)
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

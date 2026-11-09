@@ -380,5 +380,179 @@ func TestBuild_Deps_SandboxPhonyExpand(t *testing.T) {
 	}) {
 		t.Errorf("missing in.2 (order_only phony)\n%s", buf)
 	}
+}
 
+// TestBuild_Deps_OutputOrder checks that deps log records dependencies keyed on
+// the primary ninja edge output even when step.cmd.Outputs order differs from the
+// ninja manifest edge outputs (b/558995453).
+func TestBuild_Deps_OutputOrder(t *testing.T) {
+	if !runInSubProcess(t) {
+		return
+	}
+	ctx := t.Context()
+	dir := tempDir(t)
+
+	gccDeps := []string{"../../base/foo.cc", "../../base/foo.h"}
+
+	checkDeps := func() (err error) {
+		depsLog, err := ninjabuild.NewDepsLog(ctx, filepath.Join(dir, "out/siso/.siso_deps"))
+		if err != nil {
+			return fmt.Errorf("NewDepsLog: %w", err)
+		}
+		defer func() {
+			cerr := depsLog.Close()
+			if err == nil && cerr != nil {
+				err = fmt.Errorf("depsLog.Close: %w", cerr)
+			}
+		}()
+		var errs error
+		// types.h is primary output in ninja edge, but handler reorders outputs.
+		// Deps should be recorded under types.h, not hwtypes.h.
+		got, _, err := depsLog.RetrievePaths(ctx, "types.h")
+		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("deps for types.h: %w", err))
+		} else if !slices.Equal(got, gccDeps) {
+			errs = errors.Join(errs, fmt.Errorf("deps for types.h: got=%q want=%q", got, gccDeps))
+		}
+		_, _, err = depsLog.RetrievePaths(ctx, "hwtypes.h")
+		if !errors.Is(err, ninjautil.ErrNoDepsLog) {
+			errs = errors.Join(errs, fmt.Errorf("deps for hwtypes.h: got err=%v; want ErrNoDepsLog", err))
+		}
+
+		return errs
+	}
+
+	runNinjaTest := func(t *testing.T, fakere *reapitest.Fake) (build.Stats, error) {
+		t.Helper()
+		var ds build.DataSource
+		defer func() {
+			err := ds.Close(ctx)
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+		ds.Client = reapitest.New(ctx, t, fakere)
+		ds.Cache = ds.Client.CacheStore()
+		opt, graph, cleanup := setupBuild(ctx, t, dir, hashfs.Option{
+			StateFile:   ".siso_fs_state",
+			OutputLocal: func(context.Context, string) bool { return true },
+			DataSource:  ds,
+		})
+		defer cleanup()
+		bcache, err := build.NewCache(ctx, build.CacheOptions{
+			Store:      ds.Cache,
+			EnableRead: true,
+		})
+		if err != nil {
+			return build.Stats{}, err
+		}
+		opt.Cache = bcache
+		opt.RECacheEnableRead = true
+		opt.REAPIClient = ds.Client
+		return ninjabuild.Run(ctx, graph, opt, nil, ninjabuild.RunNinjaOpts{})
+	}
+	setupFiles(t, dir, t.Name(), nil)
+
+	fakere := &reapitest.Fake{
+		ExecuteFunc: func(fakere *reapitest.Fake, action *rpb.Action) (*rpb.ActionResult, error) {
+			cmd := &rpb.Command{}
+			err := fakere.FetchProto(ctx, action.CommandDigest, cmd)
+			if err != nil {
+				return nil, err
+			}
+			tree := reapitest.InputTree{CAS: fakere.CAS, Root: action.InputRootDigest}
+			_, err = tree.LookupFileNode(ctx, "base/foo.cc")
+			if err != nil {
+				t.Logf("missing base/foo.cc: %v", err)
+				return &rpb.ActionResult{
+					ExitCode:  1,
+					StderrRaw: fmt.Appendf(nil, "../../base/foo.cc: File not found: %v", err),
+				}, nil
+			}
+			if len(cmd.Arguments) < 2 {
+				return &rpb.ActionResult{
+					ExitCode:  1,
+					StderrRaw: fmt.Appendf(nil, "unknown command line: %q", cmd.Arguments),
+				}, nil
+			}
+			switch {
+			case slices.Contains(cmd.Arguments, "types.h") || slices.Contains(cmd.Arguments, "types.h.d"):
+				d, err := fakere.Put(ctx, []byte("types.h: ../../base/foo.cc ../../base/foo.h\n"))
+				if err != nil {
+					t.Logf("failed to write types.h.d: %v", err)
+					return &rpb.ActionResult{
+						ExitCode:  1,
+						StderrRaw: fmt.Appendf(nil, "types.h.d: failed to store %v", err),
+					}, nil
+				}
+				typesDigest, err := fakere.Put(ctx, []byte("// types.h\n"))
+				if err != nil {
+					return nil, err
+				}
+				hwtypesDigest, err := fakere.Put(ctx, []byte("// hwtypes.h\n"))
+				if err != nil {
+					return nil, err
+				}
+				return &rpb.ActionResult{
+					ExitCode: 0,
+					OutputFiles: []*rpb.OutputFile{
+						{
+							Path:   "types.h",
+							Digest: typesDigest,
+						},
+						{
+							Path:   "hwtypes.h",
+							Digest: hwtypesDigest,
+						},
+						{
+							Path:   "types.h.d",
+							Digest: d,
+						},
+					},
+				}, nil
+			default:
+				return &rpb.ActionResult{
+					ExitCode:  1,
+					StderrRaw: fmt.Appendf(nil, "unknown command line: %q", cmd.Arguments),
+				}, nil
+			}
+		},
+	}
+
+	t.Logf("-- first build")
+	stats, err := runNinjaTest(t, fakere)
+	if err != nil {
+		t.Fatalf("ninja err: %v", err)
+	}
+	if stats.Done != stats.Total || stats.Total != 2 {
+		t.Errorf("done=%d total=%d; want done=total=2", stats.Done, stats.Total)
+	}
+	err = checkDeps()
+	if err != nil {
+		t.Errorf("checkDeps %v", err)
+	}
+
+	t.Logf("-- confirm no-op")
+	stats, err = runNinjaTest(t, fakere)
+	if err != nil {
+		t.Fatalf("ninja err: %v", err)
+	}
+	if stats.Done != stats.Total || stats.Total != 2 || stats.Skipped != 2 {
+		t.Errorf("done=%d total=%d skipped=%d; want done=total=skipped=2, %#v", stats.Done, stats.Total, stats.Skipped, stats)
+	}
+
+	touchFile(t, dir, "base/foo.cc")
+	t.Logf("-- second build")
+	stats, err = runNinjaTest(t, fakere)
+	if err != nil {
+		t.Fatalf("ninja err: %v", err)
+	}
+	if stats.Done != stats.Total || stats.Total != 2 || stats.CacheHit+stats.Remote != 1 {
+		t.Errorf("done=%d total=%d cache_hit=%d remote=%d; want done=total=2 cache_hit+remote=1: %#v", stats.Done, stats.Total, stats.CacheHit, stats.Remote, stats)
+	}
+
+	err = checkDeps()
+	if err != nil {
+		t.Errorf("checkDeps %v", err)
+	}
 }

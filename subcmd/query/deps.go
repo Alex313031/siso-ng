@@ -21,10 +21,12 @@ import (
 
 	"github.com/google/subcommands"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/makeutil"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
 )
@@ -164,16 +166,11 @@ func (c *depsCommand) run(ctx context.Context, args []string) error {
 			targets = depsLog.RecordedTargets()
 		}
 	} else {
-		var err error
-		hashFS, err = hashfs.New(ctx, hashfs.Option{})
-		if err != nil {
-			return err
-		}
 		fsstate, err := hashfs.Load(ctx, hashfs.Option{StateFile: c.fsopt.StateFile})
 		if err != nil {
 			return err
 		}
-		err = hashFS.SetState(ctx, fsstate)
+		hashFS, err = hashfs.NewFromState(ctx, fsstate, hashfs.Option{})
 		if err != nil {
 			return err
 		}
@@ -258,11 +255,11 @@ func lookupDeps(ctx context.Context, state *ninjautil.State, hashFS *hashfs.Hash
 		return "", nil, key, depState, ninjautil.ErrNoDepsLog
 	}
 	df := bpath.MaybeFromRelative(ctx, depfile)
-	fi, err := hashFS.Stat(ctx, bpath.WorkspaceRoot, df)
+	fi, err := hashFS.Stat(ctx, bpath.WorkspaceRoot, path.New(df))
 	if err != nil {
 		return "", nil, key, depState, fmt.Errorf("no depfile=%q to build target %q: %w", depfile, target, err)
 	}
-	ents, err := hashFS.Entries(ctx, bpath.WorkspaceRoot, []string{df})
+	ents, err := hashFS.Entries(ctx, bpath.WorkspaceRoot, []path.Path{path.Path(df)})
 	if err != nil || len(ents) == 0 {
 		return "", nil, key, depState, fmt.Errorf("failed to get entry for depfile=%q %d to build target %q: %w", depfile, len(ents), target, err)
 	}

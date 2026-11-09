@@ -5,6 +5,7 @@
 package ninjautil
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -265,5 +266,127 @@ func TestDepsLog_broken(t *testing.T) {
 	err = dl3.Close()
 	if err != nil {
 		t.Errorf("dl3.Close=%v; want nil error", err)
+	}
+}
+
+func TestRecompact_DroppedPath(t *testing.T) {
+	ctx := t.Context()
+	fname := filepath.Join(t.TempDir(), "mydepslog")
+	t1 := time.Unix(1, 0)
+	t2 := time.Unix(2, 0)
+	t3 := time.Unix(3, 0)
+
+	dl, err := NewDepsLog(ctx, fname)
+	if err != nil {
+		t.Fatalf("NewDepsLog(ctx, %q)=_, %v; want nil error", fname, err)
+	}
+	if _, err := dl.Record(ctx, "out.o", t1, []string{"foo.h", "bar.h"}); err != nil {
+		t.Fatalf("dl.Record out.o: %v", err)
+	}
+	if _, err := dl.Record(ctx, "other_out.o", t2, []string{"foo.h", "baz.h"}); err != nil {
+		t.Fatalf("dl.Record other_out.o: %v", err)
+	}
+	if _, err := dl.Record(ctx, "out.o", t3, []string{"foo.h"}); err != nil {
+		t.Fatalf("dl.Record out.o update: %v", err)
+	}
+	dl.Reset()
+
+	if err := dl.Recompact(ctx); err != nil {
+		t.Fatalf("dl.Recompact(ctx)=%v; want nil error", err)
+	}
+	defer func() {
+		if err := dl.Close(); err != nil {
+			t.Errorf("dl.Close()=%v; want nil error", err)
+		}
+	}()
+
+	// "bar.h" was dropped from "out.o" before Recompact and must report
+	// ErrNoDepsLog rather than leaving a stale rPathIdx entry pointing at
+	// a shifted path in rPaths.
+	if deps, _, err := dl.RetrievePaths(ctx, "bar.h"); !errors.Is(err, ErrNoDepsLog) {
+		t.Errorf(`dl.RetrievePaths(ctx, "bar.h")=%v, _, %v; want %v`, deps, err, ErrNoDepsLog)
+	}
+}
+
+func TestRecord_SnapshotIsolation(t *testing.T) {
+	ctx := t.Context()
+	fname := filepath.Join(t.TempDir(), "mydepslog")
+	t1 := time.Unix(1, 0)
+	t2 := time.Unix(2, 0)
+	t3 := time.Unix(3, 0)
+	t4 := time.Unix(4, 0)
+
+	dl1, err := NewDepsLog(ctx, fname)
+	if err != nil {
+		t.Fatalf("NewDepsLog(ctx, %q)=_, %v; want nil error", fname, err)
+	}
+
+	if _, err := dl1.Record(ctx, "out.o", t1, []string{"foo.h", "bar.h"}); err != nil {
+		t.Fatalf("dl1.Record t1: %v", err)
+	}
+	dl1.Reset()
+
+	// Overwriting an existing target after Reset must not mutate the read
+	// snapshot before the next Reset is called.
+	if _, err := dl1.Record(ctx, "out.o", t2, []string{"foo.h"}); err != nil {
+		t.Fatalf("dl1.Record t2: %v", err)
+	}
+	deps, mtime, err := dl1.RetrievePaths(ctx, "out.o")
+	if err != nil {
+		t.Fatalf(`dl1.RetrievePaths(ctx, "out.o") before Reset: %v`, err)
+	}
+	if diff := cmp.Diff([]string{"foo.h", "bar.h"}, deps); diff != "" {
+		t.Errorf("RetrievePaths after Reset+Record mismatch (-want +got):\n%s", diff)
+	}
+	if !mtime.Equal(t1) {
+		t.Errorf("RetrievePaths mtime after Reset+Record=%v; want %v", mtime, t1)
+	}
+
+	// Overwriting an existing target after Recompact must not mutate the read
+	// snapshot before Reset.
+	dl1.Reset()
+	if err := dl1.Recompact(ctx); err != nil {
+		t.Fatalf("dl1.Recompact: %v", err)
+	}
+	if _, err := dl1.Record(ctx, "out.o", t3, []string{"bar.h"}); err != nil {
+		t.Fatalf("dl1.Record t3: %v", err)
+	}
+	deps, mtime, err = dl1.RetrievePaths(ctx, "out.o")
+	if err != nil {
+		t.Fatalf(`dl1.RetrievePaths(ctx, "out.o") after Recompact+Record: %v`, err)
+	}
+	if diff := cmp.Diff([]string{"foo.h"}, deps); diff != "" {
+		t.Errorf("RetrievePaths after Recompact+Record mismatch (-want +got):\n%s", diff)
+	}
+	if !mtime.Equal(t2) {
+		t.Errorf("RetrievePaths mtime after Recompact+Record=%v; want %v", mtime, t2)
+	}
+	if err := dl1.Close(); err != nil {
+		t.Fatalf("dl1.Close: %v", err)
+	}
+
+	// Overwriting an existing target after NewDepsLog reopen must not mutate
+	// the read snapshot before Reset.
+	dl2, err := NewDepsLog(ctx, fname)
+	if err != nil {
+		t.Fatalf("NewDepsLog reopen: %v", err)
+	}
+	defer func() {
+		if err := dl2.Close(); err != nil {
+			t.Errorf("dl2.Close()=%v; want nil error", err)
+		}
+	}()
+	if _, err := dl2.Record(ctx, "out.o", t4, []string{"foo.h", "bar.h"}); err != nil {
+		t.Fatalf("dl2.Record t4: %v", err)
+	}
+	deps, mtime, err = dl2.RetrievePaths(ctx, "out.o")
+	if err != nil {
+		t.Fatalf(`dl2.RetrievePaths(ctx, "out.o") after NewDepsLog+Record: %v`, err)
+	}
+	if diff := cmp.Diff([]string{"bar.h"}, deps); diff != "" {
+		t.Errorf("RetrievePaths after NewDepsLog+Record mismatch (-want +got):\n%s", diff)
+	}
+	if !mtime.Equal(t3) {
+		t.Errorf("RetrievePaths mtime after NewDepsLog+Record=%v; want %v", mtime, t3)
 	}
 }

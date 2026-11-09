@@ -27,7 +27,7 @@ func (*exportCommand) Synopsis() string {
 }
 
 func (*exportCommand) Usage() string {
-	return "export siso hashfs data to stdout."
+	return "export siso hashfs data to stdout.\n"
 }
 
 type exportCommand struct {

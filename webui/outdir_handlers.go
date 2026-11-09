@@ -10,17 +10,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"go.chromium.org/build/siso/build"
+	"go.chromium.org/build/siso/build/metadata"
+	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
 )
 
@@ -32,42 +33,9 @@ const (
 	flatOutsub = "_"
 )
 
-type outdirInfo struct {
-	path         string
-	pathRel      string
-	manifestPath string
-	outRoot      string
-	outSub       string
-	metrics      []*buildMetrics
-	latestRevID  string
-
-	mu            sync.Mutex
-	manifestMtime time.Time
-	ninjaState    *ninjautil.State
-}
-
 type fieldAggregate struct {
 	Key   string
 	Count int
-}
-
-// buildMetrics represents data for a single build revision.
-// (Exported fields are accessible from Go templates.)
-type buildMetrics struct {
-	Mtime         time.Time
-	Rev           string
-	buildDuration build.IntervalMetric
-	lastStepID    string
-	ruleCounts    []fieldAggregate
-	actionCounts  []fieldAggregate
-	// buildMetrics contains build.StepMetric related to overall build e.g. regenerate ninja files.
-	buildMetrics []*build.StepMetric
-	// StepMetrics contains build.StepMetric related to ninja executions.
-	StepMetrics []*build.StepMetric
-	// stepByStepID keys step ID to *build.StepMetric for faster lookup.
-	stepByStepID map[string]*build.StepMetric
-	// stepByOutput keys output to *build.StepMetric for faster lookup.
-	stepByOutput map[string]*build.StepMetric
 }
 
 // aggregateMetric represents data for the aggregates page.
@@ -80,265 +48,149 @@ type aggregateMetric struct {
 	TotalWeightedDuration build.IntervalMetric
 }
 
-func loadBuildMetrics(metricsPath string) (*buildMetrics, error) {
-	f, err := os.Open(metricsPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read metrics: %w", err)
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat metrics: %w", err)
-	}
-
-	metricsData := &buildMetrics{
-		Mtime:        stat.ModTime(),
-		buildMetrics: []*build.StepMetric{},
-		StepMetrics:  []*build.StepMetric{},
-		stepByStepID: make(map[string]*build.StepMetric),
-		stepByOutput: make(map[string]*build.StepMetric),
-		ruleCounts:   []fieldAggregate{},
-		actionCounts: []fieldAggregate{},
-	}
-
-	d := json.NewDecoder(f)
-	for {
-		var m build.StepMetric
-		err := d.Decode(&m)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("parse error in %s:%d: %w", metricsPath, d.InputOffset(), err)
-		}
-		if m.BuildID != "" {
-			metricsData.buildMetrics = append(metricsData.buildMetrics, &m)
-			// The last build metric found has the actual build duration.
-			metricsData.buildDuration = m.Duration
-		} else if m.StepID != "" {
-			metricsData.StepMetrics = append(metricsData.StepMetrics, &m)
-			metricsData.stepByStepID[m.StepID] = &m
-			metricsData.stepByOutput[m.Output()] = &m
-			metricsData.lastStepID = m.StepID
-		} else {
-			return nil, fmt.Errorf("unexpected metric found %v", m)
-		}
-	}
-
-	if len(metricsData.buildMetrics) == 0 || metricsData.buildMetrics[0].BuildID == "" {
-		return nil, fmt.Errorf("need at least one build_id in %s", metricsPath)
-	}
-	metricsData.Rev = metricsData.buildMetrics[0].BuildID
-
-	actionCounts := make(map[string]int)
-	for _, metric := range metricsData.StepMetrics {
-		if metric.Action != "" {
-			actionCounts[metric.Action]++
-		}
-	}
-	// TODO(b/349287453): use maps.Keys once go 1.23
-	for action := range actionCounts {
-		metricsData.actionCounts = append(metricsData.actionCounts, fieldAggregate{
-			Key:   action,
-			Count: actionCounts[action],
-		})
-	}
-	slices.SortFunc(metricsData.actionCounts, func(a, b fieldAggregate) int {
-		return cmp.Compare(b.Count, a.Count)
-	})
-
-	ruleCounts := make(map[string]int)
-	for _, metric := range metricsData.StepMetrics {
-		if metric.Rule != "" {
-			ruleCounts[metric.Rule]++
-		}
-	}
-	// TODO(b/349287453): use maps.Keys once go 1.23
-	for rule := range ruleCounts {
-		metricsData.ruleCounts = append(metricsData.ruleCounts, fieldAggregate{
-			Key:   rule,
-			Count: ruleCounts[rule],
-		})
-	}
-	slices.SortFunc(metricsData.ruleCounts, func(a, b fieldAggregate) int {
-		return cmp.Compare(b.Count, a.Count)
-	})
-
-	return metricsData, nil
-}
-
-// loadOutdirInfo attempts to load all metrics found in the outdir.
-func loadOutdirInfo(workspaceRoot, outDir, manifestPath string) (*outdirInfo, error) {
-	start := time.Now()
-	fmt.Fprintf(os.Stderr, "load data at %s...", outDir)
-	defer func() {
-		fmt.Fprintf(os.Stderr, " returned in %v\n", time.Since(start))
-	}()
-
-	// Get path relative to workspaceRoot.
-	execRel, err := filepath.Rel(workspaceRoot, outDir)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't get ninja dir relative to workspace: %w", err)
-	}
-
-	// Validate manifest path.
-	_, err = os.Stat(filepath.Join(outDir, manifestPath))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, &ErrManifestNotExist{outDir, manifestPath}
-	}
-
-	// TODO(b/361703735): make sure this works on windows? https://chromium-review.googlesource.com/c/infra/infra/+/5803123/comment/502308d3_ac05bf91/
-	outRoot, outSub := filepath.Split(execRel)
-	if outRoot == "" {
-		outRoot = outSub
-		outSub = flatOutsub
-	} else {
-		if strings.Contains(outSub, "/") {
-			return nil, fmt.Errorf("outdir must match pattern `workspace/outroot/outsub`, others are not supported yet")
-		}
-		outRoot = filepath.Clean(outRoot)
-	}
-
-	outdirInfo := &outdirInfo{
-		path:         outDir,
-		pathRel:      execRel,
-		manifestPath: manifestPath,
-		outRoot:      outRoot,
-		outSub:       outSub,
-		mu:           sync.Mutex{},
-	}
-
-	// Attempt to load latest metrics first.
-	// Only silently ignore if it doesn't exist, otherwise always return error.
-	// TODO(b/349287453): consider tolerate fail, so frontend can show error?
-	latestMetricsPath := filepath.Join(outDir, "siso_metrics.json")
-	_, err = os.Stat(latestMetricsPath)
-	if err == nil {
-		latestMetrics, err := loadBuildMetrics(latestMetricsPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load latest metrics: %w", err)
-		}
-		outdirInfo.metrics = append(outdirInfo.metrics, latestMetrics)
-		outdirInfo.latestRevID = latestMetrics.Rev
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed to stat latest metrics: %w", err)
-	}
-
-	// Then load revisions if available.
-	revPaths, err := filepath.Glob(filepath.Join(outDir, "siso_metrics.*.json"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to glob revs: %w", err)
-	}
-	for _, revPath := range revPaths {
-		baseName := filepath.Base(revPath)
-		matches := sisoMetricsRe.FindStringSubmatch(baseName)
-		if matches == nil {
-			fmt.Fprintf(os.Stderr, "ignoring invalid %s\n", revPath)
-			continue
-		}
-		revMetrics, err := loadBuildMetrics(revPath)
-		if err != nil {
-			// TODO(b/349287453): show error in frontend as well?
-			fmt.Fprintf(os.Stderr, "ignoring invalid rev metrics %s: %v\n", revPath, err)
-			continue
-		}
-		outdirInfo.metrics = append(outdirInfo.metrics, revMetrics)
-	}
-	return outdirInfo, nil
-}
-
-// getOutdirForRequest lazy-loads outdir for the request, returning cached result if possible.
-func (s *WebuiServer) getOutdirForRequest(r *http.Request) (*outdirInfo, error) {
-	outroot := r.PathValue("outroot")
-	outsub := r.PathValue("outsub")
-	abs := filepath.Join(s.workspaceRoot, outroot, outsub)
-	if outsub == flatOutsub {
-		abs = filepath.Join(s.workspaceRoot, outroot)
-	}
-	s.metricsMu.Lock()
-	defer s.metricsMu.Unlock()
-	outdirInfo, ok := s.outdirMetrics[abs]
-	if !ok {
-		var err error
-		// For output directories with custom manifest paths (e.g. flat output directories),
-		// use the manifest path specified by -f instead of falling back to the hardcoded "build.ninja".
-		// TODO: refactor to generic manifest path resolution logic?
-		manifestPath := "build.ninja"
-		if abs == filepath.Join(s.workspaceRoot, s.defaultOutdir) {
-			manifestPath = s.defaultManifest
-		}
-		outdirInfo, err = loadOutdirInfo(s.workspaceRoot, abs, manifestPath)
-		if err != nil {
-			return nil, fmt.Errorf("couldn't load outdir %s: %w", abs, err)
-		}
-		s.outdirMetrics[abs] = outdirInfo
-	}
-	return outdirInfo, nil
-}
-
+// handleOutdirReload reloads the outdir.
 func (s *WebuiServer) handleOutdirReload(w http.ResponseWriter, r *http.Request) {
-	outdirInfo, err := s.getOutdirForRequest(r)
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	// TODO(b/533258244): introduce concept of reloadable invocation series?
+	outdirInfo, ok := series.(*outdirInfo)
+	if !ok {
+		s.renderBuildViewError(http.StatusNotFound, "this is not an outdir", w, r)
 		return
 	}
 
-	// loadOutdirInfo will always override existing cached data.
-	newOutdirInfo, err := loadOutdirInfo(s.workspaceRoot, outdirInfo.path, outdirInfo.manifestPath)
+	// TODO(b/533258244): decouple from outdirInfo?
+	s.outdirProvider.Invalidate(outdirInfo.pathRel)
+	_, err = s.outdirProvider.Get(outdirInfo.pathRel)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to reload outdir: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.metricsMu.Lock()
-	s.outdirMetrics[outdirInfo.path] = newOutdirInfo
-	s.metricsMu.Unlock()
 
 	// Then redirect to root page.
 	http.Redirect(w, r, outdirBaseURL(r), http.StatusTemporaryRedirect)
 }
 
-// handleOutdirRoot redirects from outdir root URL to `./builds/{latestRev}/steps/`.
-func (s *WebuiServer) handleOutdirRoot(w http.ResponseWriter, r *http.Request) {
-	outdirInfo, err := s.getOutdirForRequest(r)
+// handleInvocationSeriesRoot redirects from invocation series URL to `./builds/{latestRev}/steps/`.
+func (s *WebuiServer) handleInvocationSeriesRoot(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	if series.Latest() == nil {
+		s.renderBuildViewError(http.StatusNotFound, "no invocations found", w, r)
 		return
 	}
 
-	if outdirInfo.latestRevID == "" {
-		s.renderBuildViewError(http.StatusNotFound, "outdir has no metrics", w, r)
-		return
-	}
-
-	http.Redirect(w, r, fmt.Sprintf("%s/builds/%s/steps/", outdirBaseURL(r), outdirInfo.latestRevID), http.StatusTemporaryRedirect)
+	http.Redirect(w, r, fmt.Sprintf("%s/builds/%s/steps/", outdirBaseURL(r), series.Latest().ID()), http.StatusTemporaryRedirect)
 }
 
-func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request) {
-	outdirInfo, err := s.getOutdirForRequest(r)
+func (s *WebuiServer) handleInvocationDetails(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationDetails(w, r, false)
+}
+
+func (s *WebuiServer) handleInvocationDetailsLit(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationDetails(w, r, true)
+}
+
+func (s *WebuiServer) renderInvocationDetails(w http.ResponseWriter, r *http.Request, useLit bool) {
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	metrics := series.Get(r.PathValue("rev"))
+	if metrics == nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
 		return
 	}
 
-	tmpl, err := s.loadView("_logs.html")
+	tmpl, err := s.loadView("invocation_details.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
 	}
 
-	allowedFilesMap := map[string]string{
-		".siso_config":     ".siso_config%.0s",
-		".siso_filegroups": ".siso_filegroups%.0s",
-		"siso_localexec":   "siso_localexec.%s",
-		"siso_output":      "siso_output.%s",
-		"siso_trace.json":  "siso_trace.%s.json",
+	err = s.renderBuildView(w, r, tmpl, map[string]any{
+		"useLit":  useLit,
+		"metrics": metrics,
+	})
+	if err != nil {
+		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to render view: %v", err), w, r)
+	}
+}
+
+var allowedLogFilesMap = map[string]string{
+	".siso_config":     ".siso_config%.0s",
+	".siso_filegroups": ".siso_filegroups%.0s",
+	"siso_localexec":   "siso_localexec.%s",
+	"siso_output":      "siso_output.%s",
+	"siso_trace.json":  "siso_trace.%s.json",
+}
+
+func allowedLogFiles() []string {
+	return slices.Sorted(maps.Keys(allowedLogFilesMap))
+}
+
+func (s *WebuiServer) handleOutdirLogsLit(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	_, ok := series.(*outdirInfo)
+	if !ok {
+		s.renderBuildViewError(http.StatusNotFound, "only outdirs are currently supported", w, r)
+		return
+	}
+	metrics := series.Get(r.PathValue("rev"))
+	if metrics == nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
+		return
+	}
+
+	tmpl, err := s.loadView("invocation_logs.html")
+	if err != nil {
+		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
+		return
+	}
+
+	err = s.renderBuildView(w, r, tmpl, map[string]any{
+		"useLit":       true,
+		"allowedFiles": allowedLogFiles(),
+	})
+	if err != nil {
+		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to render view: %v", err), w, r)
+	}
+}
+
+func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	// TODO(b/533258244): move the raw logs concept into the [invocation.Invocation] interface?
+	outdirInfo, ok := series.(*outdirInfo)
+	if !ok {
+		s.renderBuildViewError(http.StatusNotFound, "only outdirs are currently supported", w, r)
+		return
+	}
+
+	tmpl, err := s.loadView("invocation_logs.html")
+	if err != nil {
+		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
+		return
 	}
 
 	// Make sure this file is allowed.
 	requestedFile := r.PathValue("file")
-	revFileFormatter, ok := allowedFilesMap[requestedFile]
+	revFileFormatter, ok := allowedLogFilesMap[requestedFile]
 	if !ok {
 		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("unknown file: %s", requestedFile), w, r)
 		return
@@ -350,6 +202,7 @@ func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request
 	// Do this every page load because we don't know if another build has happened since past reload.
 	// If this has happened, then the suffix would have changed.
 	// (The alternative is either store all files in-memory, or refactor Webui to watch for files changing.)
+	// TODO(b/533258244): decouple from outdirInfo?
 	matches, err := filepath.Glob(filepath.Join(outdirInfo.path, "siso_metrics*.json"))
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to glob siso_metrics*.json: %v", err), w, r)
@@ -397,7 +250,7 @@ func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request
 		actualFile = fmt.Sprintf(revFileFormatter, buildSuffix)
 	}
 
-	fileContents, err := os.ReadFile(filepath.Join(s.defaultOutdir, actualFile))
+	fileContents, err := os.ReadFile(filepath.Join(outdirInfo.path, actualFile))
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to open file: %v", err), w, r)
 		return
@@ -412,12 +265,7 @@ func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// TODO(b/349287453): use maps.Keys once go 1.23
-	var allowedFiles []string
-	for allowedFile := range allowedFilesMap {
-		allowedFiles = append(allowedFiles, allowedFile)
-	}
-	slices.Sort(allowedFiles)
+	allowedFiles := allowedLogFiles()
 
 	err = s.renderBuildView(w, r, tmpl, map[string]any{
 		"allowedFiles": allowedFiles,
@@ -429,60 +277,61 @@ func (s *WebuiServer) handleOutdirViewLog(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (s *WebuiServer) handleOutdirAggregates(w http.ResponseWriter, r *http.Request) {
-	outdirInfo, err := s.getOutdirForRequest(r)
+func (s *WebuiServer) handleInvocationAggregates(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationAggregates(w, r, false)
+}
+
+func (s *WebuiServer) handleInvocationAggregatesLit(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationAggregates(w, r, true)
+}
+
+func (s *WebuiServer) renderInvocationAggregates(w http.ResponseWriter, r *http.Request, useLit bool) {
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
 		return
 	}
-
-	var metrics *buildMetrics
-	for _, m := range outdirInfo.metrics {
-		if m.Rev == r.PathValue("rev") {
-			metrics = m
-			break
-		}
-	}
+	metrics := series.Get(r.PathValue("rev"))
 	if metrics == nil {
 		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
 		return
 	}
 
-	aggregates := make(map[string]aggregateMetric)
-	for _, m := range metrics.StepMetrics {
-		// Aggregate by rule if exists otherwise action.
-		aggregateBy := m.Action
-		if len(m.Rule) > 0 {
-			aggregateBy = m.Rule
-		}
-		entry, ok := aggregates[aggregateBy]
-		if !ok {
-			entry.AggregateBy = aggregateBy
-		}
-		entry.Count++
-		entry.TotalUtime += m.Utime
-		entry.TotalDuration += m.Duration
-		entry.TotalWeightedDuration += m.WeightedDuration
-		aggregates[aggregateBy] = entry
-	}
-
-	// Sort by utime descending.
-	// TODO(b/349287453): use maps.Values once go 1.23
 	var sortedAggregates []aggregateMetric
-	for _, v := range aggregates {
-		sortedAggregates = append(sortedAggregates, v)
-	}
-	slices.SortFunc(sortedAggregates, func(a, b aggregateMetric) int {
-		return cmp.Compare(b.TotalUtime, a.TotalUtime)
-	})
+	if !useLit {
+		aggregates := make(map[string]aggregateMetric)
+		for _, m := range metrics.StepMetrics() {
+			// Aggregate by rule if exists otherwise action.
+			aggregateBy := m.Action
+			if len(m.Rule) > 0 {
+				aggregateBy = m.Rule
+			}
+			entry, ok := aggregates[aggregateBy]
+			if !ok {
+				entry.AggregateBy = aggregateBy
+			}
+			entry.Count++
+			entry.TotalUtime += m.Utime
+			entry.TotalDuration += m.Duration
+			entry.TotalWeightedDuration += m.WeightedDuration
+			aggregates[aggregateBy] = entry
+		}
 
-	tmpl, err := s.loadView("_aggregates.html")
+		// Sort by utime descending.
+		sortedAggregates = slices.Collect(maps.Values(aggregates))
+		slices.SortFunc(sortedAggregates, func(a, b aggregateMetric) int {
+			return cmp.Compare(b.TotalUtime, a.TotalUtime)
+		})
+	}
+
+	tmpl, err := s.loadView("invocation_aggregates.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
 	}
 
 	err = s.renderBuildView(w, r, tmpl, map[string]any{
+		"useLit":     useLit,
 		"aggregates": sortedAggregates,
 	})
 	if err != nil {
@@ -490,26 +339,19 @@ func (s *WebuiServer) handleOutdirAggregates(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-func (s *WebuiServer) handleOutdirDoRecall(w http.ResponseWriter, r *http.Request) {
-	outdirInfo, err := s.getOutdirForRequest(r)
+func (s *WebuiServer) handleInvocationStepRecall(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
 		return
 	}
-
-	var metrics *buildMetrics
-	for _, m := range outdirInfo.metrics {
-		if m.Rev == r.PathValue("rev") {
-			metrics = m
-			break
-		}
-	}
+	metrics := series.Get(r.PathValue("rev"))
 	if metrics == nil {
 		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
 		return
 	}
 
-	tmpl, err := s.loadView("_recall.html")
+	tmpl, err := s.loadView("invocation_step_recall.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
@@ -532,36 +374,66 @@ func (s *WebuiServer) handleOutdirDoRecall(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (s *WebuiServer) handleOutdirViewStep(w http.ResponseWriter, r *http.Request) {
-	var metrics *buildMetrics
-	var outdirInfo *outdirInfo
-	var err error
-	if didRequestUploadedMetrics(r) {
-		for _, m := range s.uploadedMetrics {
-			if m.Rev == r.PathValue("rev") {
-				metrics = m
-				break
-			}
-		}
-	} else {
-		outdirInfo, err = s.getOutdirForRequest(r)
-		if err != nil {
-			s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
-			return
-		}
-		for _, m := range outdirInfo.metrics {
-			if m.Rev == r.PathValue("rev") {
-				metrics = m
-				break
-			}
-		}
+func (s *WebuiServer) handleInvocationViewStep(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationViewStep(w, r, false)
+}
+
+func (s *WebuiServer) handleInvocationViewStepLit(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationViewStep(w, r, true)
+}
+
+type apiInvocationStepResponse struct {
+	Step      *build.StepMetric `json:"step"`
+	OutdirRel string            `json:"outdirRel"`
+}
+
+func (s *WebuiServer) handleAPIInvocationStep(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
 	}
+	metrics := series.Get(r.PathValue("rev"))
 	if metrics == nil {
 		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
 		return
 	}
 
-	tmpl, err := s.loadView("_step.html")
+	stepData, ok := metrics.stepByStepID[r.PathValue("id")]
+	if !ok {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("stepID %s not found", r.PathValue("id")), w, r)
+		return
+	}
+
+	outdirRel := ""
+	if outdirInfo, ok := series.(*outdirInfo); ok {
+		outdirRel = outdirInfo.pathRel
+	}
+
+	data := apiInvocationStepResponse{
+		Step:      stepData,
+		OutdirRel: outdirRel,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		clog.Warningf(r.Context(), "failed to encode JSON for %s: %v", r.URL, err)
+	}
+}
+
+func (s *WebuiServer) renderInvocationViewStep(w http.ResponseWriter, r *http.Request, useLit bool) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	metrics := series.Get(r.PathValue("rev"))
+	if metrics == nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
+		return
+	}
+
+	tmpl, err := s.loadView("invocation_step.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
@@ -574,30 +446,39 @@ func (s *WebuiServer) handleOutdirViewStep(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Find steps with the same output in other revs.
+	// Find steps with the same output in other invocations under this series.
 	// (A step could have multiple outputs, and we only log the first output as the output name.
 	// So if it changes across builds it won't work. But it's expected to be stable for most builds.)
 	inOtherRevs := make(map[string]build.StepMetric)
-	if outdirInfo != nil {
-		for _, m := range outdirInfo.metrics {
-			if step, ok := m.stepByOutput[stepData.Output()]; ok {
-				inOtherRevs[m.Rev] = *step
-			}
+	for m := range series.All() {
+		if step, ok := m.stepByOutput[stepData.Output()]; ok {
+			inOtherRevs[m.Rev] = *step
 		}
 	}
 
-	// We will only have special handling for a subset of stats, so provide the raw step for everything else.
-	var stepRaw map[string]any
-	asJSON, err := json.Marshal(stepData)
-	if err != nil {
-		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to marshal metrics: %v", err), w, r)
+	outdirRel := ""
+	if outdirInfo, ok := series.(*outdirInfo); ok {
+		outdirRel = outdirInfo.pathRel
 	}
-	err = json.Unmarshal(asJSON, &stepRaw)
-	if err != nil {
-		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to unmarshal metrics: %v", err), w, r)
+
+	var stepRaw map[string]any
+	if !useLit {
+		// We will only have special handling for a subset of stats, so provide the raw step for everything else.
+		asJSON, err := json.Marshal(stepData)
+		if err != nil {
+			s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to marshal metrics: %v", err), w, r)
+			return
+		}
+		err = json.Unmarshal(asJSON, &stepRaw)
+		if err != nil {
+			s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to unmarshal metrics: %v", err), w, r)
+			return
+		}
 	}
 
 	err = s.renderBuildView(w, r, tmpl, map[string]any{
+		"useLit":      useLit,
+		"outdirRel":   outdirRel,
 		"step":        stepData,
 		"stepRaw":     stepRaw,
 		"inOtherRevs": inOtherRevs,
@@ -607,36 +488,113 @@ func (s *WebuiServer) handleOutdirViewStep(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (s *WebuiServer) handleOutdirListSteps(w http.ResponseWriter, r *http.Request) {
-	var metrics *buildMetrics
-	var outdirInfo *outdirInfo
-	var err error
-	if didRequestUploadedMetrics(r) {
-		for _, m := range s.uploadedMetrics {
-			if m.Rev == r.PathValue("rev") {
-				metrics = m
-				break
-			}
-		}
-	} else {
-		outdirInfo, err = s.getOutdirForRequest(r)
-		if err != nil {
-			s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
-			return
-		}
-		for _, m := range outdirInfo.metrics {
-			if m.Rev == r.PathValue("rev") {
-				metrics = m
-				break
-			}
-		}
+func (s *WebuiServer) handleInvocationListSteps(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationListSteps(w, r, false)
+}
+
+func (s *WebuiServer) handleInvocationListStepsLit(w http.ResponseWriter, r *http.Request) {
+	s.renderInvocationListSteps(w, r, true)
+}
+
+type apiInvocationStepsResponse struct {
+	Steps              []*build.StepMetric `json:"steps"`
+	BuildDurationNanos int64               `json:"buildDurationNanos"`
+	OutdirRel          string              `json:"outdirRel"`
+}
+
+func (s *WebuiServer) handleAPIInvocationSteps(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
 	}
+	metrics := series.Get(r.PathValue("rev"))
 	if metrics == nil {
 		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
 		return
 	}
 
-	tmpl, err := s.loadView("_steps.html")
+	outdirRel := ""
+	if outdirInfo, ok := series.(*outdirInfo); ok {
+		outdirRel = outdirInfo.pathRel
+	}
+
+	data := apiInvocationStepsResponse{
+		Steps:              metrics.StepMetrics(),
+		BuildDurationNanos: int64(metrics.buildDuration),
+		OutdirRel:          outdirRel,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		clog.Warningf(r.Context(), "failed to encode JSON for %s: %v", r.URL, err)
+	}
+}
+
+type apiInvocationStarted struct {
+	Time     string `json:"time"`
+	Inferred bool   `json:"inferred"`
+}
+
+type apiInvocationResponse struct {
+	BuildID            string                   `json:"buildId"`
+	Status             string                   `json:"status"`
+	BuildDurationNanos int64                    `json:"buildDurationNanos"`
+	FailedSteps        int                      `json:"failedSteps"`
+	TotalSteps         int                      `json:"totalSteps"`
+	Started            *apiInvocationStarted    `json:"started"`
+	Info               *metadata.InvocationInfo `json:"info"`
+}
+
+func (s *WebuiServer) handleAPIInvocation(w http.ResponseWriter, r *http.Request) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	metrics := series.Get(r.PathValue("rev"))
+	if metrics == nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
+		return
+	}
+
+	var started *apiInvocationStarted
+	if st := metrics.Started(); !st.IsZero() {
+		started = &apiInvocationStarted{
+			Time:     st.Time.Format(time.RFC3339),
+			Inferred: st.Inferred,
+		}
+	}
+
+	data := apiInvocationResponse{
+		BuildID:            metrics.Rev,
+		Status:             string(metrics.Status),
+		BuildDurationNanos: int64(metrics.BuildDuration()),
+		FailedSteps:        metrics.FailedSteps,
+		TotalSteps:         len(metrics.StepMetrics()),
+		Started:            started,
+		Info:               metrics.Info,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		clog.Warningf(r.Context(), "failed to encode JSON for %s: %v", r.URL, err)
+	}
+}
+
+func (s *WebuiServer) renderInvocationListSteps(w http.ResponseWriter, r *http.Request, useLit bool) {
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	metrics := series.Get(r.PathValue("rev"))
+	if metrics == nil {
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("no metrics found for request %s", r.URL), w, r)
+		return
+	}
+
+	tmpl, err := s.loadView("invocation_steps.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
@@ -666,21 +624,9 @@ func (s *WebuiServer) handleOutdirListSteps(w http.ResponseWriter, r *http.Reque
 	switch view {
 	case "criticalPath":
 		sortSupported = false
-		// We assume the last step is on the critical path.
-		// Build the critical path backwards then reverse it.
-		critStepID := metrics.lastStepID
-		for critStepID != "" {
-			if step, ok := metrics.stepByStepID[critStepID]; ok {
-				filteredSteps = append(filteredSteps, step)
-				critStepID = step.PrevStepID
-			} else {
-				// TODO(b/349287453): add some sort of error to indicate prev step was not found
-				break
-			}
-		}
-		slices.Reverse(filteredSteps)
+		filteredSteps = metrics.CriticalPath()
 	default:
-		for _, m := range metrics.StepMetrics {
+		for _, m := range metrics.StepMetrics() {
 			if len(actionsWanted) > 0 && !slices.Contains(actionsWanted, m.Action) {
 				continue
 			}
@@ -738,24 +684,38 @@ func (s *WebuiServer) handleOutdirListSteps(w http.ResponseWriter, r *http.Reque
 	itemsFirst := pageIndex * itemsPerPage
 	itemsLast := max(0, min(itemsFirst+itemsPerPage, len(filteredSteps)))
 	subset := filteredSteps[itemsFirst:itemsLast]
+	targets := []string{}
+	if metrics.Info != nil {
+		targets = metrics.Info.Targets
+	}
+
+	outdirRel := ""
+	if outdirInfo, ok := series.(*outdirInfo); ok {
+		outdirRel = outdirInfo.pathRel
+	}
 
 	data := map[string]any{
-		"subset":           subset,
-		"outputSearch":     outputSearch,
-		"page":             requestedPage,
-		"pageIndex":        pageIndex,
-		"pageFirst":        pageFirst,
-		"pageNext":         pageNext,
-		"pagePrev":         pagePrev,
-		"pageLast":         pageLast,
-		"pageCount":        pageCount,
-		"itemFirstLogical": itemsFirst + 1,
-		"itemLastLogical":  itemsFirst + len(subset),
-		"itemsLen":         len(filteredSteps),
-		"actionCounts":     metrics.actionCounts,
-		"ruleCounts":       metrics.ruleCounts,
-		"buildDuration":    metrics.buildDuration,
-		"sortSupported":    sortSupported,
+		"useLit":             useLit,
+		"subset":             subset,
+		"outdirRel":          outdirRel,
+		"outputSearch":       outputSearch,
+		"page":               requestedPage,
+		"pageIndex":          pageIndex,
+		"pageFirst":          pageFirst,
+		"pageNext":           pageNext,
+		"pagePrev":           pagePrev,
+		"pageLast":           pageLast,
+		"pageCount":          pageCount,
+		"itemFirstLogical":   itemsFirst + 1,
+		"itemLastLogical":    itemsFirst + len(subset),
+		"itemsLen":           len(filteredSteps),
+		"targets":            targets,
+		"status":             metrics.Status,
+		"actionCounts":       metrics.actionCounts,
+		"ruleCounts":         metrics.ruleCounts,
+		"buildDuration":      metrics.buildDuration,
+		"buildDurationNanos": int64(metrics.buildDuration),
+		"sortSupported":      sortSupported,
 	}
 	err = s.renderBuildView(w, r, tmpl, data)
 	if err != nil {
@@ -764,9 +724,15 @@ func (s *WebuiServer) handleOutdirListSteps(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *WebuiServer) handleOutdirListTargets(w http.ResponseWriter, r *http.Request) {
-	outdirInfo, err := s.getOutdirForRequest(r)
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("outdir failed to load for request %s: %v", r.URL, err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("failed to load invocation(s) for %s: %v", r.URL, err), w, r)
+		return
+	}
+	// TODO(b/533258244): introduce concept of invocation series that provides build.ninja file?
+	outdirInfo, ok := series.(*outdirInfo)
+	if !ok {
+		s.renderBuildViewError(http.StatusNotFound, "this is not an outdir", w, r)
 		return
 	}
 
@@ -778,6 +744,7 @@ func (s *WebuiServer) handleOutdirListTargets(w http.ResponseWriter, r *http.Req
 
 	// Check manifest or manifest.stamp is newer to reload.
 	// Don't continue if failed to stat manifest, but ignore if manifest.stamp failed to stat.
+	// TODO(b/533258244): decouple from outdirInfo?
 	stat, err := os.Stat(filepath.Join(outdirInfo.path, outdirInfo.manifestPath))
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to stat %s: %v", outdirInfo.manifestPath, err), w, r)
@@ -800,12 +767,16 @@ func (s *WebuiServer) handleOutdirListTargets(w http.ResponseWriter, r *http.Req
 			return
 		}
 		outdirInfo.ninjaState = state
-		outdirInfo.manifestMtime = stat.ModTime()
+		outdirInfo.manifestMtime = buildNinjaMtime
 	}
 
 	// Use cached *ninjautil.State to read info.
 	nodes, err := outdirInfo.ninjaState.Targets([]string{target})
 	if err != nil {
+		if _, ok := errors.AsType[ninjautil.UnknownTargetError](err); ok {
+			s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("target %s not found: %v", target, err), w, r)
+			return
+		}
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to get node for target %s: %v", target, err), w, r)
 		return
 	}
@@ -832,7 +803,7 @@ func (s *WebuiServer) handleOutdirListTargets(w http.ResponseWriter, r *http.Req
 			}
 		}
 	}
-	for _, edge := range targetNode.OutEdges() {
+	for _, edge := range outdirInfo.ninjaState.OutEdges(targetNode) {
 		outs := edge.Outputs()
 		if len(outs) == 0 {
 			continue
@@ -842,7 +813,7 @@ func (s *WebuiServer) handleOutdirListTargets(w http.ResponseWriter, r *http.Req
 	slices.Sort(inputs)
 	slices.Sort(outputs)
 
-	tmpl, err := s.loadView("_targets.html")
+	tmpl, err := s.loadView("ninja_targets.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return

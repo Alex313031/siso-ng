@@ -31,6 +31,10 @@ type UI interface {
 	// If msgs starts with \n, it will print from the current line.
 	// Otherwise, it will replaces the last N lines, where N is len(msgs).
 	PrintLines(msgs ...string)
+
+	// IsOneTerminalLine returns true if line fit on one terminal line.
+	IsOneTerminalLine(line string) bool
+
 	// NewSpinner returns a new spinner.
 	NewSpinner() Spinner
 

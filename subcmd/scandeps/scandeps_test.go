@@ -29,7 +29,7 @@ build obj/foo.o: cxx foo.cc
 		want  subcommands.ExitStatus
 	}{
 		{
-			name: "valid target",
+			name: "valid_target",
 			args: []string{"-target", "obj/foo.o"},
 			setup: func(t *testing.T, dir string) {
 				writeFile := func(path, content string) {
@@ -46,7 +46,7 @@ build obj/foo.o: cxx foo.cc
 			want: subcommands.ExitSuccess,
 		},
 		{
-			name: "command line invocation",
+			name: "command_line_invocation",
 			args: []string{"--", "clang++", "-c", "foo.cc", "-o", "obj/foo.o"},
 			setup: func(t *testing.T, dir string) {
 				writeFile := func(path, content string) {
@@ -62,7 +62,7 @@ build obj/foo.o: cxx foo.cc
 			want: subcommands.ExitSuccess,
 		},
 		{
-			name: "target not found -> unsupported compiler",
+			name: "target_not_found",
 			args: []string{"-target", "obj/bar.o"},
 			setup: func(t *testing.T, dir string) {
 				if err := os.WriteFile(filepath.Join(dir, "build.ninja"), []byte(ninjaFileContent), 0644); err != nil {

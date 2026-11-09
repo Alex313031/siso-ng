@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ type stdoutURLSource struct {
 	steps   sync.Map
 	mu      sync.Mutex
 	lines   []string
+	doneN   int
+	totalN  int
 	started time.Time
 	done    chan bool
 }
@@ -99,6 +102,20 @@ func (s *stdoutURLSource) run(ctx context.Context, body io.ReadCloser) {
 			continue
 		}
 		fields := strings.SplitN(line, " ", 4)
+		if len(fields) >= 4 {
+			bracket := strings.TrimPrefix(fields[0], "[")
+			bracket = strings.TrimSuffix(bracket, "]")
+			if parts := strings.Split(bracket, "/"); len(parts) == 2 {
+				d, err1 := strconv.Atoi(parts[0])
+				t, err2 := strconv.Atoi(parts[1])
+				if err1 == nil && err2 == nil {
+					s.mu.Lock()
+					s.doneN = d
+					s.totalN = t
+					s.mu.Unlock()
+				}
+			}
+		}
 		dur, err := time.ParseDuration(fields[1])
 		if err != nil {
 			clog.Warningf(ctx, "%s: dur=%q: %v", fields[3], fields[1], err)
@@ -120,7 +137,7 @@ func (s *stdoutURLSource) run(ctx context.Context, body io.ReadCloser) {
 	}
 }
 
-func (s *stdoutURLSource) fetch(ctx context.Context) ([]build.ActiveStepInfo, error) {
+func (s *stdoutURLSource) fetch(ctx context.Context) (build.ProgressInfo, error) {
 	actives := map[string]time.Duration{}
 	s.steps.Range(func(key, value any) bool {
 		name := key.(string)
@@ -140,6 +157,8 @@ func (s *stdoutURLSource) fetch(ctx context.Context) ([]build.ActiveStepInfo, er
 	})
 	s.mu.Lock()
 	started := s.started
+	doneN := s.doneN
+	totalN := s.totalN
 	s.mu.Unlock()
 	dur := time.Since(started)
 	var activeSteps []build.ActiveStepInfo
@@ -157,5 +176,9 @@ func (s *stdoutURLSource) fetch(ctx context.Context) ([]build.ActiveStepInfo, er
 		err = io.EOF
 	default:
 	}
-	return activeSteps, err
+	return build.ProgressInfo{
+		Done:        doneN,
+		Total:       totalN,
+		ActiveSteps: activeSteps,
+	}, err
 }

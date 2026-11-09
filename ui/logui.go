@@ -67,6 +67,9 @@ func (l LogUI) PrintLines(msgs ...string) {
 	l.stdoutWriter().Write([]byte(strings.Join(msgs, "\t") + "\n"))
 }
 
+// IsOneTerminalLine returns true for LogUI.
+func (LogUI) IsOneTerminalLine(string) bool { return true }
+
 // NewSpinner returns an implementation of ui.spinner.
 func (l LogUI) NewSpinner() Spinner {
 	return &logSpinner{l: l}

@@ -39,6 +39,13 @@ func (s *stats) update(ctx context.Context, m *StepMetric, pure bool) {
 		s.s.NoExec++
 	case m.Cached:
 		s.s.CacheHit++
+		if m.TwoPhaseCacheHit {
+			s.s.TwoPhaseCacheHit++
+		} else if m.RacingWinner == "remote" {
+			s.s.CacheHitLate++
+		} else {
+			s.s.CacheHitEarly++
+		}
 	case m.IsRemote:
 		s.s.Remote++
 	case m.IsLocal:
@@ -84,23 +91,26 @@ func (s *stats) update(ctx context.Context, m *StepMetric, pure bool) {
 
 // Stats keeps statistics about the build, such as the number of total, skipped or remote actions.
 type Stats struct {
-	Done           int // completed actions, including skipped, failed
-	Fail           int // failed actions
-	Pure           int // pure actions
-	Skipped        int // skipped actions, because they were still up-to-date
-	NoExec         int // actions that was completed by handler without execute cmds e.g. stamp, copy
-	ScanDepsFailed int // actions that scandeps failed
-	ClangScanDeps  int // actions that use clang for scandeps.
-	CacheHit       int // actions for which we got a cache hit
-	Local          int // locally executed actions
-	Remote         int // remote executed actions
-	LocalFallback  int // actions for which remote execution failed, and we did a local fallback
-	CacheWrite     int // locally executed actions whose trusted results were uploaded directly to RE
-	CacheWriteErr  int // locally executed actions that failed uploading results directly to RE
-	RemoteRetry    int // accumulated remote retry counts
-	RacingLocal    int // racing steps where local won
-	RacingRemote   int // racing steps where remote won
-	Total          int // total actions that ran during this build
+	Done             int // completed actions, including skipped, failed
+	Fail             int // failed actions
+	Pure             int // pure actions
+	Skipped          int // skipped actions, because they were still up-to-date
+	NoExec           int // actions that was completed by handler without execute cmds e.g. stamp, copy
+	ScanDepsFailed   int // actions that scandeps failed
+	ClangScanDeps    int // actions that use clang for scandeps.
+	CacheHit         int // actions for which we got a cache hit
+	CacheHitEarly    int // actions for which we got a cache hit during execRemoteCache
+	CacheHitLate     int // actions for which we got a cache hit during execRemoteExecute
+	TwoPhaseCacheHit int // actions for which we got a cache hit during two phase lookup
+	Local            int // locally executed actions
+	Remote           int // remote executed actions
+	LocalFallback    int // actions for which remote execution failed, and we did a local fallback
+	CacheWrite       int // locally executed actions whose trusted results were uploaded directly to RE
+	CacheWriteErr    int // locally executed actions that failed uploading results directly to RE
+	RemoteRetry      int // accumulated remote retry counts
+	RacingLocal      int // racing steps where local won
+	RacingRemote     int // racing steps where remote won (including CacheHitLate)
+	Total            int // total actions that ran during this build
 }
 
 func (s *stats) stats() Stats {

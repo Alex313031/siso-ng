@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"path/filepath"
 
 	log "github.com/golang/glog"
 	"go.starlark.net/starlark"
@@ -153,5 +152,5 @@ func starFSCanonPath(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	if err != nil {
 		return starlark.None, err
 	}
-	return starlark.String(filepath.ToSlash(s)), nil
+	return starlark.String(s), nil
 }

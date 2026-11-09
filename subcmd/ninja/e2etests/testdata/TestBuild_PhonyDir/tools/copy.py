@@ -9,7 +9,7 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("-R", action='store_true', help="recursive copy")
+  parser.add_argument("-R", action="store_true", help="recursive copy")
   parser.add_argument("src", help="copy source")
   parser.add_argument("dst", help="copy destination")
   options = parser.parse_args()

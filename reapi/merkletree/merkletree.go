@@ -20,10 +20,12 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
 )
 
 // MerkleTree represents a merkle tree.
@@ -31,7 +33,8 @@ type MerkleTree struct {
 	// dirname to Directory.
 	// empty dirname is root.
 	m     map[string]*rpb.Directory
-	store *digest.Store
+	fn    digest.Function
+	store *blob.Store
 
 	// Note: this cache showed a reduction of 7GB (4%) during a Chrome
 	// build. The assumption is that traversal is sequential. A measurement
@@ -41,12 +44,13 @@ type MerkleTree struct {
 	pooled bool
 }
 
-// New creates new merkle tree with digest store.
-func New(store *digest.Store) *MerkleTree {
+// New creates new merkle tree with digest function and digest store.
+func New(fn digest.Function, store *blob.Store) *MerkleTree {
 	return &MerkleTree{
 		m: map[string]*rpb.Directory{
 			"": {},
 		},
+		fn:    fn,
 		store: store,
 	}
 }
@@ -61,8 +65,9 @@ var merkleTreePool = sync.Pool{
 
 // NewPooled returns a MerkleTree from the pool.
 // Call Release when done to return it; defer is the typical usage.
-func NewPooled(store *digest.Store) *MerkleTree {
+func NewPooled(fn digest.Function, store *blob.Store) *MerkleTree {
 	m := merkleTreePool.Get().(*MerkleTree)
+	m.fn = fn
 	m.store = store
 	m.lastDir = dirstate{}
 	m.pooled = true
@@ -94,10 +99,10 @@ type Entry struct {
 	//  - 'dir2/'
 	//  - 'dir2/file'
 	// error if name goes out to root.
-	Name string
+	Name path.Path
 
 	// Data is entry's content. `nil` for directories and symlinks.
-	Data digest.Data
+	Data blob.Data
 
 	// IsExecutable is true if the file is executable.
 	// no need to set this for directory.
@@ -144,14 +149,13 @@ type dirstate struct {
 // Set sets an entry.
 // It may return ErrAbsPath/ErrAmbigFileSymlink/ErrBadPath as error.
 func (m *MerkleTree) Set(entry Entry) error {
-	fname := entry.Name
+	fname := string(entry.Name)
 	if entry.Target != "" && !entry.Data.IsZero() {
 		return fmt.Errorf("set %s: %w", fname, ErrAmbigFileSymlink)
 	}
 	if filepath.IsAbs(fname) || strings.HasPrefix(fname, "/") || strings.HasPrefix(fname, `\`) {
 		return fmt.Errorf("set %s: %w", fname, ErrAbsPath)
 	}
-	fname = filepath.ToSlash(fname)
 	if entry.IsDir() || entry.Target != "" {
 		if _, exists := m.m[fname]; exists {
 			return nil
@@ -162,14 +166,16 @@ func (m *MerkleTree) Set(entry Entry) error {
 		dir:  m.RootDirectory(),
 	}
 	rest := fname
-	// Try to use the cached directory state if possible.
+	// Try to reuse the cached directory state. Hand-check the prefix
+	// and '/' separator instead of CutPrefix(fname, name+"/"), whose
+	// concatenation allocates per call (~18M allocs per cache-cold build).
 	var found bool
 	if m.lastDir.dir != nil && !strings.Contains(fname, "..") {
-		var after string
-		after, found = strings.CutPrefix(fname, m.lastDir.name+"/")
-		if found {
+		ln := len(m.lastDir.name)
+		if len(fname) > ln && fname[ln] == '/' && fname[:ln] == m.lastDir.name {
 			cur = m.lastDir
-			rest = after
+			rest = fname[ln+1:]
+			found = true
 		}
 	}
 	if !found {
@@ -214,6 +220,14 @@ func (m *MerkleTree) Set(entry Entry) error {
 			if m.store != nil {
 				m.store.Set(entry.Data)
 			}
+			// A duplicate FileNode with this name may be appended here.
+			// The REAPI Directory invariant (no two nodes share a name)
+			// is enforced in buildTree, which collapses identical re-Sets
+			// and errors on conflicting ones (different digest or
+			// executable bit). Checking for an existing FileNode here
+			// would add per-Set work to this hot path (a linear scan or a
+			// per-directory map, both allocating) without changing the
+			// built proto.
 			cur.dir.Files = append(cur.dir.Files, &rpb.FileNode{
 				Name:         name,
 				Digest:       entry.Data.Digest().Proto(),
@@ -240,6 +254,14 @@ func (m *MerkleTree) Set(entry Entry) error {
 		var err error
 		cur, err = m.setDir(cur, name)
 		if err != nil {
+			// setDir only returns ErrPrecomputedSubTree, which every
+			// caller errors.Is-checks and ignores. Return it bare;
+			// wrapping it interpolates fname and allocates a string
+			// per input descending into a precomputed subtree, all
+			// discarded.
+			if errors.Is(err, ErrPrecomputedSubTree) {
+				return err
+			}
 			return fmt.Errorf("set %s: %w", fname, err)
 		}
 	}
@@ -276,7 +298,7 @@ func (m *MerkleTree) setDir(cur dirstate, name string) (dirstate, error) {
 type TreeEntry struct {
 	// Name is relative path from root dir.
 	// Name should not end with "." or "..".
-	Name string
+	Name path.Path
 
 	// Digest is the digest of this sub tree.
 	Digest digest.Digest
@@ -285,20 +307,19 @@ type TreeEntry struct {
 	// It may be nil, if it is sure that the subtree was uploaded
 	// to CAS and no need to check missing blobs / upload blobs
 	// of the subtree.
-	Store *digest.Store
+	Store *blob.Store
 }
 
 // SetTree sets a subtree entry.
 // It may return ErrAbsPath/ErrBadPath/ErrBadTree as error.
 func (m *MerkleTree) SetTree(tentry TreeEntry) error {
-	dname := tentry.Name
+	dname := string(tentry.Name)
 	if tentry.Digest.IsZero() {
 		return fmt.Errorf("setTree %s: %w", dname, ErrBadTree)
 	}
 	if filepath.IsAbs(dname) || strings.HasPrefix(dname, "/") || strings.HasPrefix(dname, `\`) {
 		return fmt.Errorf("setTree %s: %w", dname, ErrAbsPath)
 	}
-	dname = filepath.ToSlash(dname)
 	_, exists := m.m[dname]
 	if exists {
 		return fmt.Errorf("setTree %s: %w", dname, ErrPrecomputedSubTree)
@@ -345,7 +366,7 @@ func (m *MerkleTree) SetTree(tentry TreeEntry) error {
 	}
 }
 
-func (m *MerkleTree) setTree(cur dirstate, name string, d digest.Digest, store *digest.Store) {
+func (m *MerkleTree) setTree(cur dirstate, name string, d digest.Digest, store *blob.Store) {
 	dirname := pathJoin(cur.name, name)
 	dirnode := &rpb.DirectoryNode{
 		Name:   name,
@@ -478,9 +499,12 @@ func (m *MerkleTree) mergeDir(ctx context.Context, dirname string, dir *rpb.Dire
 
 // buildtree builds tree at curdir, which is located as dirname.
 func (m *MerkleTree) buildTree(ctx context.Context, curdir *rpb.Directory, dirname string) (*rpb.Digest, error) {
-	// directory should not have duplicate name.
-	// http://b/124693412
-	names := map[string]proto.Message{}
+	// A Directory must not carry two nodes sharing one name (REAPI
+	// invariant, http://b/124693412): identical re-entries collapse to
+	// one, conflicting entries are an error. Exception: a directory
+	// sharing a name with a symlink is skipped (the symlink wins); see
+	// TestBuildDuplicateSymlinkDir.
+	names := make(map[string]proto.Message, len(curdir.Files)+len(curdir.Symlinks)+len(curdir.Directories))
 	var files []*rpb.FileNode
 	for _, f := range curdir.Files {
 		p, found := names[f.Name]
@@ -558,7 +582,7 @@ func (m *MerkleTree) buildTree(ctx context.Context, curdir *rpb.Directory, dirna
 	})
 	curdir.Directories = dirs
 
-	data, err := digest.FromProtoMessage(curdir)
+	data, err := blob.FromProtoMessage(m.fn, curdir)
 	if err != nil {
 		return nil, fmt.Errorf("directory digest %s: %w", dirname, err)
 	}

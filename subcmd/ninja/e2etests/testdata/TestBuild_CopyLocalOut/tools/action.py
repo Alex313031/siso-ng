@@ -3,7 +3,6 @@
 # found in the LICENSE file.
 
 import argparse
-import os
 import sys
 
 
@@ -18,8 +17,8 @@ def main():
     data = r.read()
   with open(options.output, "w") as w:
     w.write(data)
-    for i in range(0, 1024 * 1024):
-      w.write(' ')
+    for _ in range(0, 1024 * 1024):
+      w.write(" ")
   return 0
 
 

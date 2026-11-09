@@ -27,12 +27,15 @@ import (
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
 	"google.golang.org/grpc/grpclog"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/auth/cred"
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/merkletree"
 	"go.chromium.org/build/siso/signals"
 	"go.chromium.org/build/siso/ui"
@@ -49,7 +52,7 @@ const usage = `isolate uploads and computes tree digest for each targets.
 `
 
 // Cmd returns the Command for the `isolate` subcommand.
-func Cmd(authOpts cred.Options) *Command {
+func Cmd(authOpts func() cred.Options) *Command {
 	return &Command{
 		authOpts: authOpts,
 	}
@@ -70,7 +73,7 @@ func (*Command) Usage() string {
 // Command implements isolate subcommand.
 type Command struct {
 	Flags     *flag.FlagSet
-	authOpts  cred.Options
+	authOpts  func() cred.Options
 	projectID string
 	srcreopt  *reapi.Option
 	dstreopt  *reapi.Option
@@ -153,7 +156,7 @@ func (c *Command) run(ctx context.Context) error {
 	var credential cred.Cred
 	if c.srcreopt.NeedCred() || c.enableCloudLogging {
 		spin.Start("init credentials")
-		credential, err = cred.New(ctx, c.srcreopt.ServiceURI(), c.authOpts)
+		credential, err = cred.New(ctx, c.srcreopt.ServiceURI(), c.authOpts())
 		if err != nil {
 			spin.Stop(errors.New(""))
 			return err
@@ -174,6 +177,24 @@ func (c *Command) run(ctx context.Context) error {
 			ctx = logCtx
 		}
 	}
+
+	// The hashfs digests are computed once and uploaded to the dst backend, so
+	// both sides must use the same content digest function.
+	srcFn, err := reapi.ParseDigestFunction(c.srcreopt.DigestFunction)
+	if err != nil {
+		return fmt.Errorf("invalid -src_cas_digest_function: %w", err)
+	}
+	dstFn, err := reapi.ParseDigestFunction(c.dstreopt.DigestFunction)
+	if err != nil {
+		return fmt.Errorf("invalid -dst_cas_digest_function: %w", err)
+	}
+	if srcFn != dstFn {
+		return fmt.Errorf("content digest function mismatch: -src_cas_digest_function=%s -dst_cas_digest_function=%s: one isolate run supports a single content-hash function", srcFn, dstFn)
+	}
+	// Deliberately flag-driven: the digest function recorded in the persisted
+	// state is ignored. If it differs from -src_cas_digest_function, SetState
+	// discards the stale entries and isolate rehashes — slow but correct.
+	c.fsopt.DigestFunction = srcFn
 
 	ui.Default.Printf("use %s\n", c.srcreopt)
 	ctx = reapi.NewContext(ctx, nil)
@@ -336,7 +357,7 @@ func upload(ctx context.Context, workspaceRoot, outDir string, hashFS *hashfs.Ha
 		}
 		// Expand directory entries.
 		pathname := filepath.ToSlash(filepath.Join(outDir, fname))
-		fi, err := hashFS.Stat(ctx, workspaceRoot, pathname)
+		fi, err := hashFS.Stat(ctx, workspaceRoot, path.Path(pathname))
 		if err != nil {
 			return digest.Digest{}, err
 		}
@@ -360,8 +381,8 @@ func upload(ctx context.Context, workspaceRoot, outDir string, hashFS *hashfs.Ha
 			return digest.Digest{}, err
 		}
 	}
-	ds := digest.NewStore()
-	tree := merkletree.New(ds)
+	ds := blob.NewStore()
+	tree := merkletree.New(hashFS.DigestFunction(), ds)
 	for _, fname := range fnames {
 		pathname := filepath.ToSlash(filepath.Join(outDir, fname))
 		// To match with the implementation of `isolate` command,
@@ -369,7 +390,7 @@ func upload(ctx context.Context, workspaceRoot, outDir string, hashFS *hashfs.Ha
 		if strings.HasSuffix(pathname, ".pyc") {
 			continue
 		}
-		ents, err := hashFS.Entries(ctx, workspaceRoot, []string{pathname})
+		ents, err := hashFS.Entries(ctx, workspaceRoot, []path.Path{path.Path(pathname)})
 		if err != nil {
 			return digest.Digest{}, err
 		}

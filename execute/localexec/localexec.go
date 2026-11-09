@@ -59,10 +59,26 @@ func (LocalExec) Run(ctx context.Context, cmd *execute.Cmd) (err error) {
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil && res != nil && res.ExitCode == 0 {
+		// if we canceled, handle it as failed action.
+		clog.Infof(ctx, "localExec canceled. set exit_code=1")
+		res.ExitCode = 1
+	}
 	cmd.SetActionResult(res, false)
-
+	if res.ExecutionMetadata == nil {
+		res.ExecutionMetadata = &rpb.ExecutedActionMetadata{}
+	}
 	duration := res.ExecutionMetadata.ExecutionCompletedTimestamp.AsTime().Sub(res.ExecutionMetadata.ExecutionStartTimestamp.AsTime())
-	clog.Infof(ctx, "localexec: %v duration=%s exit=%d stdout=%d stderr=%d metadata=%s", cmd.Args, duration, res.ExitCode, len(res.StdoutRaw), len(res.StderrRaw), res.ExecutionMetadata)
+	tapResult, tapped := ExtractTapResult(res)
+	if tapped {
+		var errmsg string
+		if tapResult.Error != "" {
+			errmsg = ": " + tapResult.Error
+		}
+		clog.Infof(ctx, "localexec: %v duration=%s exit=%d stdout=%d stderr=%d tap reads=%d writes=%d deletes=%d%s", cmd.Args, duration, res.ExitCode, len(res.StdoutRaw), len(res.StderrRaw), len(tapResult.Reads), len(tapResult.Writes), len(tapResult.Deletes), errmsg)
+	} else {
+		clog.Infof(ctx, "localexec: %v duration=%s exit=%d stdout=%d stderr=%d metadata=%s", cmd.Args, duration, res.ExitCode, len(res.StdoutRaw), len(res.StderrRaw), res.ExecutionMetadata)
+	}
 
 	if res.ExitCode != 0 {
 		return execute.ExitError{ExitCode: int(res.ExitCode)}
@@ -82,11 +98,22 @@ var ForkSema = semaphore.New("fork", runtime.GOMAXPROCS(0))
 // fails with ETXTBSY, i.e. a write-mode fd to the executable is transiently
 // open somewhere (https://github.com/golang/go/issues/22315).
 func run(ctx context.Context, cmd *execute.Cmd) (*rpb.ActionResult, error) {
+	tcmd, tpostProc, err := tapCmd(cmd)
+	if err != nil {
+		return nil, err
+	}
 	backoff := 10 * time.Millisecond
 	for {
-		res, err := runOnce(ctx, cmd)
-		if err == nil || !errors.Is(err, syscall.ETXTBSY) || backoff > 320*time.Millisecond {
-			// success, non-ETXTBSY error, or budget exhausted.
+		res, err := runOnce(ctx, tcmd)
+		if err == nil {
+			// success.
+			err = tpostProc(ctx, res)
+			return res, err
+		}
+		// may leave temporary file for tapping when failed
+		// (as we leave *.rsp, *.d when failed)
+		if !errors.Is(err, syscall.ETXTBSY) || backoff > 320*time.Millisecond {
+			// non-ETXTBSY error, or budget exhausted.
 			return res, err
 		}
 		clog.Warningf(ctx, "ETXTBSY starting %s; retrying in %s", cmd.Args[0], backoff)
@@ -131,7 +158,7 @@ func runOnce(ctx context.Context, cmd *execute.Cmd) (*rpb.ActionResult, error) {
 	// success. (Bazel kills survivors at main-child exit instead, which is only
 	// safe because it captures output via files, not pipes.)
 	c.Env = cmd.Env
-	c.Dir = filepath.Join(cmd.WorkspaceRoot, cmd.WorkDir)
+	c.Dir = filepath.Join(cmd.WorkspaceRoot, string(cmd.WorkDir))
 	c.Stdout = cmd.StdoutWriter()
 	c.Stderr = cmd.StderrWriter()
 	var consoleWG sync.WaitGroup
@@ -201,10 +228,12 @@ func runOnce(ctx context.Context, cmd *execute.Cmd) (*rpb.ActionResult, error) {
 	var ru *epb.Rusage
 	var err error
 	var tracker *rusageTracker
+	var started bool
 	err = ForkSema.Do(ctx, func(ctx context.Context) error {
 		return c.Start()
 	})
 	if err == nil {
+		started = true
 		tracker = newRusageTracker(c)
 		if cmd.OOMScoreAdj != nil {
 			oomScoreAdj(ctx, c.Process.Pid, *cmd.OOMScoreAdj)
@@ -255,7 +284,10 @@ func runOnce(ctx context.Context, cmd *execute.Cmd) (*rpb.ActionResult, error) {
 
 	// TODO(b/273423470): track resource usage.
 
-	if code >= 0 {
+	if ctx.Err() != nil {
+		err = context.Cause(ctx)
+	} else if started {
+		// need to report exit code and stdout/stderr to caller.
 		err = nil
 	}
 	return result, err

@@ -87,10 +87,10 @@ type gceFactory struct {
 
 func (f gceFactory) CreateDefaultConfig() component.Config {
 	config := f.Factory.CreateDefaultConfig().(*googlecloudexporter.Config)
-	config.ProjectID = f.projectID
-	config.TraceConfig.ClientConfig.GetClientOptions = f.clientOptions
-	config.LogConfig.ClientConfig.GetClientOptions = f.clientOptions
-	config.MetricConfig.ClientConfig.GetClientOptions = f.clientOptions
+	config.Config.ProjectID = f.projectID
+	config.Config.TraceConfig.ClientConfig.GetClientOptions = f.clientOptions
+	config.Config.LogConfig.ClientConfig.GetClientOptions = f.clientOptions
+	config.Config.MetricConfig.ClientConfig.GetClientOptions = f.clientOptions
 	return config
 }
 

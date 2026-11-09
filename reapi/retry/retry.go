@@ -39,7 +39,8 @@ func (b *ExponentialBackoff) retriableError(err error) bool {
 
 	// https://github.com/bazelbuild/bazel/blob/7.1.1/src/main/java/com/google/devtools/build/lib/remote/RemoteRetrier.java#L47
 	switch st.Code() {
-	case codes.Internal,
+	case codes.ResourceExhausted,
+		codes.Internal,
 		codes.Unavailable,
 		codes.Aborted:
 		return true

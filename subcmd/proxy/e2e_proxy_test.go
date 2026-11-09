@@ -46,7 +46,7 @@ func TestProxyCleanShutdownOnCancel(t *testing.T) {
 	go grpcServer.Serve(lis)
 	defer grpcServer.Stop()
 
-	cmd := proxy.Cmd(cred.Options{})
+	cmd := proxy.Cmd(func() cred.Options { return cred.Options{} })
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	cmd.SetFlags(fs)
 

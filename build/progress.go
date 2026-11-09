@@ -7,6 +7,7 @@ package build
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -15,8 +16,6 @@ import (
 	"time"
 
 	"go.chromium.org/build/siso/execute"
-	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/o11y/resultstore"
 	"go.chromium.org/build/siso/ui"
 )
 
@@ -43,21 +42,19 @@ type progress struct {
 	// sequential, so no mutex is needed.
 	rendered bool
 
-	// topActives holds up to activeItems oldest live steps, sorted
-	// ascending by startTime. update() populates it unsorted as part
-	// of the filter pass, then sorts it once before render() reads
-	// it. Owned by the update goroutine so no mutex is needed.
+	// topActives holds up to activeItems prioritized live steps (running steps
+	// prioritized over waiting steps, then by startTime). update() populates
+	// it unsorted as part of the filter pass, then sorts it once before
+	// render() reads it. Owned by the update goroutine so no mutex is needed.
 	topActives []*stepInfo
 
-	// topActivesNewest is the index in p.topActives of the kept entry
-	// with the largest startTime while update() is populating the K
-	// entry buffer. It gives insertTopActive a single comparison
-	// rejection path in the common case where the candidate is newer
-	// than every kept entry. Owned by the update goroutine so no
-	// mutex is needed. The n == 0 branch in insertTopActive restores
-	// it on the first call of each tick, so no explicit reset is
-	// needed when topActives is cleared above.
-	topActivesNewest int
+	// topActivesLowest is the index in p.topActives of the kept entry
+	// with the lowest priority (e.g. wait phase, or newest startTime)
+	// while update() is populating the K entry buffer. It gives
+	// insertTopActive a single comparison rejection path in the common case
+	// where the candidate has lower or equal priority compared to every kept
+	// entry. Owned by the update goroutine so no mutex is needed.
+	topActivesLowest int
 
 	// linesBuf is the reusable backing for the terminal frame. start()
 	// pre-sizes it to fit an optional leading "\n", one summary row,
@@ -74,7 +71,8 @@ type progress struct {
 	// update goroutine.
 	pendingOutput []string
 
-	resultstoreUploader *resultstore.Uploader
+	// resultSink reference for appending to build transcript.
+	resultSink io.Writer
 
 	actives       []*stepInfo
 	done          chan struct{}
@@ -91,7 +89,7 @@ type stepInfo struct {
 func (p *progress) start(ctx context.Context, b *Builder) {
 	p.started = time.Now()
 	p.verbose = b.verbose
-	p.resultstoreUploader = b.resultstoreUploader
+	p.resultSink = b.resultSink
 	p.done = make(chan struct{})
 	p.updateStopped = make(chan struct{})
 	p.linesBuf = make([]string, 0, activeItems+3)
@@ -150,7 +148,7 @@ func (p *progress) update(ctx context.Context, b *Builder) {
 			}
 			p.actives = p.actives[:n]
 			sort.Slice(p.topActives, func(i, j int) bool {
-				return p.topActives[i].step.startTime.Before(p.topActives[j].step.startTime)
+				return stepActiveLess(p.topActives[i], p.topActives[j])
 			})
 			if len(p.actives) > 0 {
 				d := time.Since(lastUpdate)
@@ -166,35 +164,47 @@ func (p *progress) update(ctx context.Context, b *Builder) {
 	}
 }
 
-// insertTopActive keeps p.topActives as the activeItems oldest live
-// steps seen so far this tick. Slots are written in the order the
-// buffer filled; update() sorts the K entry buffer once after the
-// p.actives walk so render() sees the K oldest in age order.
+// stepActiveLess reports whether a should be displayed before b in the progress UI.
+// Running (non-wait) steps are prioritized over waiting steps; within the same
+// group, older steps (by startTime) are prioritized.
+func stepActiveLess(a, b *stepInfo) bool {
+	aWait := a.step.phase().isWait()
+	bWait := b.step.phase().isWait()
+	if aWait != bWait {
+		return !aWait
+	}
+	return a.step.startTime.Before(b.step.startTime)
+}
+
+// insertTopActive keeps p.topActives as the activeItems highest-priority live
+// steps seen so far this tick (running steps prioritized over waiting steps, then
+// by oldest startTime). Slots are written in the order the buffer filled;
+// update() sorts the K entry buffer once after the p.actives walk so render()
+// sees the K steps in priority order.
 //
-// p.topActivesNewest tracks the slot holding the newest of the kept
-// K across calls, so the common case (candidate newer than every
-// kept entry, dropped) is a single comparison. On the rare path
-// where a candidate is strictly older than that slot, it replaces
-// the slot and one linear scan over K slots picks the new newest.
-// K is activeItems (5), so per call work is O(1) amortized with no
-// allocation.
+// p.topActivesLowest tracks the slot holding the lowest-priority of the kept
+// K across calls, so the common case (candidate lower/equal priority than every
+// kept entry, dropped) is a single comparison. On the rare path where a
+// candidate has strictly higher priority than that slot, it replaces the slot
+// and one linear scan over K slots picks the new lowest-priority slot.
+// K is activeItems (5), so per call work is O(1) amortized with no allocation.
 func (p *progress) insertTopActive(s *stepInfo) {
 	switch {
 	case len(p.topActives) < activeItems:
 		// We have empty slots
 		p.topActives = append(p.topActives, s)
-	case s.step.startTime.Before(p.topActives[p.topActivesNewest].step.startTime):
-		// s started before current newest so replace
-		p.topActives[p.topActivesNewest] = s
+	case stepActiveLess(s, p.topActives[p.topActivesLowest]):
+		// s has higher priority than the current lowest-priority slot so replace
+		p.topActives[p.topActivesLowest] = s
 	default:
-		// s started later than current newest so ignore
+		// s has lower or equal priority compared to current lowest so ignore
 		return
 	}
-	// Find newest
-	p.topActivesNewest = 0
-	for i := range p.topActives {
-		if p.topActives[i].step.startTime.After(p.topActives[p.topActivesNewest].step.startTime) {
-			p.topActivesNewest = i
+	// Find slot with lowest priority
+	p.topActivesLowest = 0
+	for i := 1; i < len(p.topActives); i++ {
+		if stepActiveLess(p.topActives[p.topActivesLowest], p.topActives[i]) {
+			p.topActivesLowest = i
 		}
 	}
 }
@@ -236,12 +246,12 @@ func (p *progress) render(b *Builder) {
 // fastLocal acquisition) and reports the plan's live total to
 // b.statusReporter as side effects.
 func (p *progress) buildSummary(b *Builder) string {
-	dur := ui.FormatDuration(time.Since(b.start))
+	dur := ui.FormatDurationSec(time.Since(b.start))
 	stat := b.stats.stats()
 
 	runProgress := func(waits, servs int) string {
 		if waits > 0 {
-			return ui.SGR(ui.BackgroundRed, fmt.Sprintf("%d", waits+servs))
+			return fmt.Sprintf("%d%s", servs, ui.SGR(ui.BackgroundRed, fmt.Sprintf("(+%d)", waits)))
 		}
 		return fmt.Sprintf("%d", servs)
 	}
@@ -264,7 +274,8 @@ func (p *progress) buildSummary(b *Builder) string {
 	remoteServs := b.remoteSema.NumServs() + b.rewrapSema.NumServs()
 	remoteProgress := runProgress(remoteWaits, remoteServs)
 
-	flushProgress := runProgress(hashfs.FlushSemaphore.NumWaits(), hashfs.FlushSemaphore.NumServs())
+	flushGate := b.hashFS.ActiveFlushGate()
+	flushProgress := runProgress(flushGate.NumWaits(), flushGate.NumServs())
 
 	var stepsPerSec string
 	if stat.Done-stat.Skipped > 0 {
@@ -275,13 +286,13 @@ func (p *progress) buildSummary(b *Builder) string {
 		// Use floor to avoid rounding up to 100% when there are cache misses.
 		cacheHitRatio = fmt.Sprintf("cache:%5.02f%% ", math.Floor(float64(stat.CacheHit)/float64(stat.CacheHit+stat.Remote)*10000)/100.0)
 	}
-	var fallback string
-	if stat.LocalFallback > 0 {
-		fallback = "fallback:" + ui.SGR(ui.BackgroundRed, fmt.Sprintf("%d", stat.LocalFallback)) + " "
-	}
 	var cacheWrite string
 	if stat.CacheWrite > 0 {
 		cacheWrite = fmt.Sprintf("cache-write:%d(err:%d) ", stat.CacheWrite, stat.CacheWriteErr)
+	}
+	var fallback string
+	if stat.LocalFallback > 0 {
+		fallback = "fallback:" + ui.SGR(ui.BackgroundRed, fmt.Sprintf("%d", stat.LocalFallback)) + " "
 	}
 	var retry string
 	if stat.RemoteRetry > 0 {
@@ -289,12 +300,57 @@ func (p *progress) buildSummary(b *Builder) string {
 	}
 	b.statusReporter.PlanHasTotalSteps(stat.Total - stat.Skipped)
 
-	return fmt.Sprintf("[%d/%d] %s pre:%s local:%s remote:%s fetch:%s %s%s%s%s%s",
+	msg := fmt.Sprintf("[%d/%d] %s pre:%s local:%s remote:%s fetch:%s %s%s%s%s%s",
 		stat.Done-stat.Skipped, stat.Total-stat.Skipped,
 		dur,
 		preprocProgress, localProgress, remoteProgress, flushProgress,
 		stepsPerSec, cacheHitRatio, cacheWrite, fallback, retry,
 	)
+	if !ui.Default.IsOneTerminalLine(msg) {
+		// msg is too long.
+		// instead of eliding in the middle of status,
+		// eliding status field name to fit on one terminal line.
+		msg = elideStatus(msg)
+	}
+	return msg
+}
+
+func elideStatus(msg string) string {
+	sepSeen := false
+	fieldName := false
+	var sb strings.Builder
+	for i := range len(msg) {
+		ch := msg[i]
+		if fieldName {
+			switch ch {
+			case ':':
+				fieldName = false
+				sb.WriteByte(ch)
+				continue
+			case '-':
+				sepSeen = true
+				fieldName = false
+				continue
+			}
+			continue
+		}
+		if sepSeen {
+			if ch == ' ' {
+				continue
+			}
+			sepSeen = false
+			sb.WriteByte(ch)
+			if ch >= 'a' && ch <= 'z' {
+				fieldName = true
+			}
+			continue
+		}
+		if ch == ' ' {
+			sepSeen = true
+		}
+		sb.WriteByte(ch)
+	}
+	return sb.String()
 }
 
 // appendFrame builds the terminal frame into lines and returns the
@@ -366,14 +422,14 @@ func (p *progress) appendFrame(lines []string, summary string, snapshot []*stepI
 }
 
 // formatStepRow formats one active-step row in the terminal frame:
-// servDuration (or 6 spaces if zero), phase, and description. Rows for
+// displayDuration (or 6 spaces if zero), phase, and description. Rows for
 // fallback or retry phases are colored red.
 func formatStepRow(si *stepInfo) string {
 	phase := si.step.phase()
-	d := si.step.servDuration()
+	d := si.step.displayDuration()
 	durStr := "      "
 	if d > 0 {
-		durStr = fmt.Sprintf("%6s", ui.FormatDuration(d))
+		durStr = fmt.Sprintf("%6s", ui.FormatDurationSec(d))
 	}
 	msg := fmt.Sprintf("  %s [%s] %s", durStr, phase, si.desc)
 	switch phase {
@@ -452,9 +508,9 @@ func (p *progress) report(format string, args ...any) {
 	t := p.ts
 	p.mu.Unlock()
 	var msg string
-	if p.resultstoreUploader != nil {
+	if p.resultSink != nil {
 		msg = fmt.Sprintf(format, args...)
-		p.resultstoreUploader.AddBuildLog(msg + "\n")
+		fmt.Fprintln(p.resultSink, msg)
 	}
 	if ui.IsTerminal() && time.Since(t) < 500*time.Millisecond {
 		return
@@ -492,16 +548,16 @@ func (p *progress) step(b *Builder, step *Step, s string) {
 	p.mu.Unlock()
 	dur := ui.FormatDuration(time.Since(b.start))
 	stat := b.stats.stats()
-	if step != nil && p.resultstoreUploader != nil {
+	if step != nil && p.resultSink != nil {
 		switch {
 		case strings.HasPrefix(s, progressPrefixStart),
 			strings.HasPrefix(s, progressPrefixFinish),
 			strings.HasPrefix(s, progressPrefixError),
 			strings.HasPrefix(s, progressPrefixCacheHit):
-			p.resultstoreUploader.AddBuildLog(fmt.Sprintf("[%d/%d] %s %s\n",
+			fmt.Fprintf(p.resultSink, "[%d/%d] %s %s\n",
 				stat.Done-stat.Skipped, stat.Total-stat.Skipped,
 				dur,
-				s))
+				s)
 		}
 	}
 	var outputResult string
@@ -568,6 +624,14 @@ func (p *progress) step(b *Builder, step *Step, s string) {
 	p.mu.Unlock()
 }
 
+// ProgressInfo holds progress information of the build.
+type ProgressInfo struct {
+	Done        int              `json:"done"`
+	Total       int              `json:"total"`
+	Skipped     int              `json:"skipped"`
+	ActiveSteps []ActiveStepInfo `json:"active_steps,omitempty"`
+}
+
 type ActiveStepInfo struct {
 	ID    string
 	Desc  string
@@ -604,13 +668,13 @@ func (p *progress) ActiveSteps() []ActiveStepInfo {
 	for _, s := range as {
 		var servDur string
 		if dur := s.step.servDuration(); dur > 0 {
-			servDur = ui.FormatDuration(dur)
+			servDur = ui.FormatDurationSec(dur)
 		}
 		activeSteps = append(activeSteps, ActiveStepInfo{
 			ID:      s.step.String(),
 			Desc:    s.desc,
 			Phase:   s.step.phase().String(),
-			Dur:     ui.FormatDuration(now.Sub(s.step.startTime)),
+			Dur:     ui.FormatDurationSec(now.Sub(s.step.startTime)),
 			ServDur: servDur,
 		})
 	}

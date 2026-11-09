@@ -116,6 +116,104 @@ func TestBuild_Depfile_OutputLocalMinimum(t *testing.T) {
 	}
 }
 
+// TestBuild_Depfile_DotDotAcrossSymlink checks that an absolute depfile
+// dependency whose ".." crosses a symlink is kept uncleaned so the OS
+// resolves it, and the second build is a no-op rather than a rebuild.
+func TestBuild_Depfile_DotDotAcrossSymlink(t *testing.T) {
+	if !runInSubProcess(t) {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink/usrmerge path semantics")
+	}
+	ctx := t.Context()
+	dir := tempDir(t)
+
+	runNinja := func(t *testing.T, ds build.DataSource) (build.Stats, error) {
+		t.Helper()
+		opt, graph, cleanup := setupBuild(ctx, t, dir, hashfs.Option{
+			StateFile:   ".siso_fs_state",
+			DataSource:  ds,
+			OutputLocal: func(context.Context, string) bool { return false }, // minimum
+		})
+		defer cleanup()
+		opt.REAPIClient = ds.Client
+		return ninjabuild.Run(ctx, graph, opt, nil, ninjabuild.RunNinjaOpts{})
+	}
+
+	setupFiles(t, dir, t.Name(), nil)
+
+	// "lib" symlinks to "usr/lib", so <sysroot>/lib/../include/... resolves
+	// to <sysroot>/usr/include/... but collapses lexically to a nonexistent
+	// <sysroot>/include/... . Kept outside the workspace to stay absolute.
+	sysroot := filepath.Join(tempDir(t), "sysroot")
+	hdrDir := filepath.Join(sysroot, "usr/include/bits")
+	if err := os.MkdirAll(hdrDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sysroot, "usr/lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hdrDir, "long-double.h"), []byte("// header\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("usr/lib", filepath.Join(sysroot, "lib")); err != nil {
+		t.Fatal(err)
+	}
+	// Concatenate, not filepath.Join, so the ".." survives verbatim.
+	absDep := sysroot + "/lib/../include/bits/long-double.h"
+	if _, err := os.Stat(absDep); err != nil {
+		t.Fatalf("test setup: %q should resolve through the symlink: %v", absDep, err)
+	}
+	depfileContent := []byte("obj/foo.o: " + absDep + "\n")
+
+	fakere := &reapitest.Fake{
+		ExecuteFunc: func(fakere *reapitest.Fake, action *rpb.Action) (*rpb.ActionResult, error) {
+			od, err := fakere.Put(ctx, []byte("foo.o content"))
+			if err != nil {
+				return &rpb.ActionResult{ExitCode: 1, StderrRaw: []byte(err.Error())}, nil
+			}
+			dd, err := fakere.Put(ctx, depfileContent)
+			if err != nil {
+				return &rpb.ActionResult{ExitCode: 1, StderrRaw: []byte(err.Error())}, nil
+			}
+			return &rpb.ActionResult{
+				ExitCode: 0,
+				OutputFiles: []*rpb.OutputFile{
+					{Path: "obj/foo.o", Digest: od},
+					{Path: "obj/foo.o.d", Digest: dd},
+				},
+			}, nil
+		},
+	}
+	var ds build.DataSource
+	defer func() {
+		if err := ds.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	ds.Client = reapitest.New(ctx, t, fakere)
+	ds.Cache = ds.Client.CacheStore()
+
+	t.Logf("-- first build")
+	stats, err := runNinja(t, ds)
+	if err != nil {
+		t.Errorf("ninja %v: want nil err", err)
+	}
+	if stats.Remote != 1 || stats.Done != stats.Total {
+		t.Errorf("remote=%d done=%d total=%d; want remote=1 done=total; %#v", stats.Remote, stats.Done, stats.Total, stats)
+	}
+
+	t.Logf("-- confirm no-op")
+	stats, err = runNinja(t, ds)
+	if err != nil {
+		t.Errorf("ninja %v; want nil err", err)
+	}
+	if stats.Skipped != stats.Done || stats.Done != stats.Total {
+		t.Errorf("skipped=%d done=%d total=%d; want skipped=done=total; %#v", stats.Skipped, stats.Done, stats.Total, stats)
+	}
+}
+
 func TestBuild_Depfile_AsOutput(t *testing.T) {
 	if !runInSubProcess(t) {
 		return
@@ -168,7 +266,7 @@ func TestBuild_Depfile_SandboxedRestriction(t *testing.T) {
 	t.Logf("-- attempting to build with sandboxing restriction active")
 	stats, err := runNinjaTest(t)
 
-	expectedErr := build.DepfileAddsUnsandboxedFileError{Inputs: []string{"../../undeclared.h"}}
+	expectedErr := build.DepsError{UnsandboxedInputs: []string{"../../undeclared.h"}}
 	if !errors.Is(err, expectedErr) {
 		t.Errorf("got error %v, want %v", err, expectedErr)
 	}
@@ -218,7 +316,7 @@ func TestBuild_Depfile_SandboxedRestriction_FirstRunWithoutSandboxing(t *testing
 	t.Logf("-- attempting to build with sandboxing restriction active")
 	stats, err = runNinjaTest(t)
 
-	expectedErr := build.DepfileAddsUnsandboxedFileError{Inputs: []string{"../../undeclared.h"}}
+	expectedErr := build.DepsError{UnsandboxedInputs: []string{"../../undeclared.h"}}
 	if !errors.Is(err, expectedErr) {
 		t.Errorf("got error %v, want %v", err, expectedErr)
 	}
@@ -253,7 +351,7 @@ func TestBuild_Depfile_SandboxedRestriction_Multiple(t *testing.T) {
 	t.Logf("-- attempting to build with sandboxing restriction active")
 	stats, err := runNinjaTest(t)
 
-	expectedErr := build.DepfileAddsUnsandboxedFileError{Inputs: []string{"../../undeclared.h", "../../undeclared2.h"}}
+	expectedErr := build.DepsError{UnsandboxedInputs: []string{"../../undeclared.h", "../../undeclared2.h"}}
 	if !errors.Is(err, expectedErr) {
 		t.Errorf("got error %v, want %v", err, expectedErr)
 	}

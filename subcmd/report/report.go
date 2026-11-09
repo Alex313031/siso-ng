@@ -20,10 +20,10 @@ import (
 
 	"github.com/google/subcommands"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs/osfs"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/signals"
 	"go.chromium.org/build/siso/ui"
 )
@@ -97,8 +97,8 @@ func (c *Command) run(ctx context.Context) error {
 	return c.archive(ctx)
 }
 
-func (c *Command) collect(ctx context.Context) (map[string]digest.Data, error) {
-	report := make(map[string]digest.Data)
+func (c *Command) collect(ctx context.Context) (map[string]blob.Data, error) {
+	report := make(map[string]blob.Data)
 	fsys := os.DirFS(".")
 	wd, err := os.Getwd()
 	if err != nil {
@@ -107,7 +107,7 @@ func (c *Command) collect(ctx context.Context) (map[string]digest.Data, error) {
 	osfs := osfs.New(ctx, "fs", c.osfsopt)
 	rc := &reportCollector{fsys: fsys, osfs: osfs, report: report}
 
-	for _, pat := range []string{"siso*", ".siso*", "args.gn", "gn_logs.txt"} {
+	for _, pat := range []string{"siso*", ".siso*", "args.gn", "gn_logs.txt", "rbe_metrics.pb", "rbe_metrics.txt"} {
 		matches, err := fs.Glob(fsys, pat)
 		if err != nil {
 			return nil, err
@@ -141,7 +141,7 @@ func (c *Command) collect(ctx context.Context) (map[string]digest.Data, error) {
 				clog.Infof(ctx, "%s -> %s", fname, localFname)
 			}
 			src := osfs.FileSource(localFname, -1)
-			data, err := digest.FromLocalFile(ctx, src)
+			data, err := blob.FromLocalFile(ctx, osfs.DigestFunction(), src)
 			if err != nil {
 				clog.Errorf(ctx, "Error to calculate digest %s: %v", fname, err)
 			} else {
@@ -172,7 +172,7 @@ func (c *Command) collect(ctx context.Context) (map[string]digest.Data, error) {
 type reportCollector struct {
 	fsys   fs.FS
 	osfs   *osfs.OSFS
-	report map[string]digest.Data
+	report map[string]blob.Data
 }
 
 func (rc *reportCollector) collectInDir(ctx context.Context, dname string) error {
@@ -194,7 +194,7 @@ func (rc *reportCollector) collectInDir(ctx context.Context, dname string) error
 		}
 		ui.Default.PrintLines(fmt.Sprintf("reading %s", fname))
 		src := rc.osfs.FileSource(fname, -1)
-		data, err := digest.FromLocalFile(ctx, src)
+		data, err := blob.FromLocalFile(ctx, rc.osfs.DigestFunction(), src)
 		if err != nil {
 			clog.Errorf(ctx, "Error to calculate digest %s: %v", fname, err)
 			return nil
@@ -243,7 +243,7 @@ func (c *Command) archive(ctx context.Context) (err error) {
 	now := time.Now()
 	for _, fname := range fnames {
 		ui.Default.PrintLines(fmt.Sprintf("packing %s", fname))
-		buf, err := digest.DataToBytes(ctx, report[fname])
+		buf, err := blob.DataToBytes(ctx, report[fname])
 		if err != nil {
 			return fmt.Errorf("failed to get bytes for %s: %w", fname, err)
 		}

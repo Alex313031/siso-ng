@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/o11y/trace"
 	"go.chromium.org/build/siso/reapi/reapitest"
 )
 
@@ -95,11 +98,18 @@ func TestBuild_Metrics(t *testing.T) {
 	opt.RECacheEnableRead = true
 	opt.RECacheEnableWrite = false
 
+	tracer, err := trace.NewTracer(ctx, filepath.Join(dir, "siso_trace.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracer.Close(ctx)
+	opt.Tracer = tracer
+
 	var metricsBuffer syncBuffer
 	opt.MetricsJSONWriter = &metricsBuffer
 
 	t.Logf("-- first build (should be remote execution)")
-	_, err := ninjabuild.Run(ctx, graph, opt, nil, ninjabuild.RunNinjaOpts{})
+	_, err = ninjabuild.Run(ctx, graph, opt, nil, ninjabuild.RunNinjaOpts{})
 	if err != nil {
 		t.Fatalf("ninja err: %v", err)
 	}
@@ -113,6 +123,11 @@ func TestBuild_Metrics(t *testing.T) {
 		}
 		if m.StepID == "" {
 			continue
+		}
+		if !slices.ContainsFunc(m.Spans, func(span build.MetricSpan) bool {
+			return strings.HasPrefix(span.Name, "step:")
+		}) {
+			t.Errorf(`%s spans %v; want "step:" span`, m.Output(), m.Spans)
 		}
 		switch filepath.Base(m.Output()) {
 		case "local":

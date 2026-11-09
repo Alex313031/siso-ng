@@ -8,17 +8,26 @@ import (
 	"errors"
 	"testing"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/execute"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/ui"
 )
 
 func TestCmdOutput(t *testing.T) {
+	hfs, err := hashfs.New(t.Context(), hashfs.Option{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hfs.Close(t.Context())
 	execcmd := &execute.Cmd{
 		Desc:       "CXX foo.o",
 		ActionName: "cxx",
 		WorkDir:    "out/siso",
-		Outputs:    []string{"out/siso/foo.o"},
+		Outputs:    []path.Path{"out/siso/foo.o"},
+		HashFS:     hfs,
 	}
 	const command = "../../third_party/llvm-build/Release+Asserts/bin/clang++ -c ../../base/base.cc"
 
@@ -127,7 +136,7 @@ foo.d	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0	siso fe
 			result: cmdOutputResultSUCCESS,
 			rule:   "clang/cxx",
 			auxiliary: map[string]digest.Digest{
-				"bar/": digest.EmptyTree,
+				"bar/": digest.SHA256.EmptyTree(),
 			},
 			want: `SUCCESS:  "./foo.o" CXX foo.o
 build step: cxx "./foo.o"
@@ -157,12 +166,59 @@ siso_rule: clang/cxx
 	}
 }
 
+func TestFormatAuxiliaryOutput(t *testing.T) {
+	const sha256Hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	const sha1Hash = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+	sha1fn, err := digest.ParseFunction("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		fname    string
+		d        digest.Digest
+		instance string
+		fn       digest.Function
+		want     string
+	}{
+		{
+			name:     "sha256_emits_no_digest_function_flag",
+			fname:    "foo.d",
+			d:        digest.Digest{Hash: sha256Hash, SizeBytes: 3},
+			instance: "instance",
+			fn:       digest.SHA256,
+			want:     "foo.d\t" + sha256Hash + "/3\tsiso fetch -reapi_instance instance " + sha256Hash + "/3 foo.d",
+		},
+		{
+			name:     "sha1_emits_digest_function_flag",
+			fname:    "foo.d",
+			d:        digest.Digest{Hash: sha1Hash, SizeBytes: 3},
+			instance: "instance",
+			fn:       sha1fn,
+			want:     "foo.d\t" + sha1Hash + "/3\tsiso fetch -reapi_instance instance -reapi_digest_function sha1 " + sha1Hash + "/3 foo.d",
+		},
+		{
+			name:  "tree_with_sha1_keeps_type_flag",
+			fname: "bar/",
+			d:     digest.Digest{Hash: sha1Hash, SizeBytes: 3},
+			fn:    sha1fn,
+			want:  "bar/\t" + sha1Hash + "/3\tsiso fetch -reapi_digest_function sha1 -type=tree-extract " + sha1Hash + "/3 bar/",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatAuxiliaryOutput(tc.fname, tc.d, tc.instance, tc.fn); got != tc.want {
+				t.Errorf("formatAuxiliaryOutput(%q, %s, %q, %s) = %q; want %q", tc.fname, tc.d, tc.instance, tc.fn, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCmdOutputMsg(t *testing.T) {
 	execcmd := &execute.Cmd{
 		Desc:       "CXX foo.o",
 		ActionName: "cxx",
 		WorkDir:    "out/siso",
-		Outputs:    []string{"out/siso/foo.o"},
+		Outputs:    []path.Path{"out/siso/foo.o"},
 	}
 	const shortCommand = "python3 ../../build/gen.py gen/base.txt"
 	const longCommand = "../../third_party/llvm-build/Release+Asserts/bin/clang++ -c ../../base/base.cc -o obj/base/base.o"

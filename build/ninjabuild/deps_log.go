@@ -15,17 +15,20 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	log "github.com/golang/glog"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	pb "go.chromium.org/build/siso/build/ninjabuild/proto"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
 )
 
@@ -66,7 +69,7 @@ type DepsLogKey struct {
 // TODO(b/374196367): use digest for validity of output.
 func checkDepsLogState(ctx context.Context, hashFS *hashfs.HashFS, bpath *build.Path, key DepsLogKey) (DepsLogState, error) {
 	fname := bpath.MaybeFromRelative(ctx, key.Target)
-	fi, err := hashFS.Stat(ctx, bpath.WorkspaceRoot, fname)
+	fi, err := hashFS.Stat(ctx, bpath.WorkspaceRoot, path.New(fname))
 	if err != nil {
 		return DepsLogStale, fmt.Errorf("not found deps output %q: %v", key.Target, err)
 	}
@@ -74,7 +77,7 @@ func checkDepsLogState(ctx context.Context, hashFS *hashfs.HashFS, bpath *build.
 		return DepsLogValid, nil
 	}
 	if !key.Digest.IsZero() {
-		ents, err := hashFS.Entries(ctx, bpath.WorkspaceRoot, []string{fname})
+		ents, err := hashFS.Entries(ctx, bpath.WorkspaceRoot, []path.Path{path.Path(fname)})
 		if err != nil || len(ents) == 0 {
 			return DepsLogStale, fmt.Errorf("output %q entry error %v: ents=%d %v", key.Target, key.Digest, len(ents), err)
 		}
@@ -427,7 +430,7 @@ readLoop:
 	clog.Infof(ctx, "siso deps %s => paths=%d, deps=%d total=%d unique=%d recompact=%t (broken:%t)", d.fname, len(d.paths), len(d.deps), totalRecords, uniqueRecords, d.needsRecompact, broken)
 	d.rPaths = d.paths
 	maps.Copy(d.rPathIdx, d.pathIdx)
-	d.rDeps = d.deps
+	d.rDeps = slices.Clone(d.deps)
 	return nil
 }
 
@@ -495,7 +498,7 @@ func (d *depsLog) Reset() {
 	d.mu.Lock()
 	d.rPaths = d.paths
 	maps.Copy(d.rPathIdx, d.pathIdx)
-	d.rDeps = d.deps
+	d.rDeps = slices.Clone(d.deps)
 	d.mu.Unlock()
 }
 
@@ -552,8 +555,9 @@ func (d *depsLog) recompactIfNeeded(ctx context.Context) error {
 
 	d.mu.Lock()
 	d.rPaths = nd.paths
+	clear(d.rPathIdx)
 	maps.Copy(d.rPathIdx, nd.pathIdx)
-	d.rDeps = nd.deps
+	d.rDeps = slices.Clone(nd.deps)
 
 	d.paths = nd.paths
 	d.pathIdx = nd.pathIdx

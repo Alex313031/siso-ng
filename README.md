@@ -5,7 +5,9 @@ build.
 
 * It is a drop-in replacement for Ninja, which means it can be easily used
   instead of Ninja without requiring a migration or change in developers'
-  workflows.
+  workflows. Siso mainly intends to support `gn` (Chromium) and `soong`
+  (Android); support for other Ninja generators such as `cmake` is optional
+  (see [Key differences from Ninja](./docs/ninja_diff.md)).
 * It runs build actions on RBE natively.
 * It avoids stat, disk and network I/O as much as possible.
 * It reduces CPU usage and memory consumption by sharing a single process

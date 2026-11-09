@@ -68,7 +68,7 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 type source interface {
 	location() string
 	text() string
-	fetch(context.Context) ([]build.ActiveStepInfo, error)
+	fetch(context.Context) (build.ProgressInfo, error)
 }
 
 func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
@@ -102,7 +102,7 @@ func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) 
 	c.loc = src.location()
 	ret := subcommands.ExitSuccess
 	for {
-		activeSteps, err := src.fetch(ctx)
+		progress, err := src.fetch(ctx)
 		if err != nil {
 			if c.termui {
 				fmt.Fprintf(os.Stderr, "\033[H\033[J%s\n", err)
@@ -111,16 +111,18 @@ func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) 
 			}
 			ret = subcommands.ExitFailure
 		} else {
+			header := formatHeader(c.loc, progress)
 			var lines []string
 			if c.termui {
 				// move to 0,0 and clear to the end of screen.
-				lines = append(lines, fmt.Sprintf("\033[H\033[JSiso is running in %s", c.loc))
+				lines = append(lines, fmt.Sprintf("\033[H\033[J%s", header))
 				lines = append(lines, fmt.Sprintf("%10s %9s %s", "DURATION", "PHASE", "DESC"))
 			} else {
 				lines = append(lines, "\f\n")
+				lines = append(lines, header+"\n")
 				lines = append(lines, fmt.Sprintf("%10s %9s %s\n", "DURATION", "PHASE", "DESC"))
 			}
-			c.render(lines, activeSteps)
+			c.render(lines, progress.ActiveSteps)
 		}
 		if c.interval <= 0 {
 			break
@@ -129,7 +131,7 @@ func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) 
 			fmt.Println(src.text())
 			c.termui = false
 			ui.Default = ui.LogUI{}
-			c.render(nil, activeSteps)
+			c.render(nil, progress.ActiveSteps)
 			return ret
 		}
 		select {
@@ -139,6 +141,14 @@ func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) 
 		}
 	}
 	return ret
+}
+
+func formatHeader(loc string, progress build.ProgressInfo) string {
+	if progress.Total > 0 {
+		remaining := max(progress.Total-progress.Done, 0)
+		return fmt.Sprintf("Siso is running in %s [%d/%d (remaining: %d)]", loc, progress.Done, progress.Total, remaining)
+	}
+	return fmt.Sprintf("Siso is running in %s", loc)
 }
 
 func (c *Command) render(lines []string, activeSteps []build.ActiveStepInfo) {

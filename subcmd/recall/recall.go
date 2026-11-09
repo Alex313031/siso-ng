@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,11 +27,12 @@ import (
 	"google.golang.org/protobuf/proto"
 	tspb "google.golang.org/protobuf/types/known/timestamppb"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/auth/cred"
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/merkletree/exporter"
 	"go.chromium.org/build/siso/reapi/merkletree/importer"
 	rbepb "go.chromium.org/build/siso/reapi/proto"
@@ -68,7 +70,7 @@ You can omit <dir> if it is current directory ".".
 `
 
 // Cmd returns the Command for the `recall` subcommand provided by this package.
-func Cmd(authOpts cred.Options) *Command {
+func Cmd(authOpts func() cred.Options) *Command {
 	return &Command{
 		authOpts: authOpts,
 	}
@@ -89,7 +91,7 @@ func (*Command) Usage() string {
 // Command implements recall subcomand.
 type Command struct {
 	Flags             *flag.FlagSet
-	authOpts          cred.Options
+	authOpts          func() cred.Options
 	projectID         string
 	reopt             *reapi.Option
 	executeRequestStr string
@@ -144,7 +146,7 @@ func (c *Command) run(ctx context.Context) error {
 			return fmt.Errorf("reapi option is invalid: %w", err)
 		}
 		if c.reopt.NeedCred() {
-			credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts)
+			credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts())
 			if err != nil {
 				return err
 			}
@@ -267,12 +269,12 @@ func (c *Command) call(ctx context.Context, reopt reapi.Option, credential cred.
 	fmt.Printf("ToolInvocationID: %s\n", toolInvocationID)
 	fmt.Printf("ActionID: %s\n", actionID)
 
-	ds := digest.NewStore()
+	ds := blob.NewStore()
 	var inputRootDigest digest.Digest
 	_, err = os.Stat("root")
 	if err == nil {
 		fmt.Printf("input root from root/: ")
-		var im importer.Importer
+		im := importer.Importer{Fn: client.DigestFunction()}
 		inputRootDigest, err = im.Import(ctx, "root", ds)
 		if err != nil {
 			return err
@@ -294,7 +296,7 @@ func (c *Command) call(ctx context.Context, reopt reapi.Option, credential cred.
 			return err
 		}
 		platform = command.Platform
-		data, err := digest.FromProtoMessage(command)
+		data, err := blob.FromProtoMessage(client.DigestFunction(), command)
 		if err != nil {
 			return err
 		}
@@ -321,7 +323,7 @@ func (c *Command) call(ctx context.Context, reopt reapi.Option, credential cred.
 		action.InputRootDigest = inputRootDigest.Proto()
 	}
 	log.Infof("action: %s", action)
-	data, err := digest.FromProtoMessage(action)
+	data, err := blob.FromProtoMessage(client.DigestFunction(), action)
 	if err != nil {
 		return err
 	}
@@ -377,28 +379,19 @@ func printActionResult(result *rpb.ActionResult) {
 		fmt.Printf("stderr: %v\n", result.GetStderrDigest())
 	}
 	md := result.GetExecutionMetadata()
-	queueTime := timestampSub(md.GetWorkerStartTimestamp(), md.GetQueuedTimestamp())
-	workerTime := timestampSub(md.GetWorkerCompletedTimestamp(), md.GetWorkerStartTimestamp())
-	preInputTime := timestampSub(md.GetInputFetchStartTimestamp(), md.GetWorkerStartTimestamp())
-	inputTime := timestampSub(md.GetInputFetchCompletedTimestamp(), md.GetInputFetchStartTimestamp())
-	preExecTime := timestampSub(md.GetExecutionStartTimestamp(), md.GetInputFetchCompletedTimestamp())
-	execTime := timestampSub(md.GetExecutionCompletedTimestamp(), md.GetExecutionStartTimestamp())
-	postExecTime := timestampSub(md.GetOutputUploadStartTimestamp(), md.GetExecutionCompletedTimestamp())
-	outputTime := timestampSub(md.GetOutputUploadCompletedTimestamp(), md.GetOutputUploadStartTimestamp())
-	postOutputTime := timestampSub(md.GetWorkerCompletedTimestamp(), md.GetOutputUploadCompletedTimestamp())
 	fmt.Printf("execution metadata:\n")
 	fmt.Printf("  worker ID: %s\n", md.GetWorker())
 	fmt.Printf("  queue:\n")
-	fmt.Printf("     wait  : %16s since %s\n", queueTime, md.GetQueuedTimestamp().AsTime())
+	fmt.Printf("     wait  : %s\n", formatDurationSince(md.GetWorkerStartTimestamp(), md.GetQueuedTimestamp()))
 	fmt.Printf("  worker:\n")
-	fmt.Printf("     (gap) : %16s since %s\n", preInputTime, md.GetWorkerStartTimestamp().AsTime())
-	fmt.Printf("    input  : %16s since %s\n", inputTime, md.GetInputFetchStartTimestamp().AsTime())
-	fmt.Printf("     (gap) : %16s since %s\n", preExecTime, md.GetInputFetchCompletedTimestamp().AsTime())
-	fmt.Printf("    exec   : %16s since %s\n", execTime, md.GetExecutionStartTimestamp().AsTime())
-	fmt.Printf("     (gap) : %16s since %s\n", postExecTime, md.GetExecutionCompletedTimestamp().AsTime())
-	fmt.Printf("    output : %16s since %s\n", outputTime, md.GetOutputUploadStartTimestamp().AsTime())
-	fmt.Printf("     (gap) : %16s since %s\n", postOutputTime, md.GetOutputUploadCompletedTimestamp().AsTime())
-	fmt.Printf("   total   : %16s until %s\n", workerTime, md.GetWorkerCompletedTimestamp().AsTime())
+	fmt.Printf("     (gap) : %s\n", formatDurationSince(md.GetInputFetchStartTimestamp(), md.GetWorkerStartTimestamp()))
+	fmt.Printf("    input  : %s\n", formatDurationSince(md.GetInputFetchCompletedTimestamp(), md.GetInputFetchStartTimestamp()))
+	fmt.Printf("     (gap) : %s\n", formatDurationSince(md.GetExecutionStartTimestamp(), md.GetInputFetchCompletedTimestamp()))
+	fmt.Printf("    exec   : %s\n", formatDurationSince(md.GetExecutionCompletedTimestamp(), md.GetExecutionStartTimestamp()))
+	fmt.Printf("     (gap) : %s\n", formatDurationSince(md.GetOutputUploadStartTimestamp(), md.GetExecutionCompletedTimestamp()))
+	fmt.Printf("    output : %s\n", formatDurationSince(md.GetOutputUploadCompletedTimestamp(), md.GetOutputUploadStartTimestamp()))
+	fmt.Printf("     (gap) : %s\n", formatDurationSince(md.GetWorkerCompletedTimestamp(), md.GetOutputUploadCompletedTimestamp()))
+	fmt.Printf("   total   : %s\n", formatDurationUntil(md.GetWorkerCompletedTimestamp(), md.GetWorkerStartTimestamp()))
 	auxes := md.GetAuxiliaryMetadata()
 	if len(auxes) > 0 {
 		fmt.Printf("  auxiliary:\n")
@@ -427,10 +420,46 @@ func printActionResult(result *rpb.ActionResult) {
 	}
 }
 
-func timestampSub(t1, t2 *tspb.Timestamp) time.Duration {
-	time1 := t1.AsTime()
-	time2 := t2.AsTime()
-	return time1.Sub(time2)
+func formatDurationSince(end, start *tspb.Timestamp) string {
+	if end == nil {
+		return "no range"
+	}
+	err := end.CheckValid()
+	if err != nil {
+		return fmt.Sprintf("invalid start: %v", err)
+	}
+	if start == nil {
+		return fmt.Sprintf("%16s since %s", "unfinished", start.AsTime())
+	}
+	err = start.CheckValid()
+	if err != nil {
+		return fmt.Sprintf("%16s since %s : %v", "invalid end", start.AsTime(), err)
+	}
+	return fmt.Sprintf("%16s since %s", timestampSub(end, start), start.AsTime())
+}
+
+func formatDurationUntil(end, start *tspb.Timestamp) string {
+	if start == nil {
+		return "no range"
+	}
+	err := start.CheckValid()
+	if err != nil {
+		return fmt.Sprintf("invalid start: %v", err)
+	}
+	if end == nil {
+		return "unfinished"
+	}
+	err = end.CheckValid()
+	if err != nil {
+		return fmt.Sprintf("invalid end: %v", err)
+	}
+	return fmt.Sprintf("%16s until %s", timestampSub(end, start), end.AsTime())
+}
+
+func timestampSub(end, start *tspb.Timestamp) time.Duration {
+	endTime := end.AsTime()
+	startTime := start.AsTime()
+	return endTime.Sub(startTime)
 }
 
 func loadTextProto(fname string, p proto.Message) error {
@@ -469,9 +498,26 @@ func (c *Command) callLocal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if command.WorkingDirectory != "" && !filepath.IsLocal(command.WorkingDirectory) {
+		return fmt.Errorf("working_directory %q is not under exec_root", command.WorkingDirectory)
+	}
 	wd := filepath.Join(root, command.WorkingDirectory)
-	for _, output := range command.OutputFiles {
-		odir := filepath.Join(wd, filepath.Dir(output))
+	outdirs := slices.Clone(command.OutputDirectories) //nolint:staticcheck // existing deprecation
+	for _, output := range slices.Concat(
+		command.OutputFiles, //nolint:staticcheck // existing deprecation
+		command.OutputPaths,
+	) {
+		outdirs = append(outdirs, filepath.Dir(output))
+	}
+	for _, outdir := range outdirs {
+		odir := filepath.Join(wd, outdir)
+		rel, err := filepath.Rel(root, odir)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsLocal(rel) {
+			return fmt.Errorf("output %q is not under exec_root", rel)
+		}
 		err = os.MkdirAll(odir, 0755)
 		if err != nil {
 			return err

@@ -88,11 +88,16 @@ type chunk struct {
 
 // splitIntoChunks splits buf into chunks.
 func splitIntoChunks(ctx context.Context, buf []byte) []chunk {
+	if len(buf) == 0 {
+		return nil
+	}
 	defer trace.StartRegion(ctx, "ninja.split").End()
 	chunkCount := runtime.GOMAXPROCS(0)
 	chunkSize := max(1024*1024, len(buf)/chunkCount+1)
 
-	chunks := make([]chunk, 0, chunkCount)
+	// Most subninja files fit in one chunk. Avoid reserving one slot per CPU
+	// for every file.
+	chunks := make([]chunk, 0, (len(buf)-1)/chunkSize+1)
 	start := 0
 	for start < len(buf) {
 		next := min(start+chunkSize, len(buf))
@@ -158,12 +163,12 @@ loop:
 			continue
 		case '#':
 			// comment line
+			ch.ncomment++
 			j := bytes.IndexByte(buf[i+1:], '\n')
-			if i < 0 { // each EOF
+			if j < 0 { // each EOF
 				break loop
 			}
 			i = i + j + 1
-			ch.ncomment++
 			continue
 
 		case '\t':
@@ -175,13 +180,10 @@ loop:
 			switch lastStatement {
 			case statementBuild:
 				st = statementBuildVar
-				ch.nbuildvar++
 			case statementPool:
 				st = statementPoolVar
-				ch.npoolvar++
 			case statementRule:
 				st = statementRuleVar
-				ch.nrulevar++
 			default:
 				return fmt.Errorf("line:%d: unexpected indent: %q", lineno(buf, i), buf[i:e])
 			}
@@ -195,6 +197,14 @@ loop:
 				}
 				return fmt.Errorf("line:%d: wrong var binding? %q", lineno(buf, i), buf[i:e])
 			}
+			switch st {
+			case statementBuildVar:
+				ch.nbuildvar++
+			case statementPoolVar:
+				ch.npoolvar++
+			case statementRuleVar:
+				ch.nrulevar++
+			}
 			ch.statements = append(ch.statements, statement{
 				t: st,
 				s: i,
@@ -202,7 +212,6 @@ loop:
 				e: e,
 			})
 			i = e
-			ch.nvar++
 			continue
 
 		case 'b':
@@ -621,8 +630,9 @@ func (ch *chunk) parseBuild(i int) (int, error) {
 			return 0, err
 		}
 		edge.inputs = append(edge.inputs, n)
-		n.nouts.Add(1)
-		// link out edge later
+		if !n.hasOut.Load() {
+			n.hasOut.Store(true)
+		}
 	}
 	edge.implicitDeps = implicit
 	edge.orderOnlyDeps = orderOnly
@@ -758,7 +768,7 @@ func (ch *chunk) parsePool(i int, pool *Pool) (int, error) {
 	n := ch.countStatement(i, statementPoolVar)
 	poolScope.set(ch.buf, ch.statements[i:i+n])
 	i += n
-	v, ok := poolScope.lookupVar(ch.statements[i].pos, []byte("depth"))
+	v, ok := poolScope.lookupVar(ch.statements[i-1].pos+1, []byte("depth"))
 	if !ok {
 		return 0, fmt.Errorf("line:%d expect 'depth=' line", lineno(ch.buf, st.s))
 	}

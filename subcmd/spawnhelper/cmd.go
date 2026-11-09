@@ -10,6 +10,8 @@ import (
 	"flag"
 
 	"github.com/google/subcommands"
+
+	"go.chromium.org/build/siso/execute/spawnhelper"
 )
 
 // Cmd returns the spawn-helper subcommand.
@@ -19,8 +21,7 @@ func Cmd() *Command {
 
 // Command implements the spawn-helper subcommand.
 type Command struct {
-	connFD  int
-	logFile string
+	server spawnhelper.Server
 }
 
 func (*Command) Name() string { return "spawn-helper" }
@@ -36,8 +37,7 @@ actions, to avoid fork()ing its large heap.
 }
 
 func (c *Command) SetFlags(f *flag.FlagSet) {
-	f.IntVar(&c.connFD, "conn-fd", 0, "inherited socketpair fd to serve the spawn protocol on")
-	f.StringVar(&c.logFile, "log-file", "", "file for the helper's diagnostics (default: stderr)")
+	c.server.RegisterFlags(f)
 }
 
 var _ subcommands.Command = (*Command)(nil)

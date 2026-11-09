@@ -222,6 +222,8 @@ func (f *Frontend) PrintLines(msgs ...string) {
 	f.message(pb.Status_Message_INFO, strings.Join(msgs, "\n"))
 }
 
+func (*Frontend) IsOneTerminalLine(string) bool { return true }
+
 type frontendSpinner struct {
 	f   *Frontend
 	msg string

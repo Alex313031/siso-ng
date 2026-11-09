@@ -16,6 +16,7 @@ import (
 
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi/merkletree"
 )
 
@@ -28,6 +29,8 @@ func (g fakeGraph) NumTargets() int { return len(g.inputDeps) }
 func (fakeGraph) Targets(ctx context.Context, args ...string) ([]Target, error) {
 	return nil, nil
 }
+
+func (fakeGraph) LookupTarget(string) (Target, bool) { return 0, false }
 
 func (fakeGraph) SpellcheckTarget(string) (string, error) { return "", errors.New("spellcheck error") }
 
@@ -46,6 +49,8 @@ func (g fakeGraph) InputDeps(ctx context.Context) map[string][]string {
 func (fakeGraph) InputsRequiringClangScandeps(ctx context.Context) []string { return nil }
 
 func (fakeGraph) ClangScandeps(ctx context.Context) string { return "" }
+
+func (fakeGraph) EnvConfig(ctx context.Context) *EnvConfig { return nil }
 
 func (g fakeGraph) StepLimits(ctx context.Context) map[string]int {
 	return map[string]int{}
@@ -157,7 +162,7 @@ func TestDepsGCCFixCmdInputs_ios(t *testing.T) {
 				t.Logf("tree of %s: not found: %v", dir, err)
 				return merkletree.TreeEntry{}, err
 			}
-			return merkletree.TreeEntry{Name: dir}, nil
+			return merkletree.TreeEntry{Name: path.Path(dir)}, nil
 		},
 	}
 
@@ -285,7 +290,7 @@ func TestDepsGCCFixCmdInputs_chromeos(t *testing.T) {
 				t.Logf("tree of %s: not found: %v", dir, err)
 				return merkletree.TreeEntry{}, err
 			}
-			return merkletree.TreeEntry{Name: resolveddir}, nil
+			return merkletree.TreeEntry{Name: path.Path(resolveddir)}, nil
 		},
 	}
 

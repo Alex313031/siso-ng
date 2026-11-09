@@ -16,7 +16,7 @@ import (
 )
 
 // LoginCmd creates new LoginCommand.
-func LoginCmd(authOpts cred.Options) *LoginCommand {
+func LoginCmd(authOpts func() cred.Options) *LoginCommand {
 	return &LoginCommand{
 		authOpts: authOpts,
 	}
@@ -31,19 +31,20 @@ func (*LoginCommand) Synopsis() string {
 }
 
 func (*LoginCommand) Usage() string {
-	return "login to siso system."
+	return "login to siso system.\n"
 }
 
 // LoginCommand implements login subcommand.
 type LoginCommand struct {
-	authOpts cred.Options
+	authOpts func() cred.Options
 }
 
 func (*LoginCommand) SetFlags(flagSet *flag.FlagSet) {}
 
 func (c *LoginCommand) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	fmt.Printf("using %s for auth\n", c.authOpts.Type)
-	err := c.authOpts.Login(ctx)
+	authOps := c.authOpts()
+	fmt.Printf("using %s for auth\n", authOps.Type)
+	err := authOps.Login(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		fmt.Fprintf(os.Stderr, "run `siso auth-check` to check auth status?\n")

@@ -138,17 +138,44 @@ func TestPathFilter(t *testing.T) {
 				"foo/bar.ts",
 			},
 		},
+		{
+			name: "PatternsDirPrefix",
+			pf: &PathFilter{
+				Patterns: []string{
+					// always includes *.h even under out/soong/.intermediates
+					"*.h",
+					// all excludes under out/soong/.intermediates
+					"!out/soong/.intermediates/**",
+					// includes out of out/soong/.intermediates
+					"*",
+				},
+			},
+			matches: []string{
+				"foo.h",
+				"foo.o",
+				"foo/foo.h",
+				"foo/foo.o",
+				"out/soong/.intermediates/foo.h",
+				"out/soong/.intermediates/foo/foo.h",
+			},
+			nonmatches: []string{
+				"out/soong/.intermediates/foo.o",
+				"out/soong/.intermediates/foo/foo.o",
+				"out/soong/.intermediates/bar",
+				"out/soong/.intermediates/bar/bar",
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
-			f := tc.pf.filter(ctx, t.Name())
+			f := tc.pf.Filter(ctx, t.Name())
 			for _, p := range tc.matches {
-				if !f(ctx, p, false) {
+				if !f(ctx, p, true) {
 					t.Errorf("f(ctx, %q, false)=false; want=true", p)
 				}
 			}
 			for _, p := range tc.nonmatches {
-				if f(ctx, p, false) {
+				if f(ctx, p, true) {
 					t.Errorf("f(ctx, %q, false)=true; want=false", p)
 				}
 			}

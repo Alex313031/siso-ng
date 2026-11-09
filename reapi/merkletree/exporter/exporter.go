@@ -18,18 +18,20 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/merkletree"
 	"go.chromium.org/build/siso/sync/semaphore"
 )
 
 // Client is an interface to access CAS.
 type Client interface {
+	DigestFunction() digest.Function
 	Get(context.Context, digest.Digest, string) ([]byte, error)
-	FetchTree(context.Context, string, digest.Digest, *digest.Store) (*rpb.Directory, error)
+	FetchTree(context.Context, string, digest.Digest, *blob.Store) (*rpb.Directory, error)
 }
 
 // Exporter is an exporter.
@@ -162,12 +164,12 @@ func (e *Exporter) exportFile(ctx context.Context, fname string, d digest.Digest
 // If w is given, it will show the directory entries without extracting
 // into dir.
 func (e *Exporter) ExportTree(ctx context.Context, dir string, d digest.Digest, w io.Writer) error {
-	ds := digest.NewStore()
+	ds := blob.NewStore()
 	root, err := e.client.FetchTree(ctx, dir, d, ds)
 	if err != nil {
 		return err
 	}
-	files, symlinks, dirs := merkletree.Traverse(ctx, dir, root, ds)
+	files, symlinks, dirs := merkletree.Traverse(ctx, e.client.DigestFunction(), dir, root, ds)
 	if w == nil {
 		for _, file := range files {
 			e.eg.Go(func() error {

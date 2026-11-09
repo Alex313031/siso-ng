@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -30,12 +31,18 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
+	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/hashfs/osfs"
 	pb "go.chromium.org/build/siso/hashfs/proto"
 	"go.chromium.org/build/siso/mmapfile"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
+	"go.chromium.org/build/siso/resource"
+	"go.chromium.org/build/siso/toolsupport/abfsutil"
 	"go.chromium.org/build/siso/toolsupport/cartfsutil"
 	"go.chromium.org/build/siso/toolsupport/cogutil"
 )
@@ -58,6 +65,12 @@ type IgnoreFunc func(context.Context, string) bool
 
 // Option is an option for HashFS.
 type Option struct {
+	BuildLabel string // The active build label being built (if any).
+
+	// DigestFunction is the content digest function. The zero value means
+	// SHA-256.
+	DigestFunction digest.Function
+
 	StateFile       string // filename that HashFS saves its state to
 	CompressLevel   int    // compression level (0 = uncompressed, 1 = fastest, 10 = best)
 	CompressThreads int    // number of threads to use for data compression
@@ -69,6 +82,12 @@ type Option struct {
 
 	MinFlushTimeout time.Duration // minimum timeout to flush operation (>= 10s)
 
+	// FlushGate, when non-nil, is the adaptive flush admission gate
+	// used instead of the static FlushSemaphore. Set by subcmd/ninja
+	// only when the adaptive-flush experiment is enabled; nil keeps
+	// the static semaphore.
+	FlushGate *resource.Network
+
 	OSFSOption osfs.Option
 
 	FSMonitor FSMonitor
@@ -78,12 +97,14 @@ type Option struct {
 	Ignore      IgnoreFunc
 	CogFS       *cogutil.Client
 	CartFS      *cartfsutil.Client
+	ABFS        *abfsutil.Client
 
 	SetStateLogger io.Writer // capture SetState log for test
 }
 
 // RegisterFlags registers flags for the option.
 func (o *Option) RegisterFlags(flagSet *flag.FlagSet) {
+	flagSet.StringVar(&o.BuildLabel, "build_label", "", "The active build label being built")
 	flagSet.StringVar(&o.StateFile, "fs_state", defaultStateFile, "fs state filename")
 	flagSet.IntVar(&o.CompressLevel, "fs_state_compression_level", 1, "fs state compression level (1 = fastest, 10 = best)")
 	flagSet.IntVar(&o.CompressThreads, "fs_state_compression_threads", defaultCompressThreads, "number of threads to use for data compression")
@@ -96,7 +117,7 @@ func (o *Option) RegisterFlags(flagSet *flag.FlagSet) {
 
 // DataSource is an interface to get digest source for digest and its name.
 type DataSource interface {
-	Source(context.Context, digest.Digest, string) digest.Source
+	Source(context.Context, digest.Digest, string) blob.Source
 }
 
 const (
@@ -453,33 +474,39 @@ func (ies *initialEntryStates) prepare(ctx context.Context, state *pb.State) {
 
 // updateFromDisk updates file entries from *pb.State and local disk
 // and returns previouslyGeneratedFiles and taintedFiles.
-func (ies *initialEntryStates) updateFromDisk(ctx context.Context) ([]string, []string, error) {
+func (ies *initialEntryStates) updateFromDisk(ctx context.Context) ([]path.Path, []string, error) {
 	started := time.Now()
 	eg, ctx := errgroup.WithContext(ctx)
-	eg.SetLimit(runtime.GOMAXPROCS(0))
-	for i := range ies.alloc {
+	// Split the entries into one contiguous chunk per worker instead of starting a goroutine
+	// per entry, which costs more than the stat itself for states with many entries.
+	nworkers := runtime.GOMAXPROCS(0)
+	for chunk := range slices.Chunk(ies.alloc, max(1, (len(ies.alloc)+nworkers-1)/nworkers)) {
 		eg.Go(func() error {
-			if i%1000 == 0 {
-				select {
-				case <-ctx.Done():
-					err := context.Cause(ctx)
+			for i := range chunk {
+				if i%1000 == 0 {
+					select {
+					case <-ctx.Done():
+						return context.Cause(ctx)
+					default:
+					}
+				}
+				if err := ies.updateEntryFromDisk(ctx, &chunk[i]); err != nil {
 					return err
-				default:
 				}
 			}
-			es := &ies.alloc[i]
-			return ies.updateEntryFromDisk(ctx, es)
+			return nil
 		})
 	}
 	err := eg.Wait()
 	if err != nil {
 		return nil, nil, err
 	}
-	var previouslyGeneratedFiles, taintedFiles []string
+	var previouslyGeneratedFiles []path.Path
+	var taintedFiles []string
 	for i := range ies.alloc {
 		es := &ies.alloc[i]
 		if es.prevGenerated {
-			previouslyGeneratedFiles = append(previouslyGeneratedFiles, es.ent.Name)
+			previouslyGeneratedFiles = append(previouslyGeneratedFiles, path.Path(es.ent.Name))
 		}
 		if es.tainted {
 			taintedFiles = append(taintedFiles, es.ent.Name)
@@ -583,7 +610,7 @@ func (ies *initialEntryStates) initStateEntry(ctx context.Context, es *entryStat
 		mode |= 0111
 	}
 	var dir *directory
-	var src digest.Source
+	var src blob.Source
 	entDigest := toDigest(es.ent.Digest)
 	if !entDigest.IsZero() {
 		es.ftype = "file"
@@ -679,9 +706,19 @@ func (ies *initialEntryStates) initFile(ctx context.Context, es *entryState, fi 
 		// don't reconcile for source (non-generated file),
 		// as user may want to trigger build by touch.
 		src := ies.osfs.FileSource(es.ent.Name, fi.Size())
-		data, err := localDigest(ctx, src, es.ent.Name)
+		data, err := localDigest(ctx, ies.osfs.DigestFunction(), src, es.ent.Name)
 		if err == nil && data.Digest() == es.e.d {
+			if es.et == entryAfterLocal {
+				// initStateEntry queued true to lready for entryAfterLocal (meaning
+				// local file is not ready and needs flush). Since the local file
+				// digest matches state, drain and close lready to mark it ready on
+				// disk like entryEqLocal.
+				lready := make(chan bool, 1)
+				close(lready)
+				es.e.lready = lready
+			}
 			es.et = entryEqLocal
+			es.e.src = src
 			err = ies.osfs.Chtimes(ctx, es.ent.Name, time.Now(), es.e.mtime)
 			clog.Infof(ctx, "reconcile mtime %q %v -> %v: %v", es.ent.Name, fi.ModTime(), es.e.mtime, err)
 		} else {
@@ -720,15 +757,30 @@ func (ies *initialEntryStates) handleBeforeLocal(ctx context.Context, es *entryS
 	ies.ninvalidate.Add(1)
 	ies.dirty.Store(true)
 	if !es.prevGenerated || !ies.keepTainted {
+		clog.Warningf(ctx, "invalidate %s %q: state:%s disk:%s, prevGenerated:%t, keepTainted:%t", es.ftype, es.ent.Name, es.e.mtime, fi.ModTime(), es.prevGenerated, ies.keepTainted)
 		es.ftype = ""
-		clog.Warningf(ctx, "invalidate %s %q: state:%s disk:%s", es.ftype, es.ent.Name, es.e.mtime, fi.ModTime())
 		return nil
+	}
+	if es.ftype == "file" {
+		src := ies.osfs.FileSource(es.ent.Name, fi.Size())
+		data, err := localDigest(ctx, ies.osfs.DigestFunction(), src, es.ent.Name)
+		if err != nil {
+			clog.Warningf(ctx, "failed to calculate digest for tainted %q: %v", es.ent.Name, err)
+			es.ftype = ""
+			return nil
+		}
+		es.e.size = fi.Size()
+		es.e.src = src
+		es.e.d = data.Digest()
 	}
 	es.tainted = true
 	clog.Warningf(ctx, "keep tainted %s %q: state:%s disk:%s", es.ftype, es.ent.Name, es.e.mtime, fi.ModTime())
 	// keep this entry to preserve cmdhash
 	// but use mtime of actual file.
 	es.e.mtime = fi.ModTime()
+	if es.e.updatedTime.Before(es.e.mtime) {
+		es.e.updatedTime = es.e.mtime
+	}
 	return nil
 }
 
@@ -798,7 +850,7 @@ func (ies *initialEntryStates) storeEntries(ctx context.Context, hfs *HashFS, ke
 				if !keep(es.ftype) {
 					continue
 				}
-				if _, err := hfs.directory.store(ctx, es.ent.Name, &es.e); err != nil {
+				if _, err := hfs.directory.store(ctx, path.Path(es.ent.Name), &es.e); err != nil {
 					return fmt.Errorf("failed to store %s %q: %w", es.ftype, es.ent.Name, err)
 				}
 			}
@@ -824,7 +876,7 @@ func (ies *initialEntryStates) storeNonDirs(ctx context.Context, hfs *HashFS) er
 func (ies *initialEntryStates) triggerDigestCalculation(ctx context.Context, hfs *HashFS) {
 	start := time.Now()
 	for _, fname := range ies.missingDigests {
-		hfs.Stat(ctx, "", fname) // access and trigger lazy digest calculation
+		hfs.Stat(ctx, "", path.Path(fname)) // access and trigger lazy digest calculation
 	}
 	clog.Infof(ctx, "set missing_digests=%d: %s", len(ies.missingDigests), time.Since(start))
 }
@@ -841,10 +893,29 @@ func (ies *initialEntryStates) info() string {
 		len(ies.missingDigests))
 }
 
+// discardOnFunctionMismatch returns state if its digest function matches fn,
+// otherwise an empty state with discarded=true. The persisted digests
+// are only valid for the function that computed them, so trusting them under a
+// different -reapi_digest_function would yield wrong cache keys or stale no-ops.
+// An empty state carries no digests, so it is never a mismatch: a fresh build
+// under any function starts from an empty state without a spurious discard.
+func discardOnFunctionMismatch(ctx context.Context, fn digest.Function, state *pb.State) (*pb.State, bool) {
+	if len(state.GetEntries()) == 0 {
+		return state, false
+	}
+	if fn.Matches(rpb.DigestFunction_Value(state.GetDigestFunction())) {
+		return state, false
+	}
+	clog.Warningf(ctx, "digest function changed (state=%d, current=%d); discarding persisted fs state", state.GetDigestFunction(), int32(fn.Value()))
+	return &pb.State{}, true
+}
+
 // SetState sets states to the HashFS.
 func (hfs *HashFS) SetState(ctx context.Context, state *pb.State) error {
 	defer trace.Begin(ctx, "hashfs.SetState").End()
 	start := time.Now()
+
+	state, _ = discardOnFunctionMismatch(ctx, hfs.opt.DigestFunction, state)
 
 	octx := ctx // preserve original ctx
 	logw := hfs.opt.SetStateLogger
@@ -896,6 +967,8 @@ func (hfs *HashFS) SetState(ctx context.Context, state *pb.State) error {
 	}
 
 	hfs.setStateCh = make(chan error, 1)
+
+	hfs.loadBuildLabels(ctx, state, initial)
 
 	clean := initial.clean()
 	hfs.clean.Store(clean)
@@ -1006,10 +1079,10 @@ func (c *zstdCompressor) Compress(out, data []byte) (int, error) {
 	indexPayload := 4 + c.numFrames*8
 	headerSize := len(zstdEmptyFrame) + 8 + indexPayload
 	type frameSlot struct {
-		dataStart  int // offset in out where compressed data begins
-		maxSize    int // worst-case compressed size for this frame
-		compSize   int // actual compressed size (filled after compression)
-		uncompSize int // uncompressed size of the input chunk
+		dataStart  int    // offset in out where compressed data begins
+		maxSize    int    // worst-case compressed size for this frame
+		result     []byte // compressed data (may be backed by out[dataStart:] or reallocated)
+		uncompSize int    // uncompressed size of the input chunk
 	}
 	slots := make([]frameSlot, c.numFrames)
 	offset := headerSize
@@ -1029,8 +1102,7 @@ func (c *zstdCompressor) Compress(out, data []byte) (int, error) {
 		slot := &slots[i]
 		eg.Go(func() error {
 			dst := out[slot.dataStart : slot.dataStart : slot.dataStart+slot.maxSize]
-			result := c.enc.EncodeAll(chunk, dst)
-			slot.compSize = len(result)
+			slot.result = c.enc.EncodeAll(chunk, dst)
 			return nil
 		})
 		offset += maxSize
@@ -1040,14 +1112,15 @@ func (c *zstdCompressor) Compress(out, data []byte) (int, error) {
 	}
 
 	// Compact: move each frame's actual data to be contiguous (removing
-	// the gaps from worst-case over-estimation).
+	// the gaps from worst-case over-estimation, or copying from a
+	// reallocated buffer if EncodeAll grew past dst's capacity).
 	writePos := headerSize
 	for i := range slots {
 		s := &slots[i]
-		if writePos != s.dataStart {
-			copy(out[writePos:], out[s.dataStart:s.dataStart+s.compSize])
+		if len(s.result) > 0 && &s.result[0] != &out[writePos] {
+			copy(out[writePos:], s.result)
 		}
-		writePos += s.compSize
+		writePos += len(s.result)
 	}
 
 	// Write the empty frame + skippable frame header + index at the beginning.
@@ -1059,7 +1132,7 @@ func (c *zstdCompressor) Compress(out, data []byte) (int, error) {
 	binary.LittleEndian.PutUint32(out[pos:], zstdIndexVersion)
 	pos += 4
 	for _, s := range slots {
-		binary.LittleEndian.PutUint32(out[pos:], uint32(s.compSize))
+		binary.LittleEndian.PutUint32(out[pos:], uint32(len(s.result)))
 		pos += 4
 		binary.LittleEndian.PutUint32(out[pos:], uint32(s.uncompSize))
 		pos += 4
@@ -1274,7 +1347,7 @@ func (hfs *HashFS) State(ctx context.Context) *pb.State {
 					state.MissingDigests = append(state.MissingDigests, name)
 				} else if len(e.cmdhash) > 0 {
 					clog.Warningf(ctx, "need to calculate digest for %s: cmdhash=%v", name, e.cmdhash)
-					err := e.compute(ctx, name)
+					err := e.compute(ctx, hfs.opt.DigestFunction, name)
 					if err != nil {
 						clog.Warningf(ctx, "failed to calculate digest for %s: %v", name, err)
 						state.MissingDigests = append(state.MissingDigests, name)
@@ -1330,6 +1403,7 @@ func (hfs *HashFS) State(ctx context.Context) *pb.State {
 			}
 		}
 	}
+	state.DigestFunction = int32(hfs.opt.DigestFunction.Value())
 	if hfs.opt.FSMonitor != nil {
 		token, err := hfs.opt.FSMonitor.ClockToken(ctx)
 		if err != nil {
@@ -1350,11 +1424,15 @@ func (hfs *HashFS) State(ctx context.Context) *pb.State {
 		}
 		return true
 	})
+
+	hfs.saveBuildLabels(state)
+
 	clog.Infof(ctx, "state %d entries token:%q buildTargets:%v: missingOutputs:%d missingDigests:%d %s", len(state.Entries), state.LastChecked, state.BuildTargets, len(state.MissingOutputs), len(state.MissingDigests), time.Since(started))
 	return state
 }
 
-func StateMap(s *pb.State) map[string]*pb.Entry {
+func StateMap(fn digest.Function, s *pb.State) map[string]*pb.Entry {
+	s, _ = discardOnFunctionMismatch(context.Background(), fn, s)
 	m := make(map[string]*pb.Entry)
 	for _, e := range s.Entries {
 		m[e.Name] = e
@@ -1362,7 +1440,36 @@ func StateMap(s *pb.State) map[string]*pb.Entry {
 	return m
 }
 
-func loadJournal(ctx context.Context, fname string, state *pb.State) bool {
+// StateDigestFunction returns the digest function that computed the state's
+// digests, for read-only consumers that must interpret the state as recorded
+// rather than under the currently configured function. An unset function
+// (legacy state) means SHA-256.
+func StateDigestFunction(s *pb.State) (digest.Function, error) {
+	return digest.Lookup(rpb.DigestFunction_Value(s.GetDigestFunction()))
+}
+
+// NewFromState creates a HashFS for the digest function recorded in st
+// (overriding opt.DigestFunction) and ingests st into it, so that read-only
+// consumers interpret the persisted digests under the function they were
+// computed with.
+func NewFromState(ctx context.Context, st *pb.State, opt Option) (*HashFS, error) {
+	fn, err := StateDigestFunction(st)
+	if err != nil {
+		return nil, err
+	}
+	opt.DigestFunction = fn
+	hfs, err := New(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
+	if err := hfs.SetState(ctx, st); err != nil {
+		hfs.Close(ctx)
+		return nil, err
+	}
+	return hfs, nil
+}
+
+func loadJournal(ctx context.Context, fn digest.Function, fname string, state *pb.State) bool {
 	started := time.Now()
 	b, err := os.ReadFile(fname)
 	if err != nil {
@@ -1373,10 +1480,41 @@ func loadJournal(ctx context.Context, fname string, state *pb.State) bool {
 		}
 		return false
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if !dec.More() {
+		return false
+	}
+	// The first record may be a header naming the digest function that
+	// produced the journal. A journal without a header was written by an
+	// older siso, which only supported sha256. The journal's digests are
+	// only valid for the function that computed them, so a mismatched
+	// journal is discarded as if it were absent; BLAKE3 and SHA-256 are
+	// both 64 hex chars, so nothing downstream would catch the mixup.
+	jfn := digest.SHA256
+	var hdr string
+	if err := dec.Decode(&hdr); err == nil {
+		name, ok := strings.CutPrefix(hdr, journalHeaderPrefix)
+		if !ok {
+			clog.Warningf(ctx, "unrecognized journal header %q; discarding journal", hdr)
+			return false
+		}
+		jfn, err = digest.ParseFunction(name)
+		if err != nil {
+			clog.Warningf(ctx, "unrecognized journal digest function: %v; discarding journal", err)
+			return false
+		}
+	} else {
+		// Not a header, so a legacy journal whose first record is an
+		// entry: restart decoding from the beginning.
+		dec = json.NewDecoder(bytes.NewReader(b))
+	}
+	if jfn != fn {
+		clog.Warningf(ctx, "journal digest function %s doesn't match current %s; discarding journal", jfn, fn)
+		return false
+	}
 	var cnt int
 	var broken bool
-	m := StateMap(state)
-	dec := json.NewDecoder(bytes.NewReader(b))
+	var m map[string]*pb.Entry
 	for dec.More() {
 		ent := &pb.Entry{}
 		err := dec.Decode(&ent)
@@ -1384,6 +1522,10 @@ func loadJournal(ctx context.Context, fname string, state *pb.State) bool {
 			clog.Warningf(ctx, "Failed to decode journal: %v", err)
 			broken = true
 			break
+		}
+		if m == nil {
+			// Mapping a large state is slow, so do it only if there's an entry to merge.
+			m = StateMap(fn, state)
 		}
 		m[ent.Name] = ent
 		if log.V(1) {
@@ -1403,6 +1545,11 @@ func loadJournal(ctx context.Context, fname string, state *pb.State) bool {
 	for _, k := range keys {
 		state.Entries = append(state.Entries, m[k])
 	}
+	// All merged digests are under fn (both the base state and the journal
+	// were verified against it). Record it, so a base state that predates
+	// the reconciliation (e.g. an empty fresh-build state) doesn't leave
+	// the merged state mistagged as sha256.
+	state.DigestFunction = int32(fn.Value())
 	clog.Infof(ctx, "reconcile from journal %d entries (broken=%t) in %s", cnt, broken, time.Since(started))
 	return true
 }
@@ -1468,6 +1615,25 @@ func (w *journalWriter) Close() error {
 	return err
 }
 
+// journalHeaderPrefix prefixes the journal header, a JSON string naming the
+// digest function of the entries that follow, e.g. "digest_function=blake3".
+// Entries are JSON objects, so the string type alone identifies the header;
+// an older siso fails to decode it as an entry and ignores the whole journal,
+// which is safe.
+const journalHeaderPrefix = "digest_function="
+
+// writeJournalHeader writes the journal header record for fn to w.
+func writeJournalHeader(w io.Writer, fn digest.Function) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	err := enc.Encode(journalHeaderPrefix + fn.String())
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(buf.Bytes())
+	return err
+}
+
 // JournalEntry writes ent in to journal writer w.
 func JournalEntry(w io.Writer, ent *pb.Entry) error {
 	var buf bytes.Buffer
@@ -1478,4 +1644,86 @@ func JournalEntry(w io.Writer, ent *pb.Entry) error {
 	}
 	_, err = w.Write(buf.Bytes())
 	return err
+}
+
+// getActiveFilesMap compiles a fast-lookup map of normalized paths for all active state entries.
+func getActiveFilesMap(state *pb.State) map[string]bool {
+	activeFiles := make(map[string]bool)
+	for _, e := range state.Entries {
+		activeFiles[e.Name] = true
+	}
+	return activeFiles
+}
+
+// loadBuildLabels validates and loads build label tracking data from the state file.
+func (hfs *HashFS) loadBuildLabels(ctx context.Context, state *pb.State, initial *initialEntryStates) {
+	hfs.ledgerMu.Lock()
+	defer hfs.ledgerMu.Unlock()
+
+	hfs.buildLabelDictionary = make(map[uint32]*pb.BuildLabelMetadata)
+	corrupted := false
+	if state.BuildLabelDictionary != nil {
+		for _, entry := range state.BuildLabelDictionary {
+			if entry == nil || entry.Id >= 64 || entry.Metadata == nil || entry.Metadata.BuildLabel == "" {
+				corrupted = true
+				break
+			}
+			hfs.buildLabelDictionary[entry.Id] = entry.Metadata
+		}
+	}
+	if corrupted {
+		clog.Warningf(ctx, "corrupted LabelDictionary detected in state file, resetting build label masks")
+		hfs.buildLabelDictionary = make(map[uint32]*pb.BuildLabelMetadata)
+	}
+
+	hfs.fileBuildLabels = make(map[string]uint64)
+	if !corrupted && state.FileBuildLabels != nil {
+		// Load validation: Ensure we don't hold onto labels for files that were
+		// deleted outside of Siso (e.g. by `rm`) between builds.
+		activeFiles := make(map[string]bool)
+		for i := range initial.alloc {
+			es := &initial.alloc[i]
+			if es.ftype != "" && es.e.err == nil {
+				activeFiles[es.ent.Name] = true
+			}
+		}
+		for _, entry := range state.FileBuildLabels {
+			if activeFiles[entry.Path] {
+				hfs.fileBuildLabels[entry.Path] = entry.Mask
+			}
+		}
+	}
+}
+
+// saveBuildLabels serializes the in-memory build label tracking data into the state file.
+func (hfs *HashFS) saveBuildLabels(state *pb.State) {
+	hfs.ledgerMu.RLock()
+	defer hfs.ledgerMu.RUnlock()
+	if len(hfs.buildLabelDictionary) > 0 {
+		state.BuildLabelDictionary = make([]*pb.BuildLabelDictionaryEntry, 0, len(hfs.buildLabelDictionary))
+		for id, v := range hfs.buildLabelDictionary {
+			state.BuildLabelDictionary = append(state.BuildLabelDictionary, &pb.BuildLabelDictionaryEntry{
+				Id: id,
+				Metadata: &pb.BuildLabelMetadata{
+					BuildLabel:         v.BuildLabel,
+					LastBuildTimestamp: v.LastBuildTimestamp,
+				},
+			})
+		}
+	}
+	if len(hfs.fileBuildLabels) > 0 {
+		// Save validation: Double-check that we only serialize labels for files
+		// that are explicitly active in the final exported state tree.
+		activeFiles := getActiveFilesMap(state)
+
+		state.FileBuildLabels = make([]*pb.FileBuildLabel, 0, len(hfs.fileBuildLabels))
+		for name, mask := range hfs.fileBuildLabels {
+			if activeFiles[name] {
+				state.FileBuildLabels = append(state.FileBuildLabels, &pb.FileBuildLabel{
+					Path: name,
+					Mask: mask,
+				})
+			}
+		}
+	}
 }

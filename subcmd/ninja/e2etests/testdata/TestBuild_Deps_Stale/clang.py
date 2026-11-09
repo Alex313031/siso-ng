@@ -8,13 +8,13 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("-MF", type=argparse.FileType(mode='w'))
+  parser.add_argument("-MF", type=argparse.FileType(mode="w"))
   parser.add_argument("-c", type=argparse.FileType())
-  parser.add_argument("-o", type=argparse.FileType(mode='w'))
+  parser.add_argument("-o", type=argparse.FileType(mode="w"))
   options = parser.parse_args()
 
   options.o.write(options.c.read())
-  options.MF.write(f'{options.o.name}: {options.c.name} ../../base/foo.h')
+  options.MF.write(f"{options.o.name}: {options.c.name} ../../base/foo.h")
   return 0
 
 

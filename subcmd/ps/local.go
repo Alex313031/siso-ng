@@ -41,22 +41,41 @@ func (s *localSource) location() string {
 
 func (s *localSource) text() string { return "" }
 
-func (s *localSource) fetch(ctx context.Context) ([]build.ActiveStepInfo, error) {
+func (s *localSource) fetch(ctx context.Context) (build.ProgressInfo, error) {
 	portFilename := filepath.Join(s.stateDir, ".siso_port")
 	buf, err := os.ReadFile(portFilename)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("siso is not running in %s?", s.wd)
+			return build.ProgressInfo{}, fmt.Errorf("siso is not running in %s?", s.wd)
 		}
-		return nil, fmt.Errorf("siso is not running in %s? failed to read %s: %w", s.wd, portFilename, err)
+		return build.ProgressInfo{}, fmt.Errorf("siso is not running in %s? failed to read %q: %w", s.wd, portFilename, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/api/active_steps", strings.TrimSpace(string(buf))), nil)
+	addr := strings.TrimSpace(string(buf))
+	progress, statusCode, err := fetchJSON[build.ProgressInfo](ctx, fmt.Sprintf("http://%s/api/progress", addr), portFilename)
+	if statusCode == http.StatusNotFound {
+		activeSteps, _, err := fetchJSON[[]build.ActiveStepInfo](ctx, fmt.Sprintf("http://%s/api/active_steps", addr), portFilename)
+		if err != nil {
+			return build.ProgressInfo{}, err
+		}
+		return build.ProgressInfo{
+			ActiveSteps: activeSteps,
+		}, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return build.ProgressInfo{}, err
+	}
+	return progress, nil
+}
+
+func fetchJSON[T any](ctx context.Context, url, portFilename string) (T, int, error) {
+	var zero T
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return zero, 0, fmt.Errorf("failed to create request: %w", err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get active_steps via %s: %w", portFilename, err)
+		return zero, 0, fmt.Errorf("failed to get %s via %q: %w", url, portFilename, err)
 	}
 	defer func() {
 		err := resp.Body.Close()
@@ -65,16 +84,16 @@ func (s *localSource) fetch(ctx context.Context) ([]build.ActiveStepInfo, error)
 		}
 	}()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("/api/active_steps error: %d %s", resp.StatusCode, resp.Status)
+		return zero, resp.StatusCode, fmt.Errorf("%s error: %d %s", url, resp.StatusCode, resp.Status)
 	}
-	buf, err = io.ReadAll(resp.Body)
+	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("/api/active_steps read error: %w", err)
+		return zero, resp.StatusCode, fmt.Errorf("%s read error: %w", url, err)
 	}
-	var activeSteps []build.ActiveStepInfo
-	err = json.Unmarshal(buf, &activeSteps)
+	var val T
+	err = json.Unmarshal(buf, &val)
 	if err != nil {
-		return nil, fmt.Errorf("/api/active_steps unmarshal error: %w", err)
+		return zero, resp.StatusCode, fmt.Errorf("%s unmarshal error: %w", url, err)
 	}
-	return activeSteps, nil
+	return val, resp.StatusCode, nil
 }

@@ -352,6 +352,26 @@ func TestScanDepsParams(t *testing.T) {
 				Defines: map[string]string{},
 			},
 		},
+		{
+			name: "soong-g.cc.cc-preprocess-mm",
+			args: []string{
+				"/bin/sh",
+				"-c",
+				"PWD=/proc/self/cwd prebuilts/clang/host/linux-x86/clang-r614150/bin/clang++ -c -E -P -undef -xassembler-with-cpp -D__x86_64__ -D__LP64__ -Isystem/core/debuggerd -MD -MF out/soong/.intermediates/system/core/debuggerd/crash_dump.x86_64.policy/crash_dump.policy.def.mm.d -o out/soong/.intermediates/system/core/debuggerd/crash_dump.x86_64.policy/crash_dump.policy.def.mm system/core/debuggerd/seccomp_policy/crash_dump.policy.def.mm",
+			},
+			want: scandepsparams.ScanDepsParams{
+				Sources: []string{
+					"system/core/debuggerd/seccomp_policy/crash_dump.policy.def.mm",
+				},
+				Dirs: []string{
+					"system/core/debuggerd",
+				},
+				Sysroots: []string{
+					"prebuilts/clang/host/linux-x86/clang-r614150",
+				},
+				Defines: map[string]string{},
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := ExtractScanDepsParams(ctx, tc.args, tc.env, os.DirFS("."))

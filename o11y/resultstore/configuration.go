@@ -10,10 +10,12 @@ import (
 	"sort"
 
 	rspb "google.golang.org/genproto/googleapis/devtools/resultstore/v2"
+
+	"go.chromium.org/build/siso/reapi/merkletree"
 )
 
-// NewConfiguration uploads new configuration with properties.
-func (u *Uploader) NewConfiguration(ctx context.Context, id string, properties map[string]string) error {
+// newConfiguration uploads new configuration with properties.
+func (u *Uploader) newConfiguration(ctx context.Context, id string, properties map[string]string) error {
 	keys := make([]string, 0, len(properties))
 	for k := range properties {
 		keys = append(keys, k)
@@ -39,4 +41,12 @@ func (u *Uploader) NewConfiguration(ctx context.Context, id string, properties m
 		},
 	}
 	return u.Upload(ctx, req)
+}
+
+// UploadBuildConfig uploads default build configuration with properties.
+func (u *Uploader) UploadBuildConfig(ctx context.Context, properties map[string]string, ents []merkletree.Entry) error {
+	if err := u.newConfiguration(ctx, "default", properties); err != nil {
+		return err
+	}
+	return u.UploadFiles(ctx, ents)
 }

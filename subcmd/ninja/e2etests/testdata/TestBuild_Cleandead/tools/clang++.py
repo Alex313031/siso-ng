@@ -3,7 +3,6 @@
 # found in the LICENSE file.
 
 import argparse
-import os
 import sys
 
 
@@ -11,8 +10,8 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("-MF", help="deps filename")
   parser.add_argument("-o", help="output filename")
-  parser.add_argument("-c", help="compile", action='store_true')
-  parser.add_argument("inputs", nargs='*')
+  parser.add_argument("-c", help="compile", action="store_true")
+  parser.add_argument("inputs", nargs="*")
   options = parser.parse_args()
 
   if options.c:
@@ -21,8 +20,8 @@ def main():
     if options.MF:
       with open(options.MF, "w") as f:
         f.write("%s:")
-        for input in options.inputs:
-          f.write(" %s" % input)
+        for input_path in options.inputs:
+          f.write(" %s" % input_path)
     return 0
   with open(options.o, "w") as f:
     f.write("link result of %s" % options.inputs)

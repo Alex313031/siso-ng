@@ -14,16 +14,36 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/longrunning/autogen/longrunningpb"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/admin"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
 )
+
+// requestMetadataKey is the gRPC metadata key that carries the marshaled
+// RE API RequestMetadata.
+// https://github.com/bazelbuild/remote-apis/blob/8f539af4b407a4f649707f9632fc2b715c9aa065/build/bazel/remote/execution/v2/remote_execution.proto#L2034-L2045
+const requestMetadataKey = "build.bazel.remote.execution.v2.requestmetadata-bin"
+
+// traceBinKey is the gRPC metadata key that carries the caller's trace context
+// in the binary format RBE understands. See otelDialOption, which is what
+// writes it on a build's own RPCs.
+const traceBinKey = "grpc-trace-bin"
+
+// forwardedMetadataKeys are the incoming metadata keys the proxy copies onto
+// its upstream calls. Each upstream call belongs to exactly one incoming RPC,
+// so forwarding these values does not combine metadata from different callers.
+// The proxy must not set Option.TracerProvider: its client would then write
+// traceBinKey itself and duplicate the forwarded value.
+var forwardedMetadataKeys = []string{requestMetadataKey, traceBinKey}
 
 // Proxy is RE API proxy.
 type Proxy struct {
@@ -37,6 +57,51 @@ func NewProxy(client *Client, addr string) *Proxy {
 		client: client,
 		addr:   addr,
 	}
+}
+
+// withForwardedMetadata copies forwardedMetadataKeys from the incoming request
+// onto the outgoing context, so the backend still sees the tool_invocation_id,
+// target_id, action_mnemonic and friends for logging, monitoring and grouping,
+// and still parents its spans under the step that issued the RPC. Without this
+// the proxy would strip them: the handlers pass the server context to the
+// upstream client, and gRPC does not forward incoming metadata to outgoing
+// calls.
+func withForwardedMetadata(ctx context.Context) context.Context {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ctx
+	}
+	var pairs []string
+	for _, key := range forwardedMetadataKeys {
+		for _, v := range md.Get(key) {
+			pairs = append(pairs, key, v)
+		}
+	}
+	if len(pairs) == 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, pairs...)
+}
+
+// forwardMetadataUnaryInterceptor forwards the client's metadata upstream on
+// unary RPCs.
+func forwardMetadataUnaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	return handler(withForwardedMetadata(ctx), req)
+}
+
+// forwardMetadataStream overrides the handler's context so streaming RPCs carry
+// the forwarded metadata on upstream calls.
+type forwardMetadataStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *forwardMetadataStream) Context() context.Context { return s.ctx }
+
+// forwardMetadataStreamInterceptor forwards the client's metadata upstream on
+// streaming RPCs.
+func forwardMetadataStreamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	return handler(srv, &forwardMetadataStream{ServerStream: ss, ctx: withForwardedMetadata(ss.Context())})
 }
 
 // Serve serves RE API requests and proxies to the client.
@@ -54,7 +119,11 @@ func (p *Proxy) Serve(ctx context.Context) error {
 		return fmt.Errorf("failed to listen %s %s: %w", loc.Scheme, loc.Path, err)
 	}
 	// TODO: set recv msg size based on server capabilities?
-	server := grpc.NewServer(grpc.MaxRecvMsgSize(20 * 1024 * 1024))
+	server := grpc.NewServer(
+		grpc.MaxRecvMsgSize(20*1024*1024),
+		grpc.ChainUnaryInterceptor(forwardMetadataUnaryInterceptor),
+		grpc.ChainStreamInterceptor(forwardMetadataStreamInterceptor),
+	)
 
 	cp := &capabilitiesProxy{
 		client: rpb.NewCapabilitiesClient(p.client.conn),
@@ -69,6 +138,7 @@ func (p *Proxy) Serve(ctx context.Context) error {
 
 	casp := &contentAddressableStorageProxy{
 		client:            rpb.NewContentAddressableStorageClient(p.client.casConn),
+		emptyDigest:       p.client.digestFn.Empty(),
 		writableInstances: make(map[string]bool),
 	}
 	casp.checkWritable(ctx, p.client)
@@ -77,8 +147,17 @@ func (p *Proxy) Serve(ctx context.Context) error {
 	ep := &executionProxy{client: rpb.NewExecutionClient(p.client.conn)}
 	rpb.RegisterExecutionServer(server, ep)
 
-	bsp := &byteStreamProxy{client: bspb.NewByteStreamClient(p.client.casConn)}
+	op := &operationsProxy{client: longrunningpb.NewOperationsClient(p.client.conn)}
+	longrunningpb.RegisterOperationsServer(server, op)
+
+	bsp := &byteStreamProxy{client: bspb.NewByteStreamClient(p.client.casDataConn)}
 	bspb.RegisterByteStreamServer(server, bsp)
+
+	adminCleanup, err := admin.Register(server)
+	if err != nil {
+		return err
+	}
+	defer adminCleanup()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -150,9 +229,21 @@ func (ap *actionCacheProxy) UpdateActionResult(ctx context.Context, req *rpb.Upd
 	return ap.client.UpdateActionResult(ctx, req)
 }
 
+func (ap *actionCacheProxy) AddActionLookup(ctx context.Context, req *rpb.AddActionLookupRequest) (*rpb.AddActionLookupResponse, error) {
+	return ap.client.AddActionLookup(ctx, req)
+}
+
+func (ap *actionCacheProxy) ListActions(ctx context.Context, req *rpb.ListActionsRequest) (*rpb.ListActionsResponse, error) {
+	return ap.client.ListActions(ctx, req)
+}
+
 type contentAddressableStorageProxy struct {
 	rpb.UnimplementedContentAddressableStorageServer
 	client rpb.ContentAddressableStorageClient
+
+	// emptyDigest is the digest of the empty blob under the backend's digest
+	// function, used to recognize writability probes.
+	emptyDigest digest.Digest
 
 	mu                sync.Mutex
 	writableInstances map[string]bool
@@ -175,7 +266,7 @@ func (cp *contentAddressableStorageProxy) FindMissingBlobs(ctx context.Context, 
 }
 
 func (cp *contentAddressableStorageProxy) BatchUpdateBlobs(ctx context.Context, req *rpb.BatchUpdateBlobsRequest) (*rpb.BatchUpdateBlobsResponse, error) {
-	if len(req.Requests) == 1 && digest.FromProto(req.Requests[0].GetDigest()) == digest.Empty && len(req.Requests[0].GetData()) == 0 {
+	if len(req.Requests) == 1 && digest.FromProto(req.Requests[0].GetDigest()) == cp.emptyDigest && len(req.Requests[0].GetData()) == 0 {
 		cp.mu.Lock()
 		ok := cp.writableInstances[req.InstanceName]
 		cp.mu.Unlock()
@@ -197,6 +288,26 @@ func (cp *contentAddressableStorageProxy) BatchUpdateBlobs(ctx context.Context, 
 
 func (cp *contentAddressableStorageProxy) BatchReadBlobs(ctx context.Context, req *rpb.BatchReadBlobsRequest) (*rpb.BatchReadBlobsResponse, error) {
 	return cp.client.BatchReadBlobs(ctx, req)
+}
+
+func (cp *contentAddressableStorageProxy) GetTree(req *rpb.GetTreeRequest, serv rpb.ContentAddressableStorage_GetTreeServer) error {
+	gtc, err := cp.client.GetTree(serv.Context(), req)
+	if err != nil {
+		return err
+	}
+	for {
+		resp, err := gtc.Recv()
+		if err == io.EOF { //nolint:errorlint
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		err = serv.Send(resp)
+		if err != nil {
+			return err
+		}
+	}
 }
 
 type executionProxy struct {
@@ -221,8 +332,16 @@ func (ep *executionProxy) Execute(req *rpb.ExecuteRequest, serv rpb.Execution_Ex
 		if !op.GetDone() {
 			continue
 		}
+		drainExecStream(exc)
 		return nil
 	}
+}
+
+// drainExecStream reads the EOF the backend sends after the done operation, so
+// the upstream stream completes cleanly instead of being recorded as canceled
+// when the handler returns.
+func drainExecStream(exc grpc.ClientStream) {
+	_ = exc.RecvMsg(&longrunningpb.Operation{})
 }
 
 func (ep *executionProxy) WaitExecution(req *rpb.WaitExecutionRequest, serv rpb.Execution_WaitExecutionServer) error {
@@ -242,6 +361,7 @@ func (ep *executionProxy) WaitExecution(req *rpb.WaitExecutionRequest, serv rpb.
 		if !op.GetDone() {
 			continue
 		}
+		drainExecStream(exc)
 		return nil
 	}
 }
@@ -293,4 +413,13 @@ func (bp *byteStreamProxy) Write(serv bspb.ByteStream_WriteServer) error {
 			return err
 		}
 	}
+}
+
+type operationsProxy struct {
+	longrunningpb.UnimplementedOperationsServer
+	client longrunningpb.OperationsClient
+}
+
+func (op *operationsProxy) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest) (*longrunningpb.Operation, error) {
+	return op.client.GetOperation(ctx, req)
 }

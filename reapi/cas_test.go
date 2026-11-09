@@ -11,15 +11,17 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/blob"
 )
 
 // errReader returns err on every Read.
@@ -36,16 +38,16 @@ func TestExpectEOF(t *testing.T) {
 		wantErrs error // if non-nil, expectEOF's error must match via errors.Is
 	}{
 		{
-			name:    "clean EOF",
+			name:    "clean_eof",
 			r:       bytes.NewReader(nil),
 			wantEOF: true,
 		},
 		{
-			name: "trailing data",
+			name: "trailing_data",
 			r:    bytes.NewReader([]byte("x")),
 		},
 		{
-			name:     "read error",
+			name:     "read_error",
 			r:        errReader{err: sentinel},
 			wantErrs: sentinel,
 		},
@@ -73,24 +75,21 @@ func TestExpectEOF(t *testing.T) {
 func TestCreateBatchUpdateBlobsRequests(t *testing.T) {
 	ctx := t.Context()
 	rnd := rand.NewChaCha8([32]byte{})
-	ds := digest.NewStore()
-	testdata := func(s string, n int64) digest.Data {
+	ds := blob.NewStore()
+	testdata := func(s string, n int64) blob.Data {
 		buf := make([]byte, n)
 		rnd.Read(buf)
-		return digest.FromBytes(s, buf)
+		return blob.FromBytes(digest.SHA256, s, buf)
 	}
 	ds.Set(testdata("data 0", 512*1024))
 	for i := 1; i < 15; i++ {
 		ds.Set(testdata(fmt.Sprintf("data %d", i), 1024*1024))
 	}
-	uploadOps := make(map[digest.Digest]*uploadOp)
-	for _, d := range ds.List() {
-		uploadOps[d] = newUploadOp()
-	}
 	sizeLimit := int64(10 * 1024 * 1024)
 	numLimit := 10
-	blobsReqs, missingBlobs := blobsToUpload(ctx, ds.List(), ds, sizeLimit)
-	batchReqs := createBatchUpdateBlobsRequests("projects/test/instances/default_instannce", blobsReqs, sizeLimit, numLimit)
+	c := &Client{}
+	blobsReqs, missingBlobs := c.blobsToUpload(ctx, ds.List(), ds, sizeLimit)
+	batchReqs := createBatchUpdateBlobsRequests("projects/test/instances/default_instannce", digest.SHA256, blobsReqs, sizeLimit, numLimit)
 	nBatches := 0
 	for batchReq := range batchReqs {
 		size := int64(proto.Size(batchReq))
@@ -106,6 +105,42 @@ func TestCreateBatchUpdateBlobsRequests(t *testing.T) {
 	}
 	if m := missingBlobs.Size(); m != 0 {
 		t.Errorf("missingBlobs=%d; want=0", m)
+	}
+}
+
+// TestCreateBatchUpdateBlobsRequestsDigestFunctionOverhead fills a batch to
+// the brim: byteLimit is exactly the encoded size of one request holding all
+// blobs but no digest_function field. The emitted requests carry
+// digest_function, so their actual proto size must still stay within
+// byteLimit (the batching must account for the field's encoded size).
+func TestCreateBatchUpdateBlobsRequestsDigestFunctionOverhead(t *testing.T) {
+	const instance = "projects/test/instances/default_instance"
+	fn := digest.SHA256
+	newReq := func(i byte) *rpb.BatchUpdateBlobsRequest_Request {
+		data := bytes.Repeat([]byte{i}, 100)
+		return &rpb.BatchUpdateBlobsRequest_Request{
+			Digest: fn.FromBytes(data).Proto(),
+			Data:   data,
+		}
+	}
+	reqs := []*rpb.BatchUpdateBlobsRequest_Request{newReq(1), newReq(2)}
+	byteLimit := int64(proto.Size(&rpb.BatchUpdateBlobsRequest{
+		InstanceName: instance,
+		Requests:     reqs,
+	}))
+	var nBatches, nReqs int
+	for batchReq := range createBatchUpdateBlobsRequests(instance, fn, slices.Values(reqs), byteLimit, 100) {
+		nBatches++
+		nReqs += len(batchReq.Requests)
+		if got := int64(proto.Size(batchReq)); got > byteLimit {
+			t.Errorf("proto.Size(batch %d) = %d; want <= %d", nBatches, got, byteLimit)
+		}
+		if got, want := batchReq.DigestFunction, fn.Value(); got != want {
+			t.Errorf("batch %d DigestFunction = %v; want %v", nBatches, got, want)
+		}
+	}
+	if got, want := nReqs, len(reqs); got != want {
+		t.Errorf("emitted %d blob requests across %d batches; want %d", got, nBatches, want)
 	}
 }
 
@@ -523,5 +558,61 @@ func TestNewDecoder_DoubleCloseDiscardable(t *testing.T) {
 	}
 	if err := rd.Close(); err != nil {
 		t.Errorf("second Close should be a safe no-op; got %v", err)
+	}
+}
+
+func TestCreateBatchUpdateBlobsRequestsWithCompression(t *testing.T) {
+	ctx := t.Context()
+	rnd := rand.NewChaCha8([32]byte{})
+	ds := blob.NewStore()
+	testdata := func(s string, n int64) blob.Data {
+		buf := make([]byte, n)
+		rnd.Read(buf)
+		return blob.FromBytes(digest.SHA256, s, buf)
+	}
+	ds.Set(testdata("data 0", 1023))
+	ds.Set(testdata("data 1", 1024))
+	ds.Set(testdata("data 2", 1025))
+	sizeLimit := int64(3*1024 - 1)
+	numLimit := 10
+	c := &Client{
+		opt: Option{
+			BatchCompressedBlob:           1024,
+			compressorForBatchUpdateBlobs: rpb.Compressor_ZSTD,
+		},
+	}
+	blobsReqsTemp, missingBlobs := c.blobsToUpload(ctx, ds.List(), ds, sizeLimit)
+	blobsReqsSlice := slices.Collect(blobsReqsTemp)
+	numBlobsReqs := len(blobsReqsSlice)
+	blobsReqs := slices.Values(blobsReqsSlice)
+	batchReqs := createBatchUpdateBlobsRequests("projects/test/instances/default_instannce", digest.SHA256, blobsReqs, sizeLimit, numLimit)
+	var blobsPerBatch []int
+	numCompressedBlobs := 0
+	for batchReq := range batchReqs {
+		blobsPerBatch = append(blobsPerBatch, len(batchReq.Requests))
+		for _, req := range batchReq.Requests {
+			if req.Compressor == rpb.Compressor_ZSTD {
+				numCompressedBlobs++
+			}
+		}
+	}
+	numBatches := len(blobsPerBatch)
+	if numBlobsReqs != 3 {
+		t.Errorf("numBlobsReqs=%d, want=3", numBlobsReqs)
+	}
+	if numBatches != 2 {
+		t.Errorf("numBatches=%d, want=2", numBatches)
+	}
+	if blobsPerBatch[0] != 2 {
+		t.Errorf("blobsPerBatch[0]=%d, want=2", blobsPerBatch[0])
+	}
+	if blobsPerBatch[1] != 1 {
+		t.Errorf("blobsPerBatch[1]=%d, want=1", blobsPerBatch[1])
+	}
+	if numCompressedBlobs != 2 {
+		t.Errorf("numCompressedBlobs=%d, want=2", numCompressedBlobs)
+	}
+	if m := missingBlobs.Size(); m != 0 {
+		t.Errorf("missingBlobs=%d; want=0", m)
 	}
 }
