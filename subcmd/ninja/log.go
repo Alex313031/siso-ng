@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,8 +49,8 @@ const sisoResultFilename = "siso_result.json"
 
 // SisoResult contains siso result information.
 type SisoResult struct {
-	Code         int    `json:"code,omitempty"`
-	InfraFailure bool   `json:"infra_failure,omitempty"`
+	Code         int    `json:"code,omitzero"`
+	InfraFailure bool   `json:"infra_failure,omitzero"`
 	Message      string `json:"message,omitempty"`
 }
 
@@ -155,8 +156,8 @@ func (c *Command) initLogWriters(ctx context.Context, buildPath *build.Path) (lo
 	dones = append(dones, done)
 
 	return writers, func(err *error) {
-		for i := len(dones) - 1; i >= 0; i-- {
-			dones[i](err)
+		for _, done := range slices.Backward(dones) {
+			done(err)
 		}
 	}, nil
 }
@@ -295,19 +296,36 @@ func (c *Command) setupCrashOutput(ctx context.Context) (func(), error) {
 }
 
 func (c *Command) writeInvocationInfo(ctx context.Context, metricsLabels map[string]string, targets []string) error {
-	j, err := json.Marshal(metadata.InvocationInfo{
+	fname := c.logFilename(c.invocationJSON, "")
+	if fname == "" {
+		return nil
+	}
+	rotateFiles(ctx, fname)
+
+	var cmdArgs []string
+	if len(os.Args) > 1 {
+		cmdArgs = os.Args[1:]
+	}
+
+	info := metadata.InvocationInfo{
 		SisoVersion:        c.version,
 		StartTime:          c.started,
 		BuildID:            c.buildID,
 		Targets:            targets,
+		CommandLineArgs:    cmdArgs,
 		MetricsLabels:      metricsLabels,
 		EnabledExperiments: build.EnabledExperiments(),
 		Machine:            metadata.GatherMachineInfo(ctx),
-	})
+	}
+	if err := c.reopt.CheckValid(); err == nil {
+		info.REAPIInstance = c.reopt.Instance
+	}
+
+	j, err := json.Marshal(info)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(c.logDir, c.invocationJSON), j, 0644)
+	return os.WriteFile(fname, j, 0644)
 }
 
 func (c *Command) cleanupReclientMetrics(ctx context.Context) {

@@ -6,6 +6,7 @@ package ninja
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"maps"
@@ -38,11 +39,14 @@ import (
 
 	"go.chromium.org/build/siso/auth/cred"
 	"go.chromium.org/build/siso/build"
+	"go.chromium.org/build/siso/build/metadata/host"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/monitoring"
 	"go.chromium.org/build/siso/o11y/resultstore"
 	"go.chromium.org/build/siso/o11y/trace"
+	sisopath "go.chromium.org/build/siso/path"
+	"go.chromium.org/build/siso/reapi"
 	"go.chromium.org/build/siso/reapi/merkletree"
 	"go.chromium.org/build/siso/ui"
 	"go.chromium.org/build/siso/version"
@@ -177,7 +181,10 @@ func (c *Command) initCloudMonitoring(ctx context.Context, credential cred.Cred,
 	}
 	var exporter smetric.Exporter
 	if c.collectorAddress != "" {
-		exporter = newOTELMetricsExporter(ctx, c.collectorAddress)
+		exporter, err = newOTELMetricsExporter(ctx, c.collectorAddress)
+		if err != nil {
+			clog.Warningf(ctx, "failed to create OTEL metrics exporter, falling back to Cloud Monitoring: %v", err)
+		}
 	}
 	if exporter == nil {
 		exporter, err = cloudmetric.New(
@@ -200,20 +207,18 @@ func (c *Command) initCloudMonitoring(ctx context.Context, credential cred.Cred,
 	return mp, nil
 }
 
-func newOTELMetricsExporter(ctx context.Context, collectorAddr string) *otlpmetricgrpc.Exporter {
+func newOTELMetricsExporter(ctx context.Context, collectorAddr string) (smetric.Exporter, error) {
 	conn, err := grpc.NewClient(collectorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		clog.Warningf(ctx, "failed to create connection to OTLP collector: %v", err)
-		return nil
+		return nil, fmt.Errorf("create connection to OTLP collector: %w", err)
 	}
 
 	exporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
 	if err != nil {
-		clog.Warningf(ctx, "failed to create OTLP metric exporter: %v", err)
-		return nil
+		return nil, errors.Join(fmt.Errorf("create OTLP metric exporter: %w", err), conn.Close())
 	}
 	clog.Infof(ctx, "OTEL metrics exporter to %s", collectorAddr)
-	return exporter
+	return exporter, nil
 }
 
 // buildProperties builds properties for the invocation that will be uploaded to ResultStore.
@@ -221,7 +226,7 @@ func newOTELMetricsExporter(ctx context.Context, collectorAddr string) *otlpmetr
 func (c *Command) buildProperties(ctx context.Context, buildPath *build.Path) resultstore.Properties {
 	properties := resultstore.Properties{}
 	properties.Add("dir", buildPath.BaseDir)
-	info := cpuinfo()
+	info := cpuinfo(ctx)
 	properties.Add("cpu", info)
 	info = gcinfo()
 	properties.Add("memgc", info)
@@ -249,15 +254,17 @@ func (c *Command) buildProperties(ctx context.Context, buildPath *build.Path) re
 }
 
 // setupResultStore sets up ResultStore for uploading build results.
-// It returns a cleanup function that should be called at the end of the build, and any error that occurred.
-func (c *Command) setupResultStore(ctx context.Context, projectID string, buildPath *build.Path, properties resultstore.Properties, credential cred.Cred, hashFS *hashfs.HashFS) (func(error), error) {
+// It returns the ResultStore uploader, a cleanup function that should be called at the end of the build, and any error that occurred.
+func (c *Command) setupResultStore(ctx context.Context, projectID string, buildPath *build.Path, properties resultstore.Properties, credential cred.Cred, hashFS *hashfs.HashFS, reapiClient *reapi.Client) (*resultstore.Uploader, func(error), error) {
 	resultstoreUploader, err := resultstore.New(ctx, resultstore.Options{
 		InvocationID:  c.buildID,
 		Invocation:    c.invocation(ctx, c.buildID, projectID, buildPath.WorkspaceRoot, properties),
 		ClientOptions: credential.ClientOptions(),
+		HashFS:        hashFS,
+		REAPIClient:   reapiClient,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ui.Default.Infof("https://btx.cloud.google.com/invocations/%s\n", c.buildID)
 
@@ -270,15 +277,17 @@ func (c *Command) setupResultStore(ctx context.Context, projectID string, buildP
 		// TODO(b/329564182): add other files? e.g. siso_output, siso_trace.json etc.
 		if len(files) > 0 {
 			var entsErr error
-			ents, entsErr = hashFS.Entries(ctx, buildPath.AbsBase(), files)
+			ents, entsErr = hashFS.Entries(ctx, buildPath.AbsBase(), sisopath.Paths(files))
 			if entsErr != nil {
 				clog.Warningf(ctx, "failed to get entries for %q: %v", files, entsErr)
 			}
 		}
-		ents = append(ents, merkletree.Entry{
-			Name: "build.log",
-			Data: resultstoreUploader.BuildLogData(),
-		})
+		if resultstoreUploader != nil {
+			ents = append(ents, merkletree.Entry{
+				Name: "build.log",
+				Data: resultstoreUploader.BuildLogData(),
+			})
+		}
 
 		spin := ui.Default.NewSpinner()
 		spin.Start("uploading to resultstore")
@@ -300,15 +309,20 @@ func (c *Command) setupResultStore(ctx context.Context, projectID string, buildP
 		spin.Stop(cerr)
 	}
 
-	return cleanup, nil
+	return resultstoreUploader, cleanup, nil
 }
 
 // cpuinfo returns a string containing CPU information.
-func cpuinfo() string {
+func cpuinfo(ctx context.Context) string {
+	physicalCores, logicalCores, err := host.CPUCores()
+	if err != nil {
+		clog.Warningf(ctx, "failed to get cpu cores: %v", err)
+	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "cpu family=%d model=%d stepping=%d ", cpuid.CPU.Family, cpuid.CPU.Model, cpuid.CPU.Stepping)
 	fmt.Fprintf(&sb, "brand=%q vendor=%q ", cpuid.CPU.BrandName, cpuid.CPU.VendorString)
-	fmt.Fprintf(&sb, "physicalCores=%d threadsPerCore=%d logicalCores=%d ", cpuid.CPU.PhysicalCores, cpuid.CPU.ThreadsPerCore, cpuid.CPU.LogicalCores)
+	// TODO: update host.CPUCores to also return threads per core?
+	fmt.Fprintf(&sb, "physicalCores=%d threadsPerCore=%d logicalCores=%d ", physicalCores, cpuid.CPU.ThreadsPerCore, logicalCores)
 	fmt.Fprintf(&sb, "vm=%t features=%s", cpuid.CPU.VM(), cpuid.CPU.FeatureSet())
 	return sb.String()
 }

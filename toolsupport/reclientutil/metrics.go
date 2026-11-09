@@ -15,9 +15,28 @@ import (
 
 // RBEBuildMetrics converts Siso build stats into Reclient's RBE build metrics.
 func RBEBuildMetrics(buildID string, version string, dur time.Duration, stats build.Stats) *pb.RbeBuildMetrics {
-	var cacheHitRatio float64 = 0
-	if stats.Remote+stats.CacheHit > 0 {
-		cacheHitRatio = float64(stats.CacheHit / (stats.Remote + stats.CacheHit))
+	var remoteCacheHitRatio float64 = 0
+	var localCacheHitRatio float64 = 0
+	var overallCacheHitRatio float64 = 0
+	// Remote includes CacheHitLate: do not add that to the total.
+	// Include RacingLocal and LocalFallback here as they represent actions
+	// that are configured to be run remotely that were either executed
+	// locally (not found in the REAPI cache), or were run locally
+	// (cache-miss, the build failed, and succeeded when run locally).
+	totalRemoted := stats.Remote + stats.CacheHitEarly + stats.RacingLocal + stats.LocalFallback
+	if totalRemoted > 0 {
+		// Count late cache hits as cache hits.
+		remoteCacheHitRatio = float64(stats.CacheHitEarly+stats.CacheHitLate) / float64(totalRemoted)
+	}
+	// The two-phase-caching experiment means that local actions may be cached.
+	// Remoted actions never use the two-phase cache, making the calculation easier.
+	totalLocal := stats.Local + stats.TwoPhaseCacheHit
+	if totalLocal > 0 {
+		localCacheHitRatio = float64(stats.TwoPhaseCacheHit) / float64(totalLocal)
+	}
+	// Calculate the overall cache hit ratio.
+	if stats.Done-stats.Skipped > 0 {
+		overallCacheHitRatio = float64(stats.CacheHit) / float64(stats.Done-stats.Skipped)
 	}
 	return &pb.RbeBuildMetrics{
 		NumRecords: int64(stats.Done - stats.Skipped),
@@ -31,8 +50,10 @@ func RBEBuildMetrics(buildID string, version string, dur time.Duration, stats bu
 			OsFamily: runtime.GOOS,
 			Arch:     runtime.GOARCH,
 		},
-		BuildCacheHitRatio: cacheHitRatio,
-		BuildLatency:       dur.Seconds(),
+		BuildCacheHitRatio:    overallCacheHitRatio,
+		TwoPhaseCacheHitRatio: localCacheHitRatio,
+		RemoteCacheHitRatio:   remoteCacheHitRatio,
+		BuildLatency:          dur.Seconds(),
 	}
 }
 
@@ -47,6 +68,36 @@ func completionStatus(stats build.Stats) *pb.Stat {
 		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{
 			Name:  "STATUS_CACHE_HIT",
 			Count: int64(stats.CacheHit),
+		})
+	}
+	if stats.TwoPhaseCacheHit > 0 {
+		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{
+			Name:  "STATUS_TWO_PHASE_CACHE_HIT",
+			Count: int64(stats.TwoPhaseCacheHit),
+		})
+	}
+	if stats.CacheHitEarly > 0 {
+		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{
+			Name:  "STATUS_CACHE_HIT_EARLY",
+			Count: int64(stats.CacheHitEarly),
+		})
+	}
+	if stats.CacheHitLate > 0 {
+		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{
+			Name:  "STATUS_CACHE_HIT_LATE",
+			Count: int64(stats.CacheHitLate),
+		})
+	}
+	if stats.RacingRemote > 0 {
+		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{
+			Name:  "STATUS_RACING_REMOTE",
+			Count: int64(stats.RacingRemote),
+		})
+	}
+	if stats.RacingLocal > 0 {
+		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{
+			Name:  "STATUS_RACING_LOCAL",
+			Count: int64(stats.RacingLocal),
 		})
 	}
 	if stats.Remote > 0 {
@@ -66,7 +117,6 @@ func completionStatus(stats build.Stats) *pb.Stat {
 			Name:  "STATUS_LOCAL_EXECUTION",
 			Count: int64(stats.Local),
 		})
-
 	}
 	if stats.Fail > 0 {
 		s.CountsByValue = append(s.CountsByValue, &pb.Stat_Value{

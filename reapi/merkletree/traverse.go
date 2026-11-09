@@ -10,16 +10,17 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
 )
 
 // Traverse traverses a directory recursively, and returns the found files, symlinks and directories.
 // The base directory name is prepended to each path of the entries.
-// The directories not registered in the digest.Store will be ignored.
-func Traverse(ctx context.Context, base string, dir *rpb.Directory, ds *digest.Store) ([]*rpb.OutputFile, []*rpb.OutputSymlink, []*rpb.OutputDirectory) {
+// The directories not registered in the blob.Store will be ignored.
+func Traverse(ctx context.Context, fn digest.Function, base string, dir *rpb.Directory, ds *blob.Store) ([]*rpb.OutputFile, []*rpb.OutputSymlink, []*rpb.OutputDirectory) {
 	var files []*rpb.OutputFile
 	for _, f := range dir.Files {
 		files = append(files, &rpb.OutputFile{
@@ -44,7 +45,7 @@ func Traverse(ctx context.Context, base string, dir *rpb.Directory, ds *digest.S
 		db, found := ds.Get(dg)
 		if !found {
 			// TODO(b/269199873): revisit error handling.
-			clog.Errorf(ctx, "digest.Store doesn't have a directory: %s %s", subdirname, dg)
+			clog.Errorf(ctx, "blob.Store doesn't have a directory: %s %s", subdirname, dg)
 			continue
 		}
 		subdir := &rpb.Directory{}
@@ -56,9 +57,9 @@ func Traverse(ctx context.Context, base string, dir *rpb.Directory, ds *digest.S
 		}
 		dirs = append(dirs, &rpb.OutputDirectory{
 			Path:       filepath.Join(base, subd.Name),
-			TreeDigest: digest.Empty.Proto(),
+			TreeDigest: fn.Empty().Proto(),
 		})
-		sfiles, ssymlinks, sdirs := Traverse(ctx, subdirname, subdir, ds)
+		sfiles, ssymlinks, sdirs := Traverse(ctx, fn, subdirname, subdir, ds)
 		files = append(files, sfiles...)
 		symlinks = append(symlinks, ssymlinks...)
 		dirs = append(dirs, sdirs...)
@@ -66,8 +67,8 @@ func Traverse(ctx context.Context, base string, dir *rpb.Directory, ds *digest.S
 	return files, symlinks, dirs
 }
 
-func readProto(ctx context.Context, data digest.Data, m proto.Message) error {
-	b, err := digest.DataToBytes(ctx, data)
+func readProto(ctx context.Context, data blob.Data, m proto.Message) error {
+	b, err := blob.DataToBytes(ctx, data)
 	if err != nil {
 		return err
 	}

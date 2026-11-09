@@ -8,10 +8,12 @@ package ninjabuild
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -19,12 +21,22 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/buildconfig"
+	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
+)
+
+var (
+	errShellPathNotCleanOrLocal = errors.New("shell path must be clean and local")
+	errInvalidShellBasename     = errors.New("shell basename must be 'sh' or 'bash'")
+	errShellNotExecutable       = errors.New("shell must be marked executable")
 )
 
 // Graph holds build graph, i.e. all step defs described in build.ninja.
@@ -46,8 +58,11 @@ type globals struct {
 	buildConfig *buildconfig.Config
 	stepConfig  *StepConfig
 
-	// node id -> string
-	targetPaths []string
+	shellCmd    string
+	shellInputs []path.Path
+
+	// node id -> path.Path
+	targetPaths []path.Path
 
 	// deps path id -> *depsPath
 	depsPaths []atomic.Pointer[depsPath]
@@ -58,7 +73,7 @@ type globals struct {
 	phony map[string]bool
 
 	// caseSensitives lists all case sensitive input filenames.
-	caseSensitives map[string][]string
+	caseSensitives map[string][]path.Path
 
 	// edge will be associated with the gn target.
 	gnTargets map[*ninjautil.Edge]gnTarget
@@ -97,17 +112,18 @@ func (g gnTarget) String() string {
 
 // NewStepConfig creates new *StepConfig and stores it in .siso_config
 // and .siso_filegroups.
-func NewStepConfig(ctx context.Context, config *buildconfig.Config, p *build.Path, fname, stateDir string) (*StepConfig, error) {
+func NewStepConfig(ctx context.Context, fn digest.Function, config *buildconfig.Config, p *build.Path, fname, stateDir string) (*StepConfig, error) {
 	defer trace.Begin(ctx, "ninjabuild.NewStepConfig").End()
 	// Use a temporary HashFS for config initialization and updating filegroups.
 	// Config initialization is mostly CPU-bound (loading Starlark scripts, parsing config),
 	// while HashFS initialization is Disk-bound (scanning directory state, computing digests).
 	// Isolating config parsing avoids blocking the CPU execution phase on the long
 	// background disk scan of the main HashFS, allowing them to run concurrently.
-	tempHashFS, err := hashfs.New(ctx, hashfs.Option{})
+	tempHashFS, err := hashfs.New(ctx, hashfs.Option{DigestFunction: fn})
 	if err != nil {
 		return nil, err
 	}
+	defer tempHashFS.Close(ctx)
 	s, strict, err := config.Init(ctx, tempHashFS, p)
 	if err != nil {
 		return nil, err
@@ -207,12 +223,95 @@ func Load(ctx context.Context, fname string, buildPath *build.Path) (*ninjautil.
 	if err != nil {
 		return nil, fmt.Errorf("failed to load %s: %w", fname, err)
 	}
+	if err := validateDirOutputs(state); err != nil {
+		return nil, err
+	}
 	clog.Infof(ctx, "load %s %s", fname, time.Since(started))
 	return state, nil
 }
 
+// validateDirOutputs rejects a graph where any output is nested under a
+// directory output, even from the same step: a directory output owns its whole
+// tree, so its members must not be declared as separate outputs.
+func validateDirOutputs(state *ninjautil.State) error {
+	// No directory outputs: nothing to check, and no node scan.
+	dirNodes := state.DirOutputs()
+	if len(dirNodes) == 0 {
+		return nil
+	}
+	// Index the directory-output paths in a byte-trie so each node is matched
+	// against all of them in one prefix walk.
+	root := &dirTrieNode{}
+	for _, d := range dirNodes {
+		root.insert(d.Path())
+	}
+	numNodes := state.NumNodes()
+	for id := range numNodes {
+		n, ok := state.LookupNode(id)
+		if !ok {
+			continue
+		}
+		// Only an output (a node with a producing edge) can overlap a dir
+		// output; a source under one is left alone.
+		if _, ok := n.InEdge(); !ok {
+			continue
+		}
+		if dirPath := root.containingDir(n.Path()); dirPath != "" {
+			return fmt.Errorf("output %q is declared under directory output %q; a directory output owns its whole tree, so its members must not be declared as separate outputs", n.Path(), dirPath)
+		}
+	}
+	return nil
+}
+
+// dirTrieNode is a byte-trie over directory-output paths (each ending in "/").
+type dirTrieNode struct {
+	b        byte
+	children []*dirTrieNode
+	isDir    bool // a directory output ends at this node
+}
+
+func (t *dirTrieNode) child(b byte) *dirTrieNode {
+	for _, c := range t.children {
+		if c.b == b {
+			return c
+		}
+	}
+	return nil
+}
+
+func (t *dirTrieNode) insert(path string) {
+	cur := t
+	for i := range len(path) {
+		next := cur.child(path[i])
+		if next == nil {
+			next = &dirTrieNode{b: path[i]}
+			cur.children = append(cur.children, next)
+		}
+		cur = next
+	}
+	cur.isDir = true
+}
+
+// containingDir returns a directory output (path ends in "/") that strictly
+// contains p, or "" if none.
+func (t *dirTrieNode) containingDir(p string) string {
+	cur := t
+	for i := range len(p) {
+		next := cur.child(p[i])
+		if next == nil {
+			return ""
+		}
+		cur = next
+		if cur.isDir && i+1 < len(p) {
+			// p[:i+1] reached a dir-output terminal, so it strictly contains p.
+			return p[:i+1]
+		}
+	}
+	return ""
+}
+
 // NewGraph creates new Graph from fname (usually "build.ninja") with stepConfig.
-func NewGraph(ctx context.Context, fname string, nstate *ninjautil.State, config *buildconfig.Config, p *build.Path, hashFS *hashfs.HashFS, stepConfig *StepConfig, depsLog *DepsLog) *Graph {
+func NewGraph(ctx context.Context, fname string, nstate *ninjautil.State, config *buildconfig.Config, p *build.Path, hashFS *hashfs.HashFS, stepConfig *StepConfig, depsLog *DepsLog) (*Graph, error) {
 	defer trace.Begin(ctx, "ninjabuild.NewGraph").End()
 	graph := &Graph{
 		fname: fname,
@@ -226,22 +325,86 @@ func NewGraph(ctx context.Context, fname string, nstate *ninjautil.State, config
 			depsLog:        depsLog,
 			buildConfig:    config,
 			stepConfig:     stepConfig,
-			targetPaths:    make([]string, nstate.NumNodes()),
+			targetPaths:    make([]path.Path, nstate.NumNodes()),
 			depsPaths:      make([]atomic.Pointer[depsPath], depsLog.NumPaths()),
 			edgeRules:      make([]edgeRuleHolder, nstate.NumNodes()),
 			phony:          make(map[string]bool),
-			caseSensitives: make(map[string][]string),
+			caseSensitives: make(map[string][]path.Path),
 			gnTargets:      make(map[*ninjautil.Edge]gnTarget),
 			executables:    make(map[string]bool),
 		},
 	}
-	graph.initGlobals(ctx)
-	return graph
+	err := graph.initGlobals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return graph, nil
 }
 
 // StateDir returns state dir.
 func (g *Graph) StateDir() string {
 	return g.globals.stepConfig.StateDir
+}
+
+// Shell returns the hermetic shell binary path, or empty if not set.
+func (g *Graph) Shell() string {
+	return g.globals.stepConfig.Shell
+}
+
+func (g *Graph) setShell(ctx context.Context) error {
+	shell := g.globals.stepConfig.Shell
+	if shell == "" {
+		g.globals.shellCmd = ""
+		g.globals.shellInputs = nil
+		return nil
+	}
+	shellCmd, shellInput, err := resolveShellPath(ctx, g.globals.hashFS, g.globals.path, shell)
+	if err != nil {
+		return err
+	}
+	g.globals.shellCmd = shellCmd
+	shellInputs := []path.Path{shellInput}
+	shellInputs = g.globals.stepConfig.ExpandInputs(ctx, g.globals.path, g.globals.hashFS, shellInputs)
+	if !slices.Contains(shellInputs, shellInput) {
+		shellInputs = append([]path.Path{shellInput}, shellInputs...)
+	}
+	g.globals.shellInputs = shellInputs
+	return nil
+}
+
+func resolveShellPath(ctx context.Context, hashFS *hashfs.HashFS, p *build.Path, shell string) (string, path.Path, error) {
+	if shell == "" {
+		return "", "", nil
+	}
+	if runtime.GOOS == "windows" {
+		return "", "", fmt.Errorf("shell cannot be specified on windows, got %q: %w", shell, errors.ErrUnsupported)
+	}
+	if shell != filepath.Clean(shell) || !filepath.IsLocal(shell) {
+		return "", "", fmt.Errorf("%w, got: %q", errShellPathNotCleanOrLocal, shell)
+	}
+	// Enforce that the shell's basename is either "sh" or "bash" to match the
+	// hardcoded names in normalizeArgs().
+	// TODO: b/432599730 - remove the workaround
+	if base := filepath.Base(shell); base != "sh" && base != "bash" {
+		return "", "", fmt.Errorf("%w, got: %q", errInvalidShellBasename, base)
+	}
+
+	shellPath := path.New(shell)
+
+	if info, err := hashFS.Stat(ctx, p.WorkspaceRoot, shellPath); err != nil {
+		return "", "", fmt.Errorf("could not stat shell %q: %w", shell, err)
+	} else if info.Mode()&0o111 == 0 {
+		return "", "", fmt.Errorf("shell %q: %w (mode: %O)", shell, errShellNotExecutable, info.Mode())
+	}
+
+	shellCmd := p.MaybeToRelative(ctx, shell)
+
+	// Need a / in the path so that execve doesn't do $PATH lookup
+	if !strings.Contains(shellCmd, "/") {
+		shellCmd = "./" + shellCmd
+	}
+
+	return shellCmd, shellPath, nil
 }
 
 // Reload reloads hashfs, filegroups and build.ninja.
@@ -256,7 +419,7 @@ func (g *Graph) Reload(ctx context.Context) error {
 	})
 	eg.Go(func() error {
 		var err error
-		g.globals.stepConfig, err = NewStepConfig(ctx, g.globals.buildConfig, g.globals.path, g.fname, stateDir)
+		g.globals.stepConfig, err = NewStepConfig(ctx, g.globals.hashFS.DigestFunction(), g.globals.buildConfig, g.globals.path, g.fname, stateDir)
 		return err
 	})
 	eg.Go(func() error {
@@ -269,8 +432,7 @@ func (g *Graph) Reload(ctx context.Context) error {
 		return err
 	}
 	g.globals.nstate = newState
-	g.reset(ctx)
-	return nil
+	return g.reset(ctx)
 }
 
 // Reset resets graph status and hashfs.
@@ -280,28 +442,27 @@ func (g *Graph) Reset(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	g.reset(ctx)
-	return nil
+	return g.reset(ctx)
 }
 
-func (g *Graph) reset(ctx context.Context) {
+func (g *Graph) reset(ctx context.Context) error {
 	g.visited = make(map[*ninjautil.Edge]*build.Edge)
 	g.globals.depsLog.Reset()
-	g.globals.targetPaths = make([]string, g.globals.nstate.NumNodes())
+	g.globals.targetPaths = make([]path.Path, g.globals.nstate.NumNodes())
 	g.globals.depsPaths = make([]atomic.Pointer[depsPath], g.globals.depsLog.NumPaths())
 	g.globals.edgeRules = make([]edgeRuleHolder, g.globals.nstate.NumNodes())
 	g.globals.phony = make(map[string]bool)
-	g.globals.caseSensitives = make(map[string][]string)
+	g.globals.caseSensitives = make(map[string][]path.Path)
 	g.globals.gnTargets = make(map[*ninjautil.Edge]gnTarget)
 	g.globals.executables = make(map[string]bool)
-	g.initGlobals(ctx)
+	return g.initGlobals(ctx)
 }
 
-func (g *Graph) initGlobals(ctx context.Context) {
+func (g *Graph) initGlobals(ctx context.Context) error {
 	// initialize caseSensitives.
 	for _, f := range g.globals.stepConfig.CaseSensitiveInputs {
 		cif := strings.ToLower(f)
-		g.globals.caseSensitives[cif] = append(g.globals.caseSensitives[cif], f)
+		g.globals.caseSensitives[cif] = append(g.globals.caseSensitives[cif], path.FromClean(f))
 	}
 	// initialize :inputs label
 	inputsLabels := make(map[string]bool)
@@ -330,34 +491,42 @@ func (g *Graph) initGlobals(ctx context.Context) {
 			clog.Warningf(ctx, "no inputs for %q (%q)", label, target)
 			continue
 		}
-		inputNodes := edge.Inputs()
-		inputs := make([]string, 0, len(inputNodes))
-		for _, n := range inputNodes {
-			inputs = append(inputs, g.globals.targetPath(n))
+		visited := make(map[*ninjautil.Edge]bool)
+		seen := make(map[path.Path]bool)
+		stepInputs := replacePhony(ctx, g.globals, visited, seen, g.globals.targetPath(n), edge, false, nil)
+		inputs := make([]string, 0, len(stepInputs))
+		for _, n := range stepInputs {
+			inputs = append(inputs, string(n))
 		}
 		clog.Infof(ctx, "add %q (%q) in input_deps: %d", label, target, len(inputs))
 		g.globals.stepConfig.InputDeps[label] = inputs
 	}
 	// initialize executables.
-	hfsExecutables := make(map[string]bool)
+	hfsExecutables := make(map[path.Path]bool)
 	for _, f := range g.globals.stepConfig.Executables {
 		g.globals.executables[f] = true
-		absPath := f
-		if !filepath.IsAbs(absPath) {
-			absPath = filepath.Join(g.globals.path.WorkspaceRoot, f)
+		var absPath path.Path
+		if filepath.IsAbs(f) {
+			absPath = path.New(f)
+		} else {
+			absPath = path.JoinRoot(g.globals.path.WorkspaceRoot, path.New(f))
 		}
-		absPath = filepath.ToSlash(absPath)
 		hfsExecutables[absPath] = true
 		clog.Infof(ctx, "set executable %q %q", f, absPath)
 	}
 	g.globals.hashFS.SetExecutables(ctx, hfsExecutables)
+
+	err := g.setShell(ctx)
+	if err != nil {
+		return err
+	}
 
 	// TODO: find a better way to distinguish between gn build.ninja and other generator's one.
 	if _, ok := g.globals.nstate.LookupNodeByPath(g.fname); !ok {
 		// no node for g.fname (e.g. "build.ninja").
 		// so probably not build.ninja generated by gn.
 		clog.Infof(ctx, "no %s target. not gn?", g.fname)
-		return
+		return nil
 	}
 
 	// infer gn target.
@@ -439,6 +608,7 @@ func (g *Graph) initGlobals(ctx context.Context) {
 		}
 	}
 	clog.Infof(ctx, "gn_targets=%d edges=%d in %s", nGNTargets, len(g.globals.gnTargets), time.Since(started))
+	return nil
 }
 
 // Filename returns filename of build manifest (e.g. build.ninja).
@@ -480,6 +650,15 @@ func (g *Graph) Targets(ctx context.Context, args ...string) ([]build.Target, er
 	return targets, err
 }
 
+// LookupTarget returns the target ID for a build-dir-relative target path.
+func (g *Graph) LookupTarget(target string) (build.Target, bool) {
+	n, ok := g.globals.nstate.LookupNodeByPath(target)
+	if !ok {
+		return 0, false
+	}
+	return build.Target(n.ID()), true
+}
+
 // SpellcheckTarget finds closest target name from t.
 func (g *Graph) SpellcheckTarget(t string) (string, error) {
 	return g.globals.nstate.SpellcheckTarget(t)
@@ -491,17 +670,23 @@ func (g *Graph) TargetPath(ctx context.Context, target build.Target) (string, er
 	if !ok {
 		return "", fmt.Errorf("invalid target %v", target)
 	}
-	return g.globals.targetPath(node), nil
+	return string(g.globals.targetPath(node)), nil
 }
 
-func (g *globals) targetPath(node *ninjautil.Node) string {
+func (g *globals) targetPath(node *ninjautil.Node) path.Path {
 	p := g.targetPaths[node.ID()]
 	if p != "" {
 		return p
 	}
-	p = node.Path()
-	if !filepath.IsAbs(p) {
-		p = filepath.ToSlash(filepath.Join(g.path.BaseDir, p))
+	raw := node.Path()
+	if !filepath.IsAbs(raw) {
+		p = path.Path(filepath.ToSlash(filepath.Join(g.path.BaseDir, raw)))
+	} else {
+		p = path.Path(raw)
+	}
+	// filepath.Join strips a directory artifact's trailing slash; re-append it.
+	if strings.HasSuffix(raw, "/") && !strings.HasSuffix(string(p), "/") {
+		p += "/"
 	}
 	g.targetPaths[node.ID()] = p
 	return p
@@ -523,7 +708,7 @@ func (g *Graph) Edge(ctx context.Context, target build.Target, next build.StepDe
 		return v, build.ErrDuplicateStep
 	}
 	if edge.IsPhony() {
-		g.globals.phony[g.globals.targetPath(n)] = true
+		g.globals.phony[string(g.globals.targetPath(n))] = true
 	}
 	stepDef := g.newStepDef(ctx, edge, next)
 	edgeInputs := edge.TriggerInputs()
@@ -578,6 +763,11 @@ func (g *Graph) ClangScandeps(ctx context.Context) string {
 	return g.globals.stepConfig.Scandeps.UseClang
 }
 
+// EnvConfig returns environment configuration for build steps.
+func (g *Graph) EnvConfig(ctx context.Context) *build.EnvConfig {
+	return g.globals.stepConfig.Env
+}
+
 // StepLimits returns a map of maximum number of concurrent steps by pool name.
 func (g *Graph) StepLimits(ctx context.Context) map[string]int {
 	m := make(map[string]int)
@@ -594,34 +784,49 @@ func (g *Graph) StepLimits(ctx context.Context) map[string]int {
 // returns number of removed files and number of last generated files.
 func (g *Graph) CleanDead(ctx context.Context) (int, int, error) {
 	started := time.Now()
-	var deads []string
-	dir := g.globals.path.AbsBase()
+	var deads []path.Path
+	dir := path.New(g.globals.path.AbsBase())
 	genFiles := g.globals.hashFS.PreviouslyGeneratedFiles()
+
+	// Normalize generated files to workspace-relative slash paths, dropping
+	// any that escape the out dir (e.g. through a symlinked directory;
+	// b/336667052).
+	rels := make([]path.Path, 0, len(genFiles))
 	for _, genFile := range genFiles {
-		rel, err := filepath.Rel(dir, genFile)
+		rel, err := genFile.Rel(dir)
 		if err != nil {
 			return len(deads), len(genFiles), err
 		}
-		if !filepath.IsLocal(rel) {
-			// genFile may not be in out dir via symlink dir,
-			// then we should not remove the file.
-			// b/336667052
+		if !filepath.IsLocal(string(rel)) {
 			clog.Warningf(ctx, "skip generated file not in out dir: %s", genFile)
 			continue
 		}
-		rel = filepath.ToSlash(rel)
-		if g.isDead(rel) {
-			deads = append(deads, rel)
-			err := g.globals.hashFS.Remove(ctx, dir, rel)
+		rels = append(rels, rel)
+	}
+
+	// Judge only the outermost entries: a directory output is owned as a
+	// unit, so its contents must never be judged on their own. RemoveAll on
+	// a dead root takes its whole subtree. Sort only for deterministic deads.
+	slices.Sort(rels)
+	for _, rel := range execute.OutermostPaths(rels) {
+		if g.isDead(string(rel)) {
+			// RemoveAll so a dead dir output goes with its contents; a plain
+			// Remove would fail on a non-empty directory.
+			err := g.globals.hashFS.RemoveAll(ctx, string(dir), rel)
 			if err != nil {
-				return len(deads), len(genFiles), err
+				// Best-effort: a dead output that can't be removed (e.g. held
+				// open by another process on Windows) is left behind rather
+				// than failing the build.
+				clog.Warningf(ctx, "cleandead: leave %s: %v", rel, err)
+				continue
 			}
+			deads = append(deads, rel)
 			clog.Infof(ctx, "deadfile %s", rel)
 		}
 	}
 	var err error
 	if len(deads) > 0 {
-		err = g.globals.hashFS.Flush(ctx, dir, deads)
+		err = g.globals.hashFS.Flush(ctx, string(dir), deads)
 	}
 	if err != nil {
 		clog.Warningf(ctx, "cleandead %d/%d %s: %v", len(deads), len(genFiles), time.Since(started), err)
@@ -640,9 +845,14 @@ func (g *Graph) CleanDead(ctx context.Context) (int, int, error) {
 func (g *Graph) isDead(fname string) bool {
 	n, ok := g.globals.nstate.LookupNodeByPath(fname)
 	if !ok {
-		return true
+		// Directory-output nodes are keyed with a trailing slash ("gen/")
+		// but reach here slash-stripped ("gen"). Retry the slash form so a
+		// referenced dir node is not reported dead and RemoveAll'd.
+		n, ok = g.globals.nstate.LookupNodeByPath(fname + "/")
+		if !ok {
+			return true
+		}
 	}
 	_, ok = n.InEdge()
-	outs := n.OutEdges()
-	return !ok && len(outs) == 0
+	return !ok && !n.HasOut()
 }

@@ -5,18 +5,28 @@
 package resultstore
 
 import (
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 )
 
-func (u *Uploader) AddBuildLog(msg string) {
+// Write implements ResultSink.
+func (u *Uploader) Write(p []byte) (int, error) {
 	u.buildLogMu.Lock()
-	u.buildLog.WriteString(msg)
-	u.buildLogMu.Unlock()
+	defer u.buildLogMu.Unlock()
+	return u.buildLog.Write(p)
 }
 
-func (u *Uploader) BuildLogData() digest.Data {
+// BuildLogData drains all calls to [Uploader.Write] to CAS store blob.
+func (u *Uploader) BuildLogData() blob.Data {
+	// The data is uploaded via UploadFiles, which requires HashFS; fall back
+	// to SHA-256 when it is not set (the data is then never uploaded).
+	fn := digest.SHA256
+	if u.hashFS != nil {
+		fn = u.hashFS.DigestFunction()
+	}
 	u.buildLogMu.Lock()
-	data := digest.FromBytes("build.log", u.buildLog.Bytes())
+	data := blob.FromBytes(fn, "build.log", u.buildLog.Bytes())
 	u.buildLog.Reset()
 	u.buildLogMu.Unlock()
 	return data

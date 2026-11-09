@@ -1,0 +1,13 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule mkempty
+   command = python3 ../../tools/mkempty.py --out_dir=${out_dir}
+
+build empty/: mkempty | ../../tools/mkempty.py
+  out_dir = empty
+
+build all: phony empty/
+
+build build.ninja: phony

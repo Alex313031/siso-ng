@@ -21,6 +21,7 @@ import (
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/gccutil"
 	"go.chromium.org/build/siso/toolsupport/makeutil"
 	"go.chromium.org/build/siso/toolsupport/msvcutil"
@@ -32,7 +33,7 @@ type depsProcessor interface {
 
 	// fix step.cmd and returns deps inputs.
 	// paths are workspace relative.
-	DepsCmd(context.Context, *Builder, *Step) ([]string, error)
+	DepsCmd(context.Context, *Builder, *Step) ([]path.Path, error)
 
 	// collects deps after cmd run.
 	// paths are relative to the out dir.
@@ -48,23 +49,32 @@ var depsProcessors = map[string]depsProcessor{
 	"msvc":    depsMSVC{},
 }
 
-// DepfileAddsUnsandboxedFileError is error type when a depfile adds a file as a dep
-// that was not part of the original sandbox. Sandboxed actions can only use depfiles
-// to promote order-only deps to regular implicit deps.
-type DepfileAddsUnsandboxedFileError struct {
-	Inputs []string
+// DepsError is an error type for dependency check failures.
+type DepsError struct {
+	Err               error
+	UnsandboxedInputs []string
 }
 
-func (e DepfileAddsUnsandboxedFileError) Error() string {
-	return fmt.Sprintf("sandboxed action has depfile that adds dependencies that are not listed in its inputs. When sandboxing, depfiles can only be used to promote order-only deps to implicit deps. The files are:\n  %s", strings.Join(e.Inputs, "\n  "))
+func (e DepsError) Error() string {
+	if len(e.UnsandboxedInputs) > 0 {
+		return fmt.Sprintf("sandboxed action has depfile that adds dependencies that are not listed in its inputs. When sandboxing, depfiles can only be used to promote order-only deps to implicit deps. The files are:\n  %s", strings.Join(e.UnsandboxedInputs, "\n  "))
+	}
+	return fmt.Sprintf("deps error: %v", e.Err)
 }
 
-func (e DepfileAddsUnsandboxedFileError) Is(target error) bool {
-	t, ok := target.(DepfileAddsUnsandboxedFileError)
+func (e DepsError) Unwrap() error {
+	return e.Err
+}
+
+func (e DepsError) Is(target error) bool {
+	t, ok := target.(DepsError)
 	if !ok {
 		return false
 	}
-	return slices.Equal(e.Inputs, t.Inputs)
+	if len(e.UnsandboxedInputs) > 0 || len(t.UnsandboxedInputs) > 0 {
+		return slices.Equal(e.UnsandboxedInputs, t.UnsandboxedInputs)
+	}
+	return errors.Is(e.Err, t.Err)
 }
 
 // depsExpandInputs expands step.cmd.Inputs.
@@ -73,16 +83,16 @@ func depsExpandInputs(ctx context.Context, b *Builder, step *Step) {
 	ctx, span := trace.NewSpan(ctx, "deps-expand-inputs")
 	defer span.Close(nil)
 
-	fsys := b.hashFS.FileSystem(ctx, filepath.Join(step.cmd.WorkspaceRoot, step.cmd.WorkDir))
+	fsys := b.hashFS.FileSystem(ctx, filepath.Join(step.cmd.WorkspaceRoot, string(step.cmd.WorkDir)))
 
 	oldlen := len(step.cmd.Inputs)
-	var expanded []string
+	var expanded []path.Path
 	// deps=gcc,msvc with sources doesn't need to expand inputs,
 	// but need to use DepsBaseInputs to get expand phony in build graph inputs.
 	includeOrderOnly := false
-	sandbox, _ := selectSandbox(ctx, step)
-	if sandbox == "nsjail" {
-		// for nsjail sandbox, we need to include order-only files.
+	sandbox, _ := b.selectSandbox(ctx, step)
+	if sandbox != "" {
+		// for sandbox, we need to include order-only files.
 		// action will use subset of inputs and record them in depfile.
 		includeOrderOnly = true
 	}
@@ -106,8 +116,8 @@ func depsExpandInputs(ctx context.Context, b *Builder, step *Step) {
 	default:
 		expanded = step.def.ExpandedInputs(ctx)
 	}
-	inputs := make([]string, 0, oldlen+len(expanded))
-	seen := make(map[string]bool)
+	inputs := make([]path.Path, 0, oldlen+len(expanded))
+	seen := make(map[path.Path]bool)
 	for _, in := range step.cmd.Inputs {
 		if seen[in] {
 			continue
@@ -115,9 +125,10 @@ func depsExpandInputs(ctx context.Context, b *Builder, step *Step) {
 		seen[in] = true
 		// labels are expanded in expanded,
 		// so no need to preserve it in inputs.
-		if strings.Contains(in, ":") {
-			if runtime.GOOS == "windows" && filepath.IsAbs(in) {
-				if strings.Contains(in[2:], ":") {
+		ins := string(in)
+		if strings.Contains(ins, ":") {
+			if runtime.GOOS == "windows" && filepath.IsAbs(ins) {
+				if strings.Contains(ins[2:], ":") {
 					continue
 				}
 			} else {
@@ -142,14 +153,27 @@ func depsExpandInputs(ctx context.Context, b *Builder, step *Step) {
 		inputs = append(inputs, in)
 	}
 	clog.Infof(ctx, "deps expands %d -> %d", len(step.cmd.Inputs), len(inputs))
-	step.cmd.Inputs = make([]string, len(inputs))
-	copy(step.cmd.Inputs, inputs)
+	step.cmd.Inputs = inputs
+}
+
+// ensureExpanded runs depsExpandInputs and dedupInputs once per step.
+// preprocCmd and execLocal (after its two phase cache lookup) call it, so
+// every execution path sees the expanded inputs, and a two phase cache
+// hit, which replaces the inputs with the matched action's input root,
+// never expands them.
+func ensureExpanded(ctx context.Context, b *Builder, step *Step) {
+	if step.depsExpanded {
+		return
+	}
+	step.depsExpanded = true
+	depsExpandInputs(ctx, b, step)
+	dedupInputs(ctx, step.cmd)
 }
 
 // depsFixCmd checks the purity of the command by checking step inputs and deps.
-func depsFixCmd(ctx context.Context, b *Builder, step *Step, deps []string) {
-	deps = step.def.ExpandedCaseSensitives(ctx, deps)
-	err := checkDepsExist(ctx, b, deps)
+func depsFixCmd(ctx context.Context, b *Builder, step *Step, deps []path.Path) {
+	depPaths := step.def.ExpandedCaseSensitives(ctx, deps)
+	err := checkDepsExist(ctx, b, depPaths)
 	if err != nil {
 		clog.Warningf(ctx, "check deps exist: %v", err)
 		step.cmd.Pure = false
@@ -159,19 +183,18 @@ func depsFixCmd(ctx context.Context, b *Builder, step *Step, deps []string) {
 }
 
 func depsCmd(ctx context.Context, b *Builder, step *Step) error {
-	started := time.Now()
-	defer func() {
-		step.metrics.DepsScanTime = IntervalMetric(time.Since(started))
-	}()
+	// TODO: change name?
+	ctx, span := trace.NewSpan(ctx, spanDepsCmd)
+	defer span.Close(nil)
 
 	ds, found := depsProcessors[step.cmd.Deps]
 	if found {
 		start := time.Now()
 		includeOrderOnly := false
-		stepInputs := step.def.DepsBaseInputs(ctx, step.cmd.ToolInputs, includeOrderOnly)
+		baseInputs := step.def.DepsBaseInputs(ctx, step.cmd.ToolInputs, includeOrderOnly)
 		depsIns, err := ds.DepsCmd(ctx, b, step)
-		depsIns = step.def.ExpandedCaseSensitives(ctx, depsIns)
-		inputs := uniqueFiles(stepInputs, depsIns)
+		depsInPaths := step.def.ExpandedCaseSensitives(ctx, depsIns)
+		inputs := uniquePathFiles(baseInputs, depsInPaths)
 		clog.Infof(ctx, "%s-deps %d %s: %v", step.cmd.Deps, len(inputs), time.Since(start), err)
 		if err != nil {
 			return err
@@ -215,7 +238,7 @@ func depsClean(ctx context.Context, b *Builder, step *Step, err error) {
 	ds.DepsClean(ctx, b, step, err)
 }
 
-func checkDepsExist(ctx context.Context, b *Builder, depsIns []string) error {
+func checkDepsExist(ctx context.Context, b *Builder, depsIns []path.Path) error {
 	ctx, span := trace.NewSpan(ctx, "check-deps-exist")
 	defer span.Close(nil)
 
@@ -235,14 +258,14 @@ func checkDepsExist(ctx context.Context, b *Builder, depsIns []string) error {
 
 func checkDepfile(ctx context.Context, b *Builder, step *Step) error {
 	// need to write depfile on disk even if output_local_strategy skips downloading. b/355099718
-	err := b.hashFS.Flush(ctx, b.path.WorkspaceRoot, []string{step.cmd.Depfile})
+	err := b.hashFS.Flush(ctx, b.path.WorkspaceRoot, []path.Path{step.cmd.Depfile})
 	if err != nil {
 		return fmt.Errorf("failed to fetch depfile %q: %w", step.cmd.Depfile, err)
 	}
 	fsys := b.hashFS.FileSystem(ctx, b.path.WorkspaceRoot)
-	deps, err := makeutil.ParseDepsFile(ctx, fsys, step.cmd.Depfile)
+	deps, err := makeutil.ParseDepsFile(ctx, fsys, string(step.cmd.Depfile))
 	if err != nil {
-		return fmt.Errorf("failed to parse depfile %q: %w", step.cmd.Depfile, err)
+		return DepsError{Err: fmt.Errorf("failed to parse depfile %q: %w", step.cmd.Depfile, err)}
 	}
 	err = checkDeps(ctx, b, step, deps)
 	if err != nil {
@@ -263,16 +286,18 @@ func checkDeps(ctx context.Context, b *Builder, step *Step, deps []string) error
 		expInputs := step.def.ExpandedInputs(ctx)
 		ninjaInputs = make(map[string]bool, len(expInputs))
 		for _, in := range expInputs {
-			ninjaInputs[in] = true
+			ninjaInputs[string(in)] = true
 		}
 	}
 
-	var checkInputs []string
+	missingDepsCheckEnabled := b.missingDepsCheckEnabled()
+	var inputsToCheckMissingDeps []path.Path
 	var unsandboxed []string
 
 	platform := step.cmd.Platform
 	relocatableReq := platform["InputRootAbsolutePath"] == ""
 	for _, dep := range deps {
+		relDep := dep
 		// remote relocatableReq should not have absolute path dep.
 		if filepath.IsAbs(dep) {
 			if relocatableReq {
@@ -281,13 +306,26 @@ func checkDeps(ctx context.Context, b *Builder, step *Step, deps []string) error
 					return fmt.Errorf("absolute path in deps %q of %q: use input_root_absolute_path=true for %q (siso config: %s): %w", dep, step, step.cmd.Outputs[0], step.def.RuleName(), errNotRelocatable)
 				}
 			}
-			continue
+			rel, err := filepath.Rel(b.path.WorkspaceRoot, dep)
+			if err != nil {
+				// unable to make relative, consider as non-local b/542224263
+				continue
+			}
+			if !filepath.IsLocal(rel) {
+				// dependency on system file? ignore
+				continue
+			}
+			relDep, err = filepath.Rel(b.path.BaseDir, rel)
+			if err != nil {
+				return fmt.Errorf("failed to make dir relpath %q: %w", rel, err)
+			}
+			clog.Infof(ctx, "dep %q -> %q", dep, relDep)
 		}
 		// all dep (== inputs) should exist just after step ran.
-		input := b.path.MaybeFromRelative(ctx, dep)
+		input := path.New(b.path.MaybeFromRelative(ctx, relDep))
 
 		// Sandboxed actions can only use depfiles to promote order-only to implicit deps
-		if step.enforceDepfileOnlyPromotes && !ninjaInputs[input] {
+		if step.enforceDepfileOnlyPromotes && !ninjaInputs[string(input)] {
 			unsandboxed = append(unsandboxed, dep)
 			continue
 		}
@@ -297,15 +335,15 @@ func checkDeps(ctx context.Context, b *Builder, step *Step, deps []string) error
 			// file may be read by handler and not found
 			// and generated after that (e.g. gn_logs.txt)
 			// forget and check again.
-			b.hashFS.Forget(ctx, b.path.WorkspaceRoot, []string{input})
+			b.hashFS.Forget(ctx, b.path.WorkspaceRoot, []path.Path{input})
 			fi, err = b.hashFS.Stat(ctx, b.path.WorkspaceRoot, input)
 		}
 		if err != nil {
-			return fmt.Errorf("deps input %q not exist: %w", dep, err)
+			return DepsError{Err: fmt.Errorf("deps input %q not exist: %w", dep, err)}
 		}
 		// input should not be output.
 		if slices.Contains(step.cmd.Outputs, input) {
-			return fmt.Errorf("deps input %q is output", dep)
+			return DepsError{Err: fmt.Errorf("deps input %q is output", dep)}
 		}
 		if len(fi.CmdHash()) == 0 {
 			// source, not generated file
@@ -316,26 +354,60 @@ func checkDeps(ctx context.Context, b *Builder, step *Step, deps []string) error
 			// build.ninja should have been updated at the beginning of the build.
 			continue
 		}
-		checkInputs = append(checkInputs, input)
+		if !missingDepsCheckEnabled {
+			continue
+		}
+		inputsToCheckMissingDeps = append(inputsToCheckMissingDeps, input)
 	}
 	if len(unsandboxed) > 0 {
 		slices.Sort(unsandboxed)
-		return DepfileAddsUnsandboxedFileError{Inputs: unsandboxed}
+		return DepsError{UnsandboxedInputs: unsandboxed}
 	}
-	if experiments.Enabled("check-deps", "") || experiments.Enabled("fail-on-bad-deps", "") {
-		unknownBadDep, err := step.def.CheckInputDeps(ctx, checkInputs)
-		if err != nil {
-			clog.Warningf(ctx, "deps error: %v", err)
-			if unknownBadDep && experiments.Enabled("fail-on-bad-deps", "") {
-				return fmt.Errorf("deps error: %w", err)
-			}
-			stderr := step.cmd.Stderr()
-			w := step.cmd.StderrWriter()
-			if len(stderr) != 0 && !bytes.HasSuffix(stderr, []byte("\n")) {
-				fmt.Fprintf(w, "\n")
-			}
-			fmt.Fprintf(w, "deps error: %v\n", err)
-		}
+	if !missingDepsCheckEnabled {
+		return nil
+	}
+	err := checkMissingDeps(ctx, b, step, inputsToCheckMissingDeps)
+	if err != nil {
+		return DepsError{Err: err}
 	}
 	return nil
+}
+
+func checkMissingDeps(ctx context.Context, b *Builder, step *Step, inputs []path.Path) error {
+	if len(inputs) == 0 {
+		return nil
+	}
+	known, err := step.def.CheckMissingDeps(ctx, inputs)
+	if err == nil {
+		return nil
+	}
+	clog.Warningf(ctx, "%s", err)
+
+	if known {
+		printStderr(step, fmt.Sprintf("missing deps warn: %s", err))
+		return nil
+	}
+
+	mode := b.missingDepsMode()
+	switch mode {
+	case MissingDepsFatal:
+		return fmt.Errorf("%w: missing deps error: %w", ErrMissingDepsViolation, err)
+	case MissingDepsError:
+		// Defer build failure to the end so remaining steps can continue
+		// and report any additional missing dependency violations.
+		b.hasDeferredMissingDepsErrors.Store(true)
+		fallthrough
+	case MissingDepsWarn:
+		printStderr(step, fmt.Sprintf("missing deps %s: %s", mode, err))
+	}
+	return nil
+}
+
+func printStderr(step *Step, msg string) {
+	stderr := step.cmd.Stderr()
+	w := step.cmd.StderrWriter()
+	if len(stderr) != 0 && !bytes.HasSuffix(stderr, []byte("\n")) {
+		fmt.Fprintf(w, "\n")
+	}
+	fmt.Fprintf(w, "%s\n", msg)
 }

@@ -35,8 +35,8 @@ message RbeBuildMetrics {
   // Siso doesn't provide reproxy information.
   reserved 9;
 
-  // The number of cache hits divided by the number of actions. 0 if there are
-  // no actions.
+  // The number of cache hits divided by the total number of actions. 0
+  // if there are no actions.
   double build_cache_hit_ratio = 10;
 
   // Total seconds between start of first build action and end of last build
@@ -50,6 +50,14 @@ message RbeBuildMetrics {
   reserved 12;
 
   reserved 3, 8;
+
+  // Total number of two-phase cache hits divided by the total number of
+  // local actions. 0 if there are no actions.
+  double two_phase_cache_hit_ratio = 13;
+
+  // The total number of remote cache hits divided by the total number of remote
+  // actions. 0 if there are no actions.
+  double remote_cache_hit_ratio = 14;
 }
 
 message Stat {

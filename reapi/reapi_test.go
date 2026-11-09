@@ -25,11 +25,12 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/auth/cred"
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/reapitest"
 )
 
@@ -166,7 +167,7 @@ func TestUploadAll(t *testing.T) {
 	ctx := t.Context()
 	fakere := &reapitest.Fake{}
 	cl := reapitest.New(ctx, t, fakere)
-	ds := digest.NewStore()
+	ds := blob.NewStore()
 
 	// No uploads
 	n, err := cl.UploadAll(ctx, ds)
@@ -177,7 +178,7 @@ func TestUploadAll(t *testing.T) {
 	// Upload missing blobs.
 	// The small blob will be uploaded by BatchUpdateBlobs RPC
 	smallBlob := []byte("foo")
-	sd := digest.FromBytes("small", smallBlob)
+	sd := blob.FromBytes(digest.SHA256, "small", smallBlob)
 	ds.Set(sd)
 	// The large blob will be uploaded by ByteStream RPC
 	pattern := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A}
@@ -186,7 +187,7 @@ func TestUploadAll(t *testing.T) {
 		buf.WriteByte(pattern[rand.Intn(len(pattern))])
 	}
 	largeBlob := buf.Bytes()
-	ld := digest.FromBytes("large", largeBlob)
+	ld := blob.FromBytes(digest.SHA256, "large", largeBlob)
 	ds.Set(ld)
 	n, err = cl.UploadAll(ctx, ds)
 	if err != nil || n != 2 {
@@ -213,7 +214,7 @@ func TestUploadAllWithCompression(t *testing.T) {
 		CompressedBlob: 1,
 	}
 	cl := reapitest.NewWithOption(ctx, t, fakere, opt)
-	ds := digest.NewStore()
+	ds := blob.NewStore()
 
 	// No uploads
 	n, err := cl.UploadAll(ctx, ds)
@@ -224,7 +225,7 @@ func TestUploadAllWithCompression(t *testing.T) {
 	// Upload missing blobs.
 	// The small blob will be uploaded by BatchUpdateBlobs RPC
 	smallBlob := []byte("foo")
-	sd := digest.FromBytes("small", smallBlob)
+	sd := blob.FromBytes(digest.SHA256, "small", smallBlob)
 	ds.Set(sd)
 	// The large blob will be uploaded by ByteStream RPC
 	pattern := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A}
@@ -233,7 +234,7 @@ func TestUploadAllWithCompression(t *testing.T) {
 		buf.WriteByte(pattern[rand.Intn(len(pattern))])
 	}
 	largeBlob := buf.Bytes()
-	ld := digest.FromBytes("large", largeBlob)
+	ld := blob.FromBytes(digest.SHA256, "large", largeBlob)
 	ds.Set(ld)
 	n, err = cl.UploadAll(ctx, ds)
 	if err != nil || n != 2 {
@@ -303,6 +304,71 @@ func (s *fakeExecServer) Execute(_ *rpb.ExecuteRequest, stream rpb.Execution_Exe
 	})
 }
 
+// recordingExecServer records the DigestFunction of the request it receives,
+// then replies with a successful done op.
+type recordingExecServer struct {
+	rpb.UnimplementedExecutionServer
+	gotFn rpb.DigestFunction_Value
+}
+
+func (s *recordingExecServer) Execute(req *rpb.ExecuteRequest, stream rpb.Execution_ExecuteServer) error {
+	s.gotFn = req.DigestFunction
+	respAny, _ := anypb.New(&rpb.ExecuteResponse{
+		Result: &rpb.ActionResult{ExitCode: 0},
+	})
+	return stream.Send(&longrunningpb.Operation{
+		Name:   "op/1",
+		Done:   true,
+		Result: &longrunningpb.Operation_Response{Response: respAny},
+	})
+}
+
+// TestExecuteAndWaitDefaultsDigestFunction verifies that ExecuteAndWait fills in
+// the client's digest function when the request leaves it UNKNOWN (e.g. the
+// prototext-parsed request from `siso recall`).
+func TestExecuteAndWaitDefaultsDigestFunction(t *testing.T) {
+	ctx := t.Context()
+
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	es := &recordingExecServer{}
+	rpb.RegisterExecutionServer(srv, es)
+	go srv.Serve(lis)
+	t.Cleanup(srv.Stop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	// Construct the client with blake3 so ExecuteAndWait sees a non-default
+	// digest function.
+	cl, err := reapi.NewFromConn(ctx, reapi.Option{
+		Instance:       "test",
+		KeepExecStream: true,
+		DigestFunction: "blake3",
+	}, cred.Cred{}, conn, conn, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = cl.ExecuteAndWait(ctx, &rpb.ExecuteRequest{
+		ActionDigest:    &rpb.Digest{Hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		SkipCacheLookup: true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteAndWait: %v", err)
+	}
+	if got, want := es.gotFn, rpb.DigestFunction_BLAKE3; got != want {
+		t.Errorf("server received DigestFunction = %v, want %v", got, want)
+	}
+}
+
 // TestExecuteStream_NoCanceledOnSuccess verifies that a successful
 // Execute call does not report Canceled to the server. Without the
 // stream drain, the caller's deferred context cancel tears the stream
@@ -332,7 +398,7 @@ func TestExecuteStream_NoCanceledOnSuccess(t *testing.T) {
 	cl, err := reapi.NewFromConn(ctx, reapi.Option{
 		Instance:       "test",
 		KeepExecStream: true,
-	}, cred.Cred{}, conn, conn)
+	}, cred.Cred{}, conn, conn, conn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,9 +435,9 @@ func TestByteStreamRead_NoCanceledOnSuccess(t *testing.T) {
 		ByteStreamReadThreshold: 1,
 	}, grpc.WithStatsHandler(cc))
 
-	blob := []byte("test blob for bytestream read")
-	ds := digest.NewStore()
-	d := digest.FromBytes("test-blob", blob)
+	raw := []byte("test blob for bytestream read")
+	ds := blob.NewStore()
+	d := blob.FromBytes(digest.SHA256, "test-blob", raw)
 	ds.Set(d)
 	if _, err := cl.UploadAll(ctx, ds); err != nil {
 		t.Fatalf("UploadAll: %v", err)
@@ -381,7 +447,7 @@ func TestByteStreamRead_NoCanceledOnSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if !bytes.Equal(got, blob) {
+	if !bytes.Equal(got, raw) {
 		t.Fatalf("Get returned wrong data")
 	}
 

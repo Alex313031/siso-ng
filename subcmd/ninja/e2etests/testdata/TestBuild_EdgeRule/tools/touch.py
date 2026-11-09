@@ -10,7 +10,7 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("stamp", help="stamp file")
   options = parser.parse_args()
-  with open(options.stamp, 'w'):
+  with open(options.stamp, "w"):
     pass
 
 

@@ -20,6 +20,7 @@ import (
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	sisopath "go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/sync/semaphore"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
 	"go.chromium.org/build/siso/ui"
@@ -137,7 +138,7 @@ func loadCheckGraph(ctx context.Context, filename string, buildPath *build.Path,
 
 	// zero step config. no remote exec for gn gen?
 	stepConfig := &StepConfig{}
-	return NewGraph(ctx, filename, nstate, config, buildPath, hashFS, stepConfig, localDepsLog), nil
+	return NewGraph(ctx, filename, nstate, config, buildPath, hashFS, stepConfig, localDepsLog)
 }
 
 // Run runs a ninja build.
@@ -164,6 +165,7 @@ func Run(ctx context.Context, graph *Graph, bopts build.Options, targets []strin
 	}
 
 	for {
+		registerManifestFiles(ctx, graph, bopts.BuildLabel)
 		clog.Infof(ctx, "build starts")
 		stats, err := doBuild(ctx, graph, bopts, nopts, targets...)
 		if errors.Is(err, build.ErrManifestModified) {
@@ -182,15 +184,28 @@ func Run(ctx context.Context, graph *Graph, bopts build.Options, targets []strin
 			continue
 		}
 		clog.Infof(ctx, "build finished: %v", err)
-		if bopts.ResultstoreUploader != nil {
+		if bopts.ResultSink != nil {
 			if err != nil {
-				bopts.ResultstoreUploader.AddBuildLog(fmt.Sprintf("build failed: %v\n", err))
+				fmt.Fprintf(bopts.ResultSink, "build failed: %v\n", err)
 			} else {
-				bopts.ResultstoreUploader.AddBuildLog("build succeeded\n")
+				fmt.Fprintln(bopts.ResultSink, "build succeeded")
 			}
 		}
 		return stats, err
 	}
+}
+
+// registerManifestFiles records all loaded Ninja manifest files (the root
+// manifest and any recursive subninjas) into the HashFS build label ledger.
+func registerManifestFiles(ctx context.Context, graph *Graph, buildLabel string) {
+	if buildLabel == "" || graph == nil || graph.globals == nil || graph.globals.hashFS == nil || graph.globals.nstate == nil || graph.globals.path == nil {
+		return
+	}
+	manifestFiles := graph.globals.nstate.Filenames()
+	if len(manifestFiles) == 0 {
+		return
+	}
+	graph.globals.hashFS.UpdateBuildLabelMask(ctx, graph.globals.path.AbsBase(), buildLabel, manifestFiles)
 }
 
 func rebuildManifest(ctx context.Context, graph *Graph, bopts build.Options) error {
@@ -271,19 +286,12 @@ func doBuild(ctx context.Context, graph *Graph, bopts build.Options, nopts RunNi
 		return stats, err
 	}
 	stateDir := graph.StateDir()
-	if bopts.ResultstoreUploader != nil {
-		err := bopts.ResultstoreUploader.NewConfiguration(ctx, "default", graph.ConfigProperties())
+	if bopts.ResultSink != nil {
+		ents, err := bopts.HashFS.Entries(ctx, bopts.Path.AbsBase(), []sisopath.Path{sisopath.New(filepath.Join(stateDir, ".siso_config")), sisopath.New(filepath.Join(stateDir, ".siso_filegroups"))})
 		if err != nil {
 			return stats, err
 		}
-		bopts.ResultstoreUploader.HashFS = bopts.HashFS
-		bopts.ResultstoreUploader.REAPIClient = bopts.REAPIClient
-
-		ents, err := bopts.HashFS.Entries(ctx, bopts.Path.AbsBase(), []string{filepath.Join(stateDir, ".siso_config"), filepath.Join(stateDir, ".siso_filegroups")})
-		if err != nil {
-			return stats, err
-		}
-		err = bopts.ResultstoreUploader.UploadFiles(ctx, ents)
+		err = bopts.ResultSink.UploadBuildConfig(ctx, graph.ConfigProperties(), ents)
 		if err != nil {
 			return stats, err
 		}
@@ -346,8 +354,8 @@ func doBuild(ctx context.Context, graph *Graph, bopts build.Options, nopts RunNi
 	if len(semaStats) > 0 {
 		rut := dumpResourceUsageTable(semaStats)
 		clog.Infof(ctx, "resource usage table:\n%s", rut)
-		if bopts.ResultstoreUploader != nil {
-			bopts.ResultstoreUploader.AddBuildLog(rut + "\n")
+		if bopts.ResultSink != nil {
+			fmt.Fprintln(bopts.ResultSink, rut)
 		}
 	}
 	stats = b.Stats()

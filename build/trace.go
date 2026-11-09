@@ -6,6 +6,7 @@ package build
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -14,7 +15,278 @@ import (
 	"go.chromium.org/build/siso/o11y/trace"
 )
 
-func (b *Builder) traceEvents(ctx context.Context, tc *trace.Context) []trace.Event {
+const (
+	flowCat  = "flow"
+	flowName = "dep"
+
+	// The critical path track: its slices and its hops.
+	criticalCat = "critical"
+)
+
+// flowPoint is where one end of an arrow attaches.
+type flowPoint struct {
+	ts  trace.Micros
+	pid int64
+	tid int64
+}
+
+// stepTrace is what one finished step contributes to the recorder.
+type stepTrace struct {
+	attr spanEventAttr
+	// start is when the scheduler began the step, release when its outputs
+	// reached the steps waiting on them, end when it was done altogether.
+	start, release, end time.Duration
+	times               stepTimes
+}
+
+// stepTimes are the parts of a step that explain its width on the critical
+// path track, from the step's metrics. Zero means the step had none.
+type stepTimes struct {
+	scandeps, scandepsQueue, cache, materializeInputs, queue, exec, run, materializeOutputs time.Duration
+}
+
+// args labels a critical path slice like the step's other slices, plus the
+// non-zero parts of its width in milliseconds.
+func (st stepTrace) args() map[string]any {
+	args := map[string]any{
+		"id":          st.attr.id,
+		"description": st.attr.description,
+		"action":      st.attr.action,
+		"command":     st.attr.command,
+		"backtrace":   st.attr.backtrace,
+		"prev_id":     st.attr.prevID,
+	}
+	for _, t := range []struct {
+		key string
+		d   time.Duration
+	}{
+		{"scandeps_ms", st.times.scandeps},
+		{"scandeps_queue_ms", st.times.scandepsQueue},
+		{"cache_ms", st.times.cache},
+		{"materialize_inputs_ms", st.times.materializeInputs},
+		{"queue_ms", st.times.queue},
+		{"exec_ms", st.times.exec},
+		{"run_ms", st.times.run},
+		{"materialize_outputs_ms", st.times.materializeOutputs},
+		{"after_release_ms", st.end - st.release},
+	} {
+		if v := ms(t.d); v > 0 {
+			args[t.key] = v
+		}
+	}
+	return args
+}
+
+// ms renders d for args, in milliseconds to the microsecond.
+func ms(d time.Duration) float64 {
+	return float64(d.Round(time.Microsecond)) / 1e6
+}
+
+type depStep struct {
+	stepTrace
+	// anchored means a slice of this step has width, so an arrow can end
+	// inside it at dst, the start of its first slice, or leave it from src,
+	// the middle of its last. Handler-only steps such as copy emit no slice.
+	src, dst flowPoint
+	anchored bool
+}
+
+// depRecorder draws an arrow into each step from the input that finished
+// last, the step the scheduler recorded as prev, and the critical path those
+// links form. Steps finalize in any order, so links are collected during the
+// build and joined afterwards.
+//
+// The Builder holds a nil recorder when tracing is off; add, drain and record
+// accept that. The rest run under drain's lock.
+type depRecorder struct {
+	tracer *trace.Tracer
+	// pid and tid of the critical path track.
+	pid, tid int64
+
+	mu    sync.Mutex
+	steps map[string]depStep // nil once drained
+}
+
+func newDepRecorder(ctx context.Context, tracer *trace.Tracer) *depRecorder {
+	if !tracer.Enabled() {
+		return nil
+	}
+	pid := tracer.Process(ctx, "critical path")
+	// Above the per-step tracks, where the viewer opens.
+	tracer.ProcessSortIndex(ctx, pid, -1)
+	tid := int64(tracer.Thread(ctx, pid, "critical path"))
+	return &depRecorder{tracer: tracer, pid: pid, tid: tid, steps: make(map[string]depStep)}
+}
+
+// add records a step even with no slice to anchor an arrow, so the chain can
+// pass through it.
+func (r *depRecorder) add(st stepTrace, events []trace.Event) {
+	if r == nil || st.attr.id == "" {
+		return
+	}
+	src, dst, anchored := flowEnds(events)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.steps == nil {
+		return // drain already ran; a step can finish after Build returned.
+	}
+	r.steps[st.attr.id] = depStep{stepTrace: st, src: src, dst: dst, anchored: anchored}
+}
+
+// criticalPath draws the chain on a track of its own: one slice per step,
+// from its start to the moment it released its successor. Work after that
+// point, such as the depfile flush, delayed nothing and is left off. A
+// successor cannot start before its release, so the slices never overlap and
+// one row holds them all. The last step keeps its tail: the build waited for it.
+//
+// The caller holds r.mu.
+func (r *depRecorder) criticalPath() []trace.Event {
+	chain := r.chain()
+	events := make([]trace.Event, 0, 3*len(chain))
+	for i, st := range chain {
+		stop := st.release
+		if i == len(chain)-1 {
+			stop = st.end
+		}
+		events = append(events, trace.Event{
+			Name: st.attr.output0,
+			Cat:  criticalCat,
+			Ph:   "X",
+			T:    trace.Micros(st.start),
+			Dur:  trace.Micros(stop - st.start),
+			Pid:  r.pid,
+			Tid:  r.tid,
+			Args: st.args(),
+		})
+		if i == 0 {
+			continue
+		}
+		// Hops give Perfetto's detail panel its preceding and following links.
+		// They leave from the middle, as in flowEnds.
+		prev := chain[i-1]
+		id := r.tracer.NextFlowID()
+		events = append(events,
+			trace.Event{Name: flowName, Cat: criticalCat, Ph: "s", ID: id, T: trace.Micros(prev.start + (prev.release-prev.start)/2), Pid: r.pid, Tid: r.tid},
+			trace.Event{Name: flowName, Cat: criticalCat, Ph: "f", Bp: "e", ID: id, T: trace.Micros(st.start), Pid: r.pid, Tid: r.tid})
+	}
+	return events
+}
+
+// chain returns the critical path, oldest first: the step that finished
+// last, the step that released it, and so on back.
+//
+// The caller holds r.mu.
+func (r *depRecorder) chain() []stepTrace {
+	var last string
+	var lastEnd time.Duration
+	for id, step := range r.steps {
+		if step.end > lastEnd {
+			last, lastEnd = id, step.end
+		}
+	}
+	var chain []stepTrace
+	// A chain cannot be longer than the table unless it loops.
+	for id := last; id != "" && len(chain) < len(r.steps); {
+		step, ok := r.steps[id]
+		if !ok {
+			break
+		}
+		chain = append(chain, step.stepTrace)
+		id = step.attr.prevID
+	}
+	slices.Reverse(chain)
+	return chain
+}
+
+// source walks back to the nearest step with a slice of its own; some emit
+// none and still unblock others. Skipped and phony steps never get here:
+// plan.completeStep already forwards prev past them.
+//
+// The caller holds r.mu.
+func (r *depRecorder) source(prev string) (flowPoint, bool) {
+	// A chain cannot be longer than the table unless it loops.
+	for range len(r.steps) {
+		step, ok := r.steps[prev]
+		if !ok {
+			return flowPoint{}, false
+		}
+		if step.anchored {
+			return step.src, true
+		}
+		prev = step.attr.prevID
+	}
+	return flowPoint{}, false
+}
+
+// flows returns both ends of every arrow. Ids come from the tracer because
+// several builders share one file.
+//
+// The caller holds r.mu.
+func (r *depRecorder) flows() []trace.Event {
+	events := make([]trace.Event, 0, 2*len(r.steps))
+	for _, step := range r.steps {
+		if !step.anchored || step.attr.prevID == "" {
+			continue
+		}
+		src, ok := r.source(step.attr.prevID)
+		if !ok {
+			continue
+		}
+		id := r.tracer.NextFlowID()
+		events = append(events,
+			trace.Event{Name: flowName, Cat: flowCat, Ph: "s", ID: id, T: src.ts, Pid: src.pid, Tid: src.tid},
+			trace.Event{Name: flowName, Cat: flowCat, Ph: "f", Bp: "e", ID: id, T: step.dst.ts, Pid: step.dst.pid, Tid: step.dst.tid})
+	}
+	return events
+}
+
+// drain returns everything to draw and releases the step table.
+func (r *depRecorder) drain() []trace.Event {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	events := append(r.criticalPath(), r.flows()...)
+	r.steps = nil
+	return events
+}
+
+func (r *depRecorder) record() {
+	if r == nil {
+		return
+	}
+	r.tracer.Record(r.drain())
+}
+
+// flowEnds picks a point inside the step's last slice and the start of its
+// first. An arrow binds to the slice holding its timestamp, so a zero-width
+// slice can hold none.
+func flowEnds(events []trace.Event) (src, dst flowPoint, ok bool) {
+	var first, last trace.Event
+	for _, ev := range events {
+		if ev.Dur <= 0 {
+			continue
+		}
+		if !ok || ev.T < first.T {
+			first = ev
+		}
+		if !ok || ev.T+ev.Dur > last.T+last.Dur {
+			last = ev
+		}
+		ok = true
+	}
+	if !ok {
+		return src, dst, false
+	}
+	// A slice covers [ts, ts+dur), so its end would bind to whatever follows
+	// on the track. The middle is inside at any width.
+	src = flowPoint{ts: last.T + last.Dur/2, pid: last.Pid, tid: last.Tid}
+	dst = flowPoint{ts: first.T, pid: first.Pid, tid: first.Tid}
+	return src, dst, true
+}
+
+func (b *Builder) traceEvents(ctx context.Context, tc *trace.Context, step *Step) []trace.Event {
 	spans := tc.Spans()
 	if len(spans) == 0 {
 		return nil
@@ -45,6 +317,28 @@ func (b *Builder) traceEvents(ctx context.Context, tc *trace.Context) []trace.Ev
 		}
 		events = append(events, obj)
 	}
+	release := step.releaseTime
+	if release.IsZero() { // failed before releasing anything
+		release = step.endTime
+	}
+	m := &step.metrics
+	b.traceDeps.add(stepTrace{
+		attr:    attr,
+		start:   step.startTime.Sub(trace.StartTime()),
+		release: release.Sub(trace.StartTime()),
+		end:     step.endTime.Sub(trace.StartTime()),
+		times: stepTimes{
+			// DepsScanTime wraps the scan and its semaphore wait.
+			scandeps:           time.Duration(m.ScandepsTime),
+			scandepsQueue:      time.Duration(m.DepsScanTime - m.ScandepsTime),
+			cache:              time.Duration(m.CacheTime),
+			materializeInputs:  time.Duration(m.MaterializeInputsTime),
+			queue:              time.Duration(m.QueueTime),
+			exec:               time.Duration(m.ExecTime),
+			run:                time.Duration(m.RunTime),
+			materializeOutputs: time.Duration(m.MaterializeOutputsTime),
+		},
+	}, events)
 	return events
 }
 
@@ -90,10 +384,10 @@ func runPreprocSpanEvent(span trace.SpanData, attr spanEventAttr, pid int64) tra
 		Name: attr.output0,
 		Cat:  attr.spanName,
 		Ph:   "X",
-		T:    span.Start.Sub(trace.StartTime()).Microseconds(),
+		T:    trace.Micros(span.Start.Sub(trace.StartTime())),
 		Pid:  pid,
 		Tid:  int64(span.Tid),
-		Dur:  span.Duration().Microseconds(),
+		Dur:  trace.Micros(span.Duration()),
 		Args: map[string]any{
 			"id":          attr.id,
 			"description": attr.description,
@@ -110,10 +404,10 @@ func runLocalSpanEvent(span trace.SpanData, attr spanEventAttr, pid int64) trace
 		Name: attr.output0,
 		Cat:  attr.spanName,
 		Ph:   "X",
-		T:    span.Start.Sub(trace.StartTime()).Microseconds(),
+		T:    trace.Micros(span.Start.Sub(trace.StartTime())),
 		Pid:  pid,
 		Tid:  int64(span.Tid),
-		Dur:  span.Duration().Microseconds(),
+		Dur:  trace.Micros(span.Duration()),
 		Args: map[string]any{
 			"id":          attr.id,
 			"description": attr.description,
@@ -130,10 +424,10 @@ func runRemoteSpanEvent(span trace.SpanData, attr spanEventAttr, pid int64) trac
 		Name: attr.output0,
 		Cat:  attr.spanName,
 		Ph:   "X",
-		T:    span.Start.Sub(trace.StartTime()).Microseconds(),
+		T:    trace.Micros(span.Start.Sub(trace.StartTime())),
 		Pid:  pid,
 		Tid:  int64(span.Tid),
-		Dur:  span.Duration().Microseconds(),
+		Dur:  trace.Micros(span.Duration()),
 		Args: map[string]any{
 			"id":          attr.id,
 			"description": attr.description,
@@ -150,10 +444,10 @@ func rbeWorkerSpanEvent(span trace.SpanData, attr spanEventAttr, pid int64, work
 		Name: attr.output0,
 		Cat:  attr.spanName,
 		Ph:   "X",
-		T:    span.Start.Sub(trace.StartTime()).Microseconds(),
+		T:    trace.Micros(span.Start.Sub(trace.StartTime())),
 		Pid:  pid,
 		Tid:  int64(workerID),
-		Dur:  span.Duration().Microseconds(),
+		Dur:  trace.Micros(span.Duration()),
 		Args: map[string]any{
 			"id":          attr.id,
 			"description": attr.description,

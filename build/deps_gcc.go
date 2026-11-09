@@ -20,6 +20,7 @@ import (
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi/merkletree"
 	"go.chromium.org/build/siso/scandeps"
 	"go.chromium.org/build/siso/toolsupport/gccutil"
@@ -41,13 +42,13 @@ func (gcc depsGCC) DepsFastCmd(ctx context.Context, b *Builder, cmd *execute.Cmd
 	}
 	// sets include dirs + sysroots to ToolInputs.
 	// Inputs will be overridden by deps log data.
-	newCmd.ToolInputs = append(newCmd.ToolInputs, inputs...)
+	newCmd.ToolInputs = append(newCmd.ToolInputs, path.Paths(inputs)...)
 	gcc.fixForSplitDwarf(ctx, newCmd)
 	return newCmd, nil
 }
 
 func (gcc depsGCC) fixCmdInputs(ctx context.Context, b *Builder, cmd *execute.Cmd) ([]string, error) {
-	params, err := gccutil.ExtractScanDepsParams(ctx, cmd.Args, cmd.Env, b.hashFS.FileSystem(ctx, filepath.Join(cmd.WorkspaceRoot, cmd.WorkDir)))
+	params, err := gccutil.ExtractScanDepsParams(ctx, cmd.Args, cmd.Env, b.hashFS.FileSystem(ctx, filepath.Join(cmd.WorkspaceRoot, string(cmd.WorkDir))))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +71,7 @@ func (gcc depsGCC) fixCmdInputs(ctx context.Context, b *Builder, cmd *execute.Cm
 	if len(params.Sources) == 0 {
 		// If ExtractScanDepsParams doesn't return Sources, such action uses inputs from ninja build file directly, as the action doesn't need include scanning.
 		// e.g. clang modules, rust and etc.
-		inputs = slices.Clone(cmd.Inputs)
+		inputs = path.Strings(cmd.Inputs)
 	}
 	// include files detected by command line. i.e. sanitaizer ignore lists.
 	// These would not be in depsfile, different from Sources.
@@ -109,13 +110,13 @@ func (depsGCC) fixForSplitDwarf(ctx context.Context, cmd *execute.Cmd) {
 	}
 	dwo := ""
 	for _, out := range cmd.Outputs {
-		if before, ok := strings.CutSuffix(out, ".o"); ok { // TODO: or ".obj" for win?
+		if before, ok := strings.CutSuffix(string(out), ".o"); ok { // TODO: or ".obj" for win?
 			dwo = before + ".dwo"
 			continue
 		}
 	}
 	clog.Infof(ctx, "add %s", dwo)
-	cmd.Outputs = uniqueFiles(cmd.Outputs, []string{dwo})
+	cmd.Outputs = uniquePathFiles(cmd.Outputs, []path.Path{path.New(dwo)})
 }
 
 func (depsGCC) DepsAfterRun(ctx context.Context, b *Builder, step *Step) (_ []string, err error) {
@@ -134,18 +135,18 @@ func (depsGCC) DepsAfterRun(ctx context.Context, b *Builder, step *Step) (_ []st
 	_, dspan := trace.NewSpan(ctx, "parse-deps")
 	deps, err := makeutil.ParseDeps(ctx, buf)
 	if err != nil {
-		return nil, fmt.Errorf("gcc-deps: failed to parse depfile %q: %w", step.cmd.Depfile, err)
+		return nil, DepsError{Err: fmt.Errorf("gcc-deps: failed to parse depfile %q: %w", step.cmd.Depfile, err)}
 	}
 	err = checkDeps(ctx, b, step, deps)
 	if err != nil {
-		return nil, fmt.Errorf("error in depfile %q: %w", step.cmd.Depfile, err)
+		return nil, fmt.Errorf("error in GCC deps check with depfile %q: %w", step.cmd.Depfile, err)
 	}
 	dspan.SetAttr("deps", len(deps))
 	dspan.Close(nil)
 	return deps, nil
 }
 
-func (gcc depsGCC) DepsCmd(ctx context.Context, b *Builder, step *Step) ([]string, error) {
+func (gcc depsGCC) DepsCmd(ctx context.Context, b *Builder, step *Step) ([]path.Path, error) {
 	depsIns, err := gcc.depsInputs(ctx, b, step)
 	if err != nil {
 		return nil, err
@@ -161,7 +162,7 @@ func (gcc depsGCC) DepsCmd(ctx context.Context, b *Builder, step *Step) ([]strin
 		depsIns = append(depsIns, inputs...)
 	}
 	gcc.fixForSplitDwarf(ctx, step.cmd)
-	return depsIns, err
+	return path.Paths(depsIns), err
 }
 
 func (gcc depsGCC) depsInputs(ctx context.Context, b *Builder, step *Step) ([]string, error) {
@@ -185,9 +186,9 @@ func (depsGCC) scandeps(ctx context.Context, b *Builder, step *Step) ([]string, 
 	var ins []string
 	err := b.scanDepsSema.Do(ctx, step.weight, func(ctx context.Context) error {
 		debug := step.def.Binding("debug") == "true"
-		b.scandepsStarted(step)
-		defer b.scandepsFinish(step)
-		params, err := gccutil.ExtractScanDepsParams(ctx, step.cmd.Args, step.cmd.Env, b.hashFS.FileSystem(ctx, filepath.Join(step.cmd.WorkspaceRoot, step.cmd.WorkDir)))
+		ctx, span := b.scandepsStarted(ctx, step)
+		defer span.Close(nil)
+		params, err := gccutil.ExtractScanDepsParams(ctx, step.cmd.Args, step.cmd.Env, b.hashFS.FileSystem(ctx, filepath.Join(step.cmd.WorkspaceRoot, string(step.cmd.WorkDir))))
 		if err != nil {
 			return err
 		}
@@ -217,7 +218,10 @@ func (depsGCC) scandeps(ctx context.Context, b *Builder, step *Step) ([]string, 
 			clog.Infof(ctx, "scandeps req=%s", buf)
 		}
 		started := time.Now()
-		ins, err = b.scanDeps.Scan(ctx, workspaceRoot, req)
+		scanResults, err := b.scanDeps.Scan(ctx, workspaceRoot, req)
+		if err == nil {
+			ins = path.Strings(scanResults)
+		}
 		if bool(log.V(1)) || debug {
 			clog.Infof(ctx, "scandeps %d %s: %v", len(ins), time.Since(started), err)
 		}
@@ -264,7 +268,7 @@ func (gcc depsGCC) scandepsByClang(ctx context.Context, b *Builder, step *Step) 
 		// e.g.
 		//  /usr/local/google/home/ukai/src/chromium/src/native_client/toolchain/linux_x86/nacl_x86_glibc/bin/../lib/gcc/x86_64-nacl/4.4.3/../../../../x86_64-nacl/include/stdint.h
 		inpath := b.path.MaybeFromRelative(ctx, in)
-		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, inpath)
+		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, path.New(inpath))
 		if err != nil {
 			clog.Warningf(ctx, "missing inputs? %s: %v", inpath, err)
 			continue
@@ -288,34 +292,30 @@ func CreateScanDepsRequestGCC(ctx context.Context, p *Path, params scandepsparam
 	// externals stores non local paths.
 	// usually error, but can be used for scandeps for cros chroot case.
 	var externals []string
-	canonicalize := func(s string) string {
-		s = p.MaybeFromRelative(ctx, s)
-		if !filepath.IsLocal(s) {
-			externals = append(externals, s)
+	canonicalize := func(s string) path.Path {
+		pp := path.New(p.MaybeFromRelative(ctx, s))
+		if !filepath.IsLocal(string(pp)) {
+			externals = append(externals, string(pp))
 		}
-		return s
+		return pp
 	}
-	for i, s := range params.Sources {
-		params.Sources[i] = canonicalize(s)
+	canonicalizeAll := func(ss []string) []path.Path {
+		ps := make([]path.Path, len(ss))
+		for i, s := range ss {
+			ps[i] = canonicalize(s)
+		}
+		return ps
 	}
-	for i, s := range params.Includes {
-		params.Includes[i] = canonicalize(s)
-	}
+	sources := canonicalizeAll(params.Sources)
+	includes := canonicalizeAll(params.Includes)
+	// Also canonicalize Files for the caller (used outside the Request).
 	for i, s := range params.Files {
-		params.Files[i] = canonicalize(s)
+		params.Files[i] = string(canonicalize(s))
 	}
-	for i, s := range params.Dirs {
-		params.Dirs[i] = canonicalize(s)
-	}
-	for i, s := range params.QuoteDirs {
-		params.QuoteDirs[i] = canonicalize(s)
-	}
-	for i, s := range params.Frameworks {
-		params.Frameworks[i] = canonicalize(s)
-	}
-	for i, s := range params.Sysroots {
-		params.Sysroots[i] = canonicalize(s)
-	}
+	dirs := canonicalizeAll(params.Dirs)
+	quoteDirs := canonicalizeAll(params.QuoteDirs)
+	frameworks := canonicalizeAll(params.Frameworks)
+	sysroots := canonicalizeAll(params.Sysroots)
 
 	workspaceRoot := p.WorkspaceRoot
 	if len(externals) > 0 && !allowExternals {
@@ -340,40 +340,33 @@ func CreateScanDepsRequestGCC(ctx context.Context, p *Path, params scandepsparam
 		//  workspaceRoot: /
 		//     path:  usr/include
 		workspaceRoot = "/"
-		rebaseToSystemRoot := func(s string) string {
-			return filepath.Join(p.WorkspaceRoot, s)[1:]
+		rebaseToSystemRoot := func(pp path.Path) path.Path {
+			return path.FromClean(filepath.Join(p.WorkspaceRoot, string(pp))[1:])
 		}
-		for i, s := range params.Sources {
-			params.Sources[i] = rebaseToSystemRoot(s)
+		rebaseAll := func(ps []path.Path) {
+			for i, pp := range ps {
+				ps[i] = rebaseToSystemRoot(pp)
+			}
 		}
-		for i, s := range params.Includes {
-			params.Includes[i] = rebaseToSystemRoot(s)
-		}
+		rebaseAll(sources)
+		rebaseAll(includes)
 		for i, s := range params.Files {
-			params.Files[i] = rebaseToSystemRoot(s)
+			params.Files[i] = string(rebaseToSystemRoot(path.FromClean(s)))
 		}
-		for i, s := range params.Dirs {
-			params.Dirs[i] = rebaseToSystemRoot(s)
-		}
-		for i, s := range params.QuoteDirs {
-			params.QuoteDirs[i] = rebaseToSystemRoot(s)
-		}
-		for i, s := range params.Frameworks {
-			params.Frameworks[i] = rebaseToSystemRoot(s)
-		}
-		for i, s := range params.Sysroots {
-			params.Sysroots[i] = rebaseToSystemRoot(s)
-		}
+		rebaseAll(dirs)
+		rebaseAll(quoteDirs)
+		rebaseAll(frameworks)
+		rebaseAll(sysroots)
 	}
 
 	req := scandeps.Request{
 		Defines:    params.Defines,
-		Sources:    params.Sources,
-		Includes:   params.Includes,
-		Dirs:       params.Dirs,
-		QuoteDirs:  params.QuoteDirs,
-		Frameworks: params.Frameworks,
-		Sysroots:   params.Sysroots,
+		Sources:    sources,
+		Includes:   includes,
+		Dirs:       dirs,
+		QuoteDirs:  quoteDirs,
+		Frameworks: frameworks,
+		Sysroots:   sysroots,
 		Timeout:    timeout,
 	}
 	return req, workspaceRoot, nil
@@ -391,5 +384,5 @@ func (depsGCC) DepsClean(ctx context.Context, b *Builder, step *Step, err error)
 	if !b.keepDepfile {
 		b.hashFS.Remove(ctx, step.cmd.WorkspaceRoot, step.cmd.Depfile)
 	}
-	b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, []string{step.cmd.Depfile})
+	b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, []path.Path{step.cmd.Depfile})
 }

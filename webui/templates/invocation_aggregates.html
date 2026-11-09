@@ -1,0 +1,47 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "breadcrumbs"}}
+<div class="breadcrumb">
+  <span class="breadcrumb-label">Aggregates{{if .useLit}} (Lit){{end}}</span>
+</div>
+{{end}}
+
+{{define "tabs"}}
+  {{template "invocation_tabs" .}}
+{{end}}
+
+{{define "content"}}
+<div class="surface">
+<h2>Aggregates prototype{{if .useLit}} (Lit){{end}}</h2>
+{{if .useLit}}
+  <siso-aggregates-table
+      build-id="{{.currentRev}}"
+      endpoint="{{.outdirRevBaseURL}}/api/steps"
+      base-url="{{.outdirRevBaseURL}}">
+  </siso-aggregates-table>
+{{else}}
+<table>
+  <thead>
+    <th>Aggregate By</th>
+    <th>Count</th>
+    <th>Total Utime</th>
+    <th>Total Duration</th>
+    <th>Total Weighted Duration</th>
+  </thead>
+  <tbody>
+    {{range $_, $aggregate := .aggregates}}
+      <tr>
+        <td>{{$aggregate.AggregateBy}}</td>
+        <td>{{$aggregate.Count}}</td>
+        <td>{{formatIntervalMetricTimestamp $aggregate.TotalUtime}}</td>
+        <td>{{formatIntervalMetricTimestamp $aggregate.TotalDuration}}</td>
+        <td>{{formatIntervalMetricTimestamp $aggregate.TotalWeightedDuration}}</td>
+      </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+</div>
+{{end}}

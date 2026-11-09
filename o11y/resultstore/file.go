@@ -12,34 +12,66 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/hashigo/digest"
+	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/reapi/merkletree"
 )
 
+// hashType maps a digest function to the ResultStore file hash type.
+// ResultStore only models MD5/SHA1/SHA256; anything else is unspecified.
+func hashType(fn digest.Function) rspb.File_HashType {
+	switch fn.Value() {
+	case rpb.DigestFunction_SHA256:
+		return rspb.File_SHA256
+	case rpb.DigestFunction_SHA1:
+		return rspb.File_SHA1
+	case rpb.DigestFunction_MD5:
+		return rspb.File_MD5
+	default:
+		return rspb.File_HASH_TYPE_UNSPECIFIED
+	}
+}
+
+// digestFunction returns the digest function that produced the digests this
+// uploader attaches to files: HashFS's function, falling back to the REAPI
+// client's, then SHA-256.
+func (u *Uploader) digestFunction() digest.Function {
+	if u.hashFS != nil {
+		return u.hashFS.DigestFunction()
+	}
+	if u.reapiClient != nil {
+		return u.reapiClient.DigestFunction()
+	}
+	return digest.SHA256
+}
+
 // UploadFiles uploads files to RBE-CAS, and sets the files as the invocation's artifact.
-// Need to set HashFS, REAPIClient to Uploader before calling this.
+// Need to set HashFS, REAPIClient to Options before calling this.
 func (u *Uploader) UploadFiles(ctx context.Context, ents []merkletree.Entry) error {
-	if u.HashFS == nil || u.REAPIClient == nil {
+	if u.hashFS == nil || u.reapiClient == nil {
 		return fmt.Errorf("resultstore: unable to upload file. hashfs or reapi client is not set")
 	}
-	ds := digest.NewStore()
+	ds := blob.NewStore()
+	ht := hashType(u.digestFunction())
 	var files []*rspb.File
 	for _, ent := range ents {
 		file := &rspb.File{
-			Uid: ent.Name,
+			Uid: string(ent.Name),
 		}
 		if ent.Data.IsZero() {
 			continue
 		}
 		ds.Set(ent.Data)
 		d := ent.Data.Digest()
-		file.Uri = u.REAPIClient.FileURI(d)
+		file.Uri = u.reapiClient.FileURI(d)
 		file.Length = &wrapperspb.Int64Value{
 			Value: d.SizeBytes,
 		}
 		// file.ContentType ?
 		file.Digest = d.Hash
-		file.HashType = rspb.File_SHA256
+		file.HashType = ht
 		files = append(files, file)
 	}
 	select {
@@ -63,11 +95,11 @@ func (u *Uploader) UploadFiles(ctx context.Context, ents []merkletree.Entry) err
 	return u.Upload(ctx, req)
 }
 
-// SetFile set a file as the invocation's artifact.
-func (u *Uploader) SetFile(ctx context.Context, name string, d digest.Digest) error {
+// uploadFile set a file as the invocation's artifact.
+func (u *Uploader) uploadFile(ctx context.Context, name string, d digest.Digest) error {
 	var uri string
-	if u.REAPIClient != nil {
-		uri = u.REAPIClient.FileURI(d)
+	if u.reapiClient != nil {
+		uri = u.reapiClient.FileURI(d)
 	}
 	req := &rspb.UploadRequest{
 		UploadOperation: rspb.UploadRequest_MERGE,
@@ -86,11 +118,16 @@ func (u *Uploader) SetFile(ctx context.Context, name string, d digest.Digest) er
 							Value: d.SizeBytes,
 						},
 						Digest:   d.Hash,
-						HashType: rspb.File_SHA256,
+						HashType: hashType(u.digestFunction()),
 					},
 				},
 			},
 		},
 	}
 	return u.Upload(ctx, req)
+}
+
+// UploadBuildNinja implements build.ResultSink.
+func (u *Uploader) UploadBuildNinja(ctx context.Context, d digest.Digest) error {
+	return u.uploadFile(ctx, "build.ninja.dir", d)
 }

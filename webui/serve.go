@@ -6,7 +6,6 @@
 package webui
 
 import (
-	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -26,20 +25,15 @@ import (
 	"time"
 
 	"go.chromium.org/build/siso/build"
-	"go.chromium.org/build/siso/build/ninjabuild"
 	mwc "go.chromium.org/build/siso/third_party/material_web_components"
+	"go.chromium.org/build/siso/webui/invocation"
 )
 
-//go:embed templates/*.html css/*.css js/*.js
+//go:embed templates/*.html templates/**/*.html static/*.css static/*.js
 var content embed.FS
 
 var (
-	// templates is a map for caching HTML template files when local development is false.
-	templates = make(map[string]*template.Template)
-	// combinedCSS is a string for caching the global stylesheet when local development is false.
-	combinedCSS         = ""
-	combinedCSSChecksum = uint32(0)
-	combinedCSSPathRe   = regexp.MustCompile(`/combined.(\d+).css`)
+	combinedCSSPathRe = regexp.MustCompile(`/combined.(\d+).css`)
 
 	// sisoStateHeuristics lists files that when present inside an output subdirectory under 'out/',
 	// strongly indicate that the subdirectory represents an active build configuration (rather than
@@ -51,6 +45,12 @@ var (
 	}
 	// baseFunctions provides global functions to the HTML template files.
 	baseFunctions = template.FuncMap{
+		// outdirEscape escapes all special characters for safe inclusion in a URL path
+		// segment, except slashes which are assumed to be part of the outdir's path and
+		// hence left as-is.
+		"outdirEscape": func(s string) string {
+			return strings.ReplaceAll(url.PathEscape(s), "%2F", "/")
+		},
 		"pathEscape": func(s string) string {
 			return url.PathEscape(s)
 		},
@@ -128,8 +128,12 @@ var (
 			if err != nil {
 				return "", fmt.Errorf("couldn't get local time location")
 			}
+			started := m.Started()
+			if started.IsZero() {
+				return "Unknown", nil
+			}
 			now := time.Now()
-			buildTimeLocal := m.Mtime.In(local)
+			buildTimeLocal := started.Time.In(local)
 			nowY, nowM, nowD := now.Date()
 			buildY, buildM, buildD := buildTimeLocal.Date()
 			if buildY == nowY && buildM == nowM && buildD == nowD {
@@ -145,47 +149,54 @@ var (
 		"timeRFC3339": func(t time.Time) string {
 			return t.Format(time.RFC3339)
 		},
+		"formatBytes": func(b uint64) string {
+			if b == 0 {
+				return "N/A"
+			}
+			const unit = 1024
+			if b < unit {
+				return fmt.Sprintf("%d B", b)
+			}
+			v, i := float64(b)/unit, 0
+			for ; v >= unit && i < len(byteUnits)-1; i++ {
+				v /= unit
+			}
+			return fmt.Sprintf("%.1f %s", v, byteUnits[i])
+		},
+		"joinStrings": func(elems []string, sep string) string {
+			return strings.Join(elems, sep)
+		},
 	}
+	byteUnits     = [...]string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
 	sisoMetricsRe = regexp.MustCompile(`siso_metrics.(\d+).json`)
 	sortParamRe   = regexp.MustCompile(`^(?P<sortBy>[a-z]+?)(?P<order>Asc|Dsc)$`)
 )
 
 type WebuiServer struct {
-	sisoVersion       string
-	localDevelopment  bool
-	port              int
-	staticFS          fs.FS
-	sseServer         *sseServer
-	workspaceRoot     string
-	defaultOutdir     string
-	defaultManifest   string
-	defaultOutdirRoot string
-	defaultOutdirSub  string
-	outsubs           []string
+	sisoVersion      string
+	localDevelopment bool
+	port             int
+	staticFS         fs.FS
+	sseServer        *sseServer
+	workspaceRoot    string
+	defaultOutdir    string
+	outdirProvider   outdirProvider
+	knownOutdirs     []string // TODO: fold into outdirProvider
+	uploadedMetrics  metricsFileProvider
 	runbuildState
 
-	metricsMu       sync.Mutex
-	outdirMetrics   map[string]*outdirInfo
-	uploadedMetrics []*buildMetrics
+	cssMu               sync.RWMutex
+	combinedCSS         string
+	combinedCSSChecksum uint32
+
+	templatesMu sync.RWMutex
+	templates   map[string]*template.Template
 }
 
 type runningStepInfo struct {
 	stepOut  string
 	stepType string
 	started  time.Time
-}
-
-// ErrWorkspaceNotExist represents error when workspace was not found.
-type ErrWorkspaceNotExist struct {
-	err error
-}
-
-func (f ErrWorkspaceNotExist) Unwrap() error {
-	return f.err
-}
-
-func (f ErrWorkspaceNotExist) Error() string {
-	return fmt.Sprintf("failed to find workspace: %v", f.err)
 }
 
 // ErrManifestNotExist represents error when build manifest was not found.
@@ -200,37 +211,47 @@ func (f ErrManifestNotExist) Error() string {
 
 // loadView lazy-parses a view once, or parses every time if in local development mode.
 func (s *WebuiServer) loadView(view string) (*template.Template, error) {
-	if template, ok := templates[view]; ok {
-		return template, nil
+	s.templatesMu.RLock()
+	tmpl, ok := s.templates[view]
+	s.templatesMu.RUnlock()
+	if !s.localDevelopment && ok {
+		return tmpl, nil
 	}
 	templatesFS, err := fs.Sub(s.staticFS, "templates")
 	if err != nil {
 		return nil, fmt.Errorf("templates not found: %w", err)
 	}
-	template, err := template.New("").Funcs(baseFunctions).ParseFS(templatesFS, "webui_base.html", view)
+	tmpl, err = template.New("").Funcs(baseFunctions).ParseFS(
+		templatesFS, "base.html", "partials/*.html", view)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse view: %w", err)
 	}
-	if !s.localDevelopment {
-		templates[view] = template
+	if s.localDevelopment {
+		return tmpl, nil
 	}
-	return template, nil
+	s.templatesMu.Lock()
+	defer s.templatesMu.Unlock()
+	if cachedTmpl, ok := s.templates[view]; ok {
+		return cachedTmpl, nil
+	}
+	s.templates[view] = tmpl
+	return tmpl, nil
 }
 
 // ensureCSS lazy-loads the global stylesheet, or loads every time if in local development mode.
 func (s *WebuiServer) ensureCSS() error {
-	if !s.localDevelopment && combinedCSS != "" {
+	// Fast-path: Check if CSS is already cached. We use a read-lock here
+	// to avoid blocking other concurrent requests in production mode.
+	s.cssMu.RLock()
+	hasCSS := s.combinedCSS != ""
+	s.cssMu.RUnlock()
+	if !s.localDevelopment && hasCSS {
 		return nil
 	}
 	sb := strings.Builder{}
 	for _, stylesheet := range []string{
-		"css/light.css",
-		"css/light-hc.css",
-		"css/light-mc.css",
-		"css/dark.css",
-		"css/dark-hc.css",
-		"css/dark-mc.css",
-		"css/style.css",
+		"static/theme.css",
+		"static/style.css",
 	} {
 		f, err := s.staticFS.Open(stylesheet)
 		if err != nil {
@@ -243,13 +264,17 @@ func (s *WebuiServer) ensureCSS() error {
 		sb.Write(data)
 		sb.WriteByte('\n')
 	}
-	combinedCSS = sb.String()
-	combinedCSSChecksum = crc32.ChecksumIEEE([]byte(combinedCSS))
+	// Slow-path: Lock for writing to update the cache.
+	s.cssMu.Lock()
+	defer s.cssMu.Unlock()
+	// Double-check: Another concurrent request might have populated the cache
+	// while we were waiting for the write lock.
+	if !s.localDevelopment && s.combinedCSS != "" {
+		return nil
+	}
+	s.combinedCSS = sb.String()
+	s.combinedCSSChecksum = crc32.ChecksumIEEE([]byte(s.combinedCSS))
 	return nil
-}
-
-func didRequestUploadedMetrics(r *http.Request) bool {
-	return r.PathValue("outroot") == "uploads" && r.PathValue("outsub") == "view"
 }
 
 // baseURLFromRequest gets the base URL from context.
@@ -261,26 +286,20 @@ func outdirBaseURL(r *http.Request) string {
 // renderBuildView renders a build-related view.
 // TODO(b/361703735): return data instead of write to response writer? https://chromium-review.googlesource.com/c/infra/infra/+/5803123/comment/4ce69ada_31730349/
 func (s *WebuiServer) renderBuildView(wr http.ResponseWriter, r *http.Request, tmpl *template.Template, data map[string]any) error {
-	rev := r.PathValue("rev")
-	if didRequestUploadedMetrics(r) {
-		data["viewingUploaded"] = true
-	} else if outdirInfo, err := s.getOutdirForRequest(r); err == nil {
-		if rev == "" {
-			rev = outdirInfo.latestRevID
-		}
-		data["outroot"] = outdirInfo.outRoot
-		data["outsub"] = outdirInfo.outSub
-		outdirAbbrev := outdirInfo.path
-		// Showing the full path is too long in the webui so abbreviate home dir to ~.
-		// TODO(b/361703735): refactor https://chromium-review.googlesource.com/c/infra/infra/+/5804478/comment/dcfb372d_f21e4cc5/
-		if home, err := os.UserHomeDir(); err == nil {
-			outdirAbbrev = strings.Replace(outdirAbbrev, home, "~", 1)
-		}
-		data["outdirAbbrev"] = outdirAbbrev
-		data["outdirRel"] = outdirInfo.pathRel
-		data["revs"] = outdirInfo.metrics
+	series, err := s.invocationSeriesFor(r)
+	if err != nil {
+		return fmt.Errorf("failed to load invocation(s) for %s: %v", r.URL, err)
 	}
-	data["outsubs"] = s.outsubs
+
+	data["seriesTitle"] = series.Title()
+	data["revs"] = series.All()
+
+	rev := r.PathValue("rev")
+	if rev == "" && series.Latest() != nil {
+		rev = series.Latest().ID()
+	}
+
+	data["knownOutdirs"] = s.knownOutdirs
 	data["versionID"] = s.sisoVersion
 	data["currentURL"] = r.URL
 	data["currentRev"] = rev
@@ -288,12 +307,15 @@ func (s *WebuiServer) renderBuildView(wr http.ResponseWriter, r *http.Request, t
 	if rev != "" {
 		data["outdirRevBaseURL"] = fmt.Sprintf("%s/builds/%s", data["outdirBaseURL"], rev)
 	}
-	err := s.ensureCSS()
+	err = s.ensureCSS()
 	if err != nil {
 		return fmt.Errorf("failed to ensure CSS: %w", err)
 	}
 	// Use checksum for CSS for cache busting.
-	data["combinedCSSPath"] = fmt.Sprintf("/combined.%d.css", combinedCSSChecksum)
+	s.cssMu.RLock()
+	checksum := s.combinedCSSChecksum
+	s.cssMu.RUnlock()
+	data["combinedCSSPath"] = fmt.Sprintf("/combined.%d.css", checksum)
 	err = tmpl.ExecuteTemplate(wr, "base", data)
 	if err != nil {
 		return fmt.Errorf("failed to execute template: %w", err)
@@ -304,7 +326,7 @@ func (s *WebuiServer) renderBuildView(wr http.ResponseWriter, r *http.Request, t
 // renderBuildViewError renders a build-related error.
 func (s *WebuiServer) renderBuildViewError(status int, message string, w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(status)
-	tmpl, err := s.loadView("_error.html")
+	tmpl, err := s.loadView("error.html")
 	if err != nil {
 		fmt.Fprintf(w, "failed to load error view: %s\n", err)
 		return
@@ -323,26 +345,25 @@ type ServerConfig struct {
 	Version          string
 	LocalDevelopment bool
 	Port             int
-	OutDir           ninjabuild.DirFlag
+	WorkspaceRoot    string
+	DefaultOutdir    string
 	ManifestPath     string
 }
 
 // NewServer inits a webui server.
-func NewServer(ctx context.Context, cfg ServerConfig) (*WebuiServer, error) {
-	_, workspaceRoot, outDir, err := ninjabuild.InitDir(ctx, cfg.OutDir)
-	if err != nil {
-		return nil, &ErrWorkspaceNotExist{err}
-	}
+func NewServer(cfg ServerConfig) (*WebuiServer, error) {
+	defaultOutdir := filepath.ToSlash(cfg.DefaultOutdir)
 	s := WebuiServer{
 		sisoVersion:      cfg.Version,
 		localDevelopment: cfg.LocalDevelopment,
 		staticFS:         fs.FS(content),
 		sseServer:        newSseServer(),
-		workspaceRoot:    workspaceRoot,
-		defaultOutdir:    outDir,
-		defaultManifest:  cfg.ManifestPath,
-		outdirMetrics:    make(map[string]*outdirInfo),
+		workspaceRoot:    cfg.WorkspaceRoot,
+		defaultOutdir:    defaultOutdir,
+		outdirProvider:   makeOutdirProvider(cfg.WorkspaceRoot, cfg.ManifestPath, defaultOutdir),
+		uploadedMetrics:  makeMetricsFileProvider(),
 		port:             cfg.Port,
+		templates:        make(map[string]*template.Template),
 	}
 
 	if cfg.LocalDevelopment {
@@ -350,19 +371,13 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*WebuiServer, error) {
 	}
 
 	// Preload default outdir.
-	absOutDir := filepath.Join(workspaceRoot, outDir)
-	defaultOutdirInfo, err := loadOutdirInfo(workspaceRoot, absOutDir, cfg.ManifestPath)
+	_, err := s.outdirProvider.Get(defaultOutdir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to preload outdir: %w", err)
 	}
-	s.outdirMetrics[absOutDir] = defaultOutdirInfo
-	s.defaultOutdirRoot = defaultOutdirInfo.outRoot
-	s.defaultOutdirSub = defaultOutdirInfo.outSub
 
 	// Find other outdirs.
-	// TODO: support out*/*
-	// TODO(b/361703735): can use defaultOutdirParent?
-	matches, err := filepath.Glob(filepath.Join(s.workspaceRoot, "out/*"))
+	matches, err := filepath.Glob(filepath.Join(s.workspaceRoot, "out*/*"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to glob %s: %w", s.workspaceRoot, err)
 	}
@@ -382,11 +397,11 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*WebuiServer, error) {
 			}) {
 				continue
 			}
-			outsub, err := filepath.Rel(filepath.Join(s.workspaceRoot, defaultOutdirInfo.outRoot), match)
+			outsub, err := filepath.Rel(s.workspaceRoot, match)
 			if err != nil {
-				return nil, fmt.Errorf("failed to make %s workspace relative: %w", match, err)
+				return nil, fmt.Errorf("failed to make %s workspace-root relative: %w", match, err)
 			}
-			s.outsubs = append(s.outsubs, outsub)
+			s.knownOutdirs = append(s.knownOutdirs, filepath.ToSlash(outsub))
 		}
 	}
 
@@ -394,14 +409,30 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*WebuiServer, error) {
 }
 
 func (s *WebuiServer) LoadStandaloneMetrics(metricsPath string) error {
-	metrics, err := loadBuildMetrics(metricsPath)
-	if err != nil {
-		return fmt.Errorf("failed to load metrics: %w", err)
+	_, err := s.uploadedMetrics.Get(metricsPath)
+	return err
+}
+
+func (s *WebuiServer) invocationSeriesFor(r *http.Request) (invocation.Series[*buildMetrics], error) {
+	if r.PathValue("outroot") == "uploads" && r.PathValue("outsub") == "view" {
+		s.uploadedMetrics.mu.Lock()
+		defer s.uploadedMetrics.mu.Unlock()
+		for _, m := range s.uploadedMetrics.files {
+			if m.metrics.Rev == r.PathValue("rev") || r.PathValue("rev") == "" {
+				return m, nil
+			}
+		}
+		return nil, fmt.Errorf("not found")
+		// TODO: move into uploaded.go?
 	}
-	s.metricsMu.Lock()
-	s.uploadedMetrics = append(s.uploadedMetrics, metrics)
-	s.metricsMu.Unlock()
-	return nil
+
+	outroot := r.PathValue("outroot")
+	outsub := r.PathValue("outsub")
+	path := filepath.Join(outroot, outsub)
+	if outsub == flatOutsub {
+		path = outroot
+	}
+	return s.outdirProvider.Get(path)
 }
 
 func (s *WebuiServer) staticFileHandler(h http.Handler) http.Handler {
@@ -414,18 +445,18 @@ func (s *WebuiServer) staticFileHandler(h http.Handler) http.Handler {
 	})
 }
 
-func (s *WebuiServer) Serve() int {
-	s.sseServer.Start()
-	http.Handle("/events/", s.sseServer)
+func (s *WebuiServer) mux() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/events/", s.sseServer)
 
 	// Subrouter for all outdir related URLs.
 	// This is set up on a separate mux because it's too generic and would otherwise cause panic:
-	//     /css/ and /{outroot}/{outsub}/ both match some paths, like "/css/outsub/".
+	//     /static/ and /{outroot}/{outsub}/ both match some paths, like "/static/outsub/".
 	//     But neither is more specific than the other.
-	//     /css/ matches "/css/", but /{outroot}/{outsub}/ doesn't.
-	//     /{outroot}/{outsub}/ matches "/outroot/outsub/", but /css/ doesn't.
+	//     /static/ matches "/static/", but /{outroot}/{outsub}/ doesn't.
+	//     /{outroot}/{outsub}/ matches "/outroot/outsub/", but /static/ doesn't.
 	outdirRouter := http.NewServeMux()
-	outdirRouter.HandleFunc("/{outroot}/{outsub}/", s.handleOutdirRoot)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/", s.handleInvocationSeriesRoot)
 	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/logs/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, fmt.Sprintf("%s/builds/%s/logs/.siso_config", outdirBaseURL(r), url.PathEscape(r.PathValue("rev"))), http.StatusTemporaryRedirect)
 	})
@@ -436,11 +467,21 @@ func (s *WebuiServer) Serve() int {
 	outdirRouter.HandleFunc("POST /{outroot}/{outsub}/runbuild/", s.handleRunbuildPost)
 	outdirRouter.HandleFunc("/{outroot}/{outsub}/reload", s.handleOutdirReload)
 	outdirRouter.HandleFunc("/{outroot}/{outsub}/watch/", s.handleOutdirWatch)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/", s.handleInvocationSeriesList)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/details/", s.handleInvocationDetails)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/details_lit/", s.handleInvocationDetailsLit)
 	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/logs/{file}", s.handleOutdirViewLog)
-	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/aggregates/", s.handleOutdirAggregates)
-	outdirRouter.HandleFunc("POST /{outroot}/{outsub}/builds/{rev}/steps/{id}/recall/", s.handleOutdirDoRecall)
-	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/steps/{id}/", s.handleOutdirViewStep)
-	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/steps/", s.handleOutdirListSteps)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/logs_lit/", s.handleOutdirLogsLit)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/aggregates/", s.handleInvocationAggregates)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/aggregates_lit/", s.handleInvocationAggregatesLit)
+	outdirRouter.HandleFunc("POST /{outroot}/{outsub}/builds/{rev}/steps/{id}/recall/", s.handleInvocationStepRecall)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/steps/{id}/", s.handleInvocationViewStep)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/steps_lit/{id}/", s.handleInvocationViewStepLit)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/steps/", s.handleInvocationListSteps)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/steps_lit/", s.handleInvocationListStepsLit)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/api/steps/{id}", s.handleAPIInvocationStep)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/api/steps", s.handleAPIInvocationSteps)
+	outdirRouter.HandleFunc("/{outroot}/{outsub}/builds/{rev}/api/invocation", s.handleAPIInvocation)
 	outdirRouter.HandleFunc("/{outroot}/{outsub}/targets/{target}/", s.handleOutdirListTargets)
 
 	// Handlers for uploaded metrics.
@@ -451,12 +492,21 @@ func (s *WebuiServer) Serve() int {
 	// Furthermore, we also have hardcoded links built around this URL structure.
 	// It would probably be more ideal to have just "/uploads/{rev}/builds/steps/", but it would require more refactoring.
 	uploadsRouter := http.NewServeMux()
-	uploadsRouter.HandleFunc("/uploads/view/", s.handleOutdirRoot)
-	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/aggregates/", s.handleOutdirAggregates)
-	uploadsRouter.HandleFunc("POST /uploads/view/builds/{rev}/steps/{id}/recall/", s.handleOutdirDoRecall)
-	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/steps/{id}/", s.handleOutdirViewStep)
-	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/steps/", s.handleOutdirListSteps)
-	http.HandleFunc("/uploads/view/", func(w http.ResponseWriter, r *http.Request) {
+	uploadsRouter.HandleFunc("/uploads/view/", s.handleInvocationSeriesRoot)
+	uploadsRouter.HandleFunc("/uploads/view/builds/", s.handleInvocationSeriesList)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/details/", s.handleInvocationDetails)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/details_lit/", s.handleInvocationDetailsLit)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/aggregates/", s.handleInvocationAggregates)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/aggregates_lit/", s.handleInvocationAggregatesLit)
+	uploadsRouter.HandleFunc("POST /uploads/view/builds/{rev}/steps/{id}/recall/", s.handleInvocationStepRecall)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/steps/{id}/", s.handleInvocationViewStep)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/steps_lit/{id}/", s.handleInvocationViewStepLit)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/steps/", s.handleInvocationListSteps)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/steps_lit/", s.handleInvocationListStepsLit)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/api/steps/{id}", s.handleAPIInvocationStep)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/api/steps", s.handleAPIInvocationSteps)
+	uploadsRouter.HandleFunc("/uploads/view/builds/{rev}/api/invocation", s.handleAPIInvocation)
+	mux.HandleFunc("/uploads/view/", func(w http.ResponseWriter, r *http.Request) {
 		// This is how we hack around the hardcoded assumption that URLs are /{outroot}/{outsub}/.
 		// Common code paths will then have checks to handle this special case.
 		r.SetPathValue("outroot", "uploads")
@@ -465,10 +515,10 @@ func (s *WebuiServer) Serve() int {
 	})
 
 	// Default catch-all handler.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Redirect root to default outdir.
 		if r.URL.Path == "/" {
-			http.Redirect(w, r, fmt.Sprintf("/%s/%s/", s.defaultOutdirRoot, s.defaultOutdirSub), http.StatusTemporaryRedirect)
+			http.Redirect(w, r, fmt.Sprintf("/%s/", s.defaultOutdir), http.StatusTemporaryRedirect)
 			return
 		}
 
@@ -481,7 +531,10 @@ func (s *WebuiServer) Serve() int {
 		if combinedCSSPathRe.MatchString(r.URL.Path) {
 			w.Header().Add("Content-Type", "text/css; charset=UTF-8")
 			w.Header().Add("Cache-Control", "max-age=86400, private") // 1 day
-			w.Write([]byte(combinedCSS))
+			s.cssMu.RLock()
+			css := s.combinedCSS
+			s.cssMu.RUnlock()
+			w.Write([]byte(css))
 			return
 		}
 
@@ -489,20 +542,27 @@ func (s *WebuiServer) Serve() int {
 		outdirRouter.ServeHTTP(w, r)
 	})
 
-	http.Handle("/js/", s.staticFileHandler(http.FileServerFS(s.staticFS)))
+	mux.Handle("/static/", s.staticFileHandler(http.FileServerFS(s.staticFS)))
 
 	// Serve third party JS. No other third party libraries right now, so just serve Material Design node_modules root.
-	http.Handle("/third_party/", http.StripPrefix("/third_party/", s.staticFileHandler(http.FileServerFS(mwc.NodeModulesFS))))
+	mux.Handle("/third_party/", http.StripPrefix("/third_party/", s.staticFileHandler(http.FileServerFS(mwc.NodeModulesFS))))
 
+	return http.NewCrossOriginProtection().Handler(mux)
+}
+
+// Serve serves the webui with the current configuration.
+func (s *WebuiServer) Serve() int {
+	s.sseServer.Start()
 	fmt.Printf("listening on http://localhost:%d/...\n", s.port)
 	// Hack for now to make loading external siso_metrics.json more usable, until we can have the homepage automatically show "here's all the loaded siso_metrics"
-	if len(s.uploadedMetrics) > 0 {
+	// TODO(b/533258244): now that we have the concept of invocation providers, this should become feasible.
+	if len(s.uploadedMetrics.files) > 0 {
 		fmt.Printf("for provided siso_metrics.json:\n")
-		for _, metrics := range s.uploadedMetrics {
-			fmt.Printf("- http://localhost:%d/uploads/view/builds/%s/steps/\n", s.port, metrics.Rev)
+		for _, file := range s.uploadedMetrics.files {
+			fmt.Printf("- http://localhost:%d/uploads/view/builds/%s/steps/\n", s.port, file.metrics.ID())
 		}
 	}
-	err := http.ListenAndServe(fmt.Sprintf(":%d", s.port), nil)
+	err := http.ListenAndServe(fmt.Sprintf("localhost:%d", s.port), s.mux())
 	if errors.Is(err, http.ErrServerClosed) {
 		fmt.Printf("server closed\n")
 	} else if err != nil {

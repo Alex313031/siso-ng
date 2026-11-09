@@ -1,0 +1,20 @@
+#!/bin/sh
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Copy the config to nsjail.config for the test to read.
+cp $2 nsjail.config
+
+# Extract the sandbox outdir.
+outdir=$(sed -ne 's|.*src: "\(.*nsjail_workdir.*/src/out/siso\)".*|\1|p' $2)
+
+# Detect the command and create the expected outputs.
+if grep -q "mkdir" "$2"; then
+  mkdir -p "${outdir}/input_dir"
+else
+  mkdir -p "${outdir}/obj"
+  touch "${outdir}/obj/repackaged.zip"
+fi
+
+exit 0

@@ -17,6 +17,7 @@ import (
 
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/nsjailutil"
 )
 
@@ -27,6 +28,8 @@ type nsjailExecutor struct {
 
 	jail *nsjailutil.NSJail
 }
+
+var _ execute.Executor = (*nsjailExecutor)(nil)
 
 func newNSJailExecutor(ctx context.Context, b *Builder, executor execute.Executor, sandboxConfig map[string]string) (*nsjailExecutor, error) {
 	exePath := sandboxConfig["nsjail_path"]
@@ -48,12 +51,31 @@ func newNSJailExecutor(ctx context.Context, b *Builder, executor execute.Executo
 	if log.V(1) {
 		clog.Infof(ctx, "use nsjail=%q", exePath)
 	}
+	var publicDirs, writableDirs []string
+	_, hasReadable := sandboxConfig["default_readable_dirs"]
+	_, hasWritable := sandboxConfig["default_writable_dirs"]
+	if hasReadable || hasWritable {
+		publicDirs = splitDirs(sandboxConfig["default_readable_dirs"])
+		for i, d := range publicDirs {
+			if !filepath.IsAbs(d) && b.path.WorkspaceRoot != "" {
+				publicDirs[i] = filepath.Join(b.path.WorkspaceRoot, d)
+			}
+		}
+		writableDirs = splitDirs(sandboxConfig["default_writable_dirs"])
+		for i, d := range writableDirs {
+			if !filepath.IsAbs(d) && b.path.WorkspaceRoot != "" {
+				writableDirs[i] = filepath.Join(b.path.WorkspaceRoot, d)
+			}
+		}
+	}
 	return &nsjailExecutor{
 		b:        b,
 		executor: executor,
 		req: nsjailutil.Request{
 			ExePath:       exePath,
 			JailRootDir:   workDir,
+			PublicDirs:    publicDirs,
+			WritableDirs:  writableDirs,
 			WorkspaceRoot: b.path.WorkspaceRoot,
 			WorkDir:       b.path.BaseDir,
 			OutDir:        outDir,
@@ -75,8 +97,9 @@ func (n *nsjailExecutor) Close() error {
 func (n *nsjailExecutor) Run(ctx context.Context, cmd *execute.Cmd) (err error) {
 	fsys := n.b.hashFS.FileSystem(ctx, "/")
 	req := n.req
-	req.Inputs = cmd.AllInputs()
-	req.Outputs = cmd.AllOutputs()
+	req.Inputs = path.Strings(cmd.AllInputs())
+	req.Outputs = path.Strings(cmd.AllOutputs())
+	req.Restat = cmd.Restat
 	jail, err := nsjailutil.New(ctx, fsys, req)
 	if err != nil {
 		return err
@@ -90,8 +113,8 @@ func (n *nsjailExecutor) Run(ctx context.Context, cmd *execute.Cmd) (err error) 
 		return fmt.Errorf("failed to setup nsjail: %w", err)
 	}
 	// phony_output would have no cmd.Outputs, so no need to capture outputs in jail.
-	if len(cmd.Outputs) > 0 {
-		newCmd.ExecRootInJailDir = jail.ExecRoot()
+	if len(cmd.Outputs) > 0 || len(cmd.OutputDirs) > 0 {
+		newCmd.PostProc = jail.PostProc
 	}
 	clog.Infof(ctx, "run %q", newCmd.Args)
 	err = n.executor.Run(ctx, newCmd)
@@ -103,7 +126,8 @@ func (n *nsjailExecutor) Run(ctx context.Context, cmd *execute.Cmd) (err error) 
 	return nil
 }
 
-func (n *nsjailExecutor) logLocalExec(ctx context.Context, step *Step, dur time.Duration) error {
+func (n *nsjailExecutor) logLocalExec(ctx context.Context, step *Step, dur time.Duration) error { //nolint:unparam
+
 	command := step.def.Binding("command")
 	if len(command) > 256 {
 		command = command[:256] + " ..."
@@ -111,7 +135,7 @@ func (n *nsjailExecutor) logLocalExec(ctx context.Context, step *Step, dur time.
 	allOutputs := step.cmd.AllOutputs()
 	var output string
 	if len(allOutputs) > 0 {
-		output = allOutputs[0]
+		output = string(allOutputs[0])
 	}
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, `cmd: %s pure:%t/nsjail restat:%t %s

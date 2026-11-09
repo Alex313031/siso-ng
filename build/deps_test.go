@@ -14,6 +14,7 @@ import (
 
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/path"
 )
 
 func TestDepsExpandInputs(t *testing.T) {
@@ -47,15 +48,15 @@ func TestDepsExpandInputs(t *testing.T) {
 	}
 	step := &Step{
 		def: &fakeStepDef{
-			expandedInputs: func(context.Context) []string {
-				return []string{
+			expandedInputs: func(context.Context) []path.Path {
+				return []path.Path{
 					"components/file1",
 					"components/file2",
 				}
 			},
 		},
 		cmd: &execute.Cmd{
-			Inputs: []string{
+			Inputs: []path.Path{
 				"components:label",
 				"non-existing-file",
 			},
@@ -64,7 +65,7 @@ func TestDepsExpandInputs(t *testing.T) {
 	depsExpandInputs(ctx, b, step)
 
 	// expanded and no label and no existing file
-	want := []string{
+	want := []path.Path{
 		"components/file1",
 		"components/file2",
 	}

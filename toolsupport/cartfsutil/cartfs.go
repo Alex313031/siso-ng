@@ -14,6 +14,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/reapi/merkletree"
 	cartfspb "go.chromium.org/build/siso/toolsupport/cartfsutil/proto/server"
@@ -27,8 +29,9 @@ type Client struct {
 }
 
 // New creates new cartfs client mounted at dir.
-func New(ctx context.Context, endpoint string) (*Client, error) {
-	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func New(ctx context.Context, endpoint string, opts ...grpc.DialOption) (*Client, error) {
+	dopts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opts...)
+	conn, err := grpc.NewClient(endpoint, dopts...)
 	if err != nil {
 		clog.Warningf(ctx, "cartfs: failed to dial to cartfs server %s: %v", endpoint, err)
 		return nil, err
@@ -77,6 +80,33 @@ type Registration struct {
 	Err error
 }
 
+// Digest returns digest of the file.
+func (c *Client) Digest(ctx context.Context, fname string) (digest.Digest, error) {
+	if c == nil || c.conn == nil || c.client == nil {
+		return digest.Digest{}, errors.ErrUnsupported
+	}
+	relpath, err := filepath.Rel(c.dir, fname)
+	if err != nil {
+		return digest.Digest{}, fmt.Errorf("cartfs: get digest: out of dir: %q", fname)
+	}
+	if !filepath.IsLocal(relpath) {
+		return digest.Digest{}, fmt.Errorf("cartfs: get digest: out of dir: %q", fname)
+	}
+	relpath = filepath.ToSlash(relpath)
+	resp, err := c.client.GetDigest(ctx, &cartfspb.GetDigestRequest{
+		Identifier: &cartfspb.GetDigestRequest_Path{
+			Path: relpath,
+		},
+	})
+	if err != nil {
+		return digest.Digest{}, fmt.Errorf("cartfs: get digest %q: %w", fname, err)
+	}
+	return digest.Digest{
+		Hash:      resp.Hash,
+		SizeBytes: int64(resp.Size),
+	}, nil
+}
+
 // RegisterFiles registers entries at dir.
 func (c *Client) RegisterFiles(ctx context.Context, dir string, entries []*Registration) error {
 	if c == nil || c.conn == nil || c.client == nil {
@@ -89,18 +119,18 @@ func (c *Client) RegisterFiles(ctx context.Context, dir string, entries []*Regis
 		if ent == nil {
 			continue
 		}
-		fullpath := filepath.Join(dir, ent.Entry.Name)
+		fullpath := filepath.Join(dir, string(ent.Entry.Name))
 		relpath, err := filepath.Rel(c.dir, fullpath)
 		if log.V(1) {
 			clog.Infof(ctx, "cartfs entry %q %q -> %q: %v", dir, ent.Entry.Name, relpath, err)
 		}
 		if err != nil {
-			ent.Err = fmt.Errorf("cartfs: out of dir: %s", ent.Entry.Name)
+			ent.Err = fmt.Errorf("cartfs: out of dir: %q", ent.Entry.Name)
 			clog.Warningf(ctx, "%v", ent.Err)
 			continue
 		}
 		if !filepath.IsLocal(relpath) {
-			ent.Err = fmt.Errorf("cartfs: out of dir: %s", ent.Entry.Name)
+			ent.Err = fmt.Errorf("cartfs: out of dir: %q", ent.Entry.Name)
 			clog.Warningf(ctx, "%v", ent.Err)
 			continue
 		}
@@ -108,7 +138,7 @@ func (c *Client) RegisterFiles(ctx context.Context, dir string, entries []*Regis
 		m[relpath] = ent
 		d := ent.Entry.Data.Digest()
 		if d.IsZero() {
-			ent.Err = fmt.Errorf("cartfs: empty digest: %s", ent.Entry.Name)
+			ent.Err = fmt.Errorf("cartfs: empty digest: %q", ent.Entry.Name)
 			clog.Warningf(ctx, "%v", ent.Err)
 			continue
 		}

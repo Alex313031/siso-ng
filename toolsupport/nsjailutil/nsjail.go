@@ -8,23 +8,29 @@ package nsjailutil
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	log "github.com/golang/glog"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 	pb "go.chromium.org/build/siso/toolsupport/nsjailutil/proto"
 )
 
 // NSJail manages nsjail environment.
 type NSJail struct {
-	exePath string
-	dir     string
-	config  *pb.NsJailConfig
+	exePath       string
+	workspaceRoot string
+	dir           string
+	config        *pb.NsJailConfig
 }
 
 // Request is a request for nsjail.
@@ -38,6 +44,9 @@ type Request struct {
 	// absolute paths. e.g. /bin
 	PublicDirs []string `json:"public_dirs,omitempty"`
 
+	// absolute paths. e.g. /dev
+	WritableDirs []string `json:"writable_dirs,omitempty"`
+
 	WorkspaceRoot string `json:"workspace_root"`    // absolute path to workspace root
 	WorkDir       string `json:"workdir,omitempty"` // working dir, relative to WorkspaceRoot
 
@@ -49,6 +58,9 @@ type Request struct {
 
 	// relative to workspace, or absolute path
 	Outputs []string `json:"outputs"`
+
+	// Restat mode.
+	Restat bool
 }
 
 const (
@@ -73,6 +85,7 @@ func New(ctx context.Context, fsys fs.FS, req Request) (_ *NSJail, err error) {
 	if err != nil {
 		return nil, err
 	}
+	jail.workspaceRoot = req.WorkspaceRoot
 	if !filepath.IsAbs(req.JailRootDir) {
 		return nil, fmt.Errorf("root_dir is not absolute path: %q", req.JailRootDir)
 	}
@@ -119,7 +132,7 @@ func New(ctx context.Context, fsys fs.FS, req Request) (_ *NSJail, err error) {
 	// TODO: Consider adding customizable env vars in the ninja file.
 	jail.config.Envar = append(jail.config.Envar, "TMPDIR=/tmp")
 
-	if req.PublicDirs == nil {
+	if req.PublicDirs == nil && req.WritableDirs == nil {
 		req.PublicDirs = []string{
 			"/bin",
 			"/lib",
@@ -150,6 +163,15 @@ func New(ctx context.Context, fsys fs.FS, req Request) (_ *NSJail, err error) {
 			Dst:    proto.String(dir),
 			IsBind: proto.Bool(true),
 			IsDir:  proto.Bool(true),
+		})
+	}
+	for _, dir := range req.WritableDirs {
+		jail.config.Mount = append(jail.config.Mount, &pb.MountPt{
+			Src:    proto.String(dir),
+			Dst:    proto.String(dir),
+			IsBind: proto.Bool(true),
+			IsDir:  proto.Bool(true),
+			Rw:     proto.Bool(true),
 		})
 	}
 	jail.config.MountProc = proto.Bool(true)
@@ -229,17 +251,71 @@ func New(ctx context.Context, fsys fs.FS, req Request) (_ *NSJail, err error) {
 				IsSymlink: proto.Bool(true),
 				IsDir:     proto.Bool(false),
 			})
-		case fi.Mode().IsRegular():
+		case fi.IsDir() || fi.Mode().IsRegular():
 			jail.config.Mount = append(jail.config.Mount, &pb.MountPt{
 				Src:    proto.String(absInputPath),
 				Dst:    proto.String(inputPathInSandbox),
 				IsBind: proto.Bool(true),
-				IsDir:  proto.Bool(false),
+				IsDir:  proto.Bool(fi.IsDir()),
 			})
 		default:
 			return nil, fmt.Errorf("unsupported input file type %q: %v", input, fi.Mode())
 		}
 	}
+
+	if req.Restat {
+		for _, out := range req.Outputs {
+			fi, err := fs.Lstat(fsys, out)
+			if err != nil {
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				clog.Infof(ctx, "restat output %q is not file", out)
+				continue
+			}
+			if log.V(1) {
+				clog.Infof(ctx, "jail restat output %q: %v", out, fi.ModTime())
+			}
+			absOutputPath := filepath.Join(req.WorkspaceRoot, out)
+			outputPathInSandbox := filepath.Join(execRootInSandbox, out)
+
+			// we can't use rw bind mount, since it doesn't work
+			// for remove or move.
+			err = func() error {
+				src, err := os.Open(absOutputPath)
+				if err != nil {
+					return fmt.Errorf("output src: %w", err)
+				}
+				defer src.Close()
+				fi, err := src.Stat()
+				if err != nil {
+					return fmt.Errorf("output src: %w", err)
+				}
+				absOutputPathInSandbox := filepath.Join(jail.dir, outputPathInSandbox)
+				dst, err := os.Create(absOutputPathInSandbox)
+				if err != nil {
+					return fmt.Errorf("output dst: %w", err)
+				}
+				_, err = io.Copy(dst, src)
+				cerr := dst.Close()
+				if err != nil {
+					return fmt.Errorf("output copy: %w", err)
+				}
+				if cerr != nil {
+					return fmt.Errorf("output close: %w", err)
+				}
+				err = os.Chtimes(absOutputPathInSandbox, time.Time{}, fi.ModTime())
+				if err != nil {
+					return fmt.Errorf("output chtimes: %w", err)
+				}
+				return nil
+			}()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return jail, nil
 }
 
@@ -292,4 +368,42 @@ func (j *NSJail) Close() error {
 		return nil
 	}
 	return os.RemoveAll(j.dir)
+}
+
+// renameFromJail moves a captured output from the nsjail exec root to its
+// workspace location. A directory destination may already hold the previous
+// build's files, and os.Rename onto a non-empty directory fails with
+// ENOTEMPTY, so remove the destination first. File outputs rename directly.
+func renameFromJail(jailPath, destPath string) error {
+	if fi, err := os.Lstat(jailPath); err == nil && fi.IsDir() {
+		if err := os.RemoveAll(destPath); err != nil {
+			return err
+		}
+	}
+	return os.Rename(jailPath, destPath)
+}
+
+func (j *NSJail) PostProc(ctx context.Context, outputs []path.Path) error {
+	// TODO: reconcile output dirs?
+	// OutermostPaths drops entries nested under a directory output:
+	// renaming the ancestor moves the whole subtree, so a nested rename
+	// would fail (source gone) or clobber a sibling already moved in.
+	for _, output := range outputs {
+		outputInJail := filepath.Join(j.ExecRoot(), string(output))
+		outputAbs := filepath.Join(j.workspaceRoot, string(output))
+		fi, err := os.Lstat(outputAbs)
+		jfi, jerr := os.Lstat(outputInJail)
+		if err == nil && jerr == nil && fi.ModTime().Equal(jfi.ModTime()) {
+			// if no change, we don't need to rename from jail.
+			clog.Infof(ctx, "restat no change output in jail %q\n", outputAbs)
+			continue
+		}
+		if log.V(1) {
+			clog.Infof(ctx, "capture output from jail %q -> %q", outputInJail, outputAbs)
+		}
+		if err := renameFromJail(outputInJail, outputAbs); err != nil {
+			return err
+		}
+	}
+	return nil
 }

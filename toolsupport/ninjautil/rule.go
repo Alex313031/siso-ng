@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"hash/maphash"
+	"slices"
 	"sync/atomic"
 )
 
@@ -35,8 +36,7 @@ func (r *rule) setVar(key []byte, val evalString) {
 func (r *rule) lookupVar(pos int, key []byte) (evalString, bool) {
 	var ret evalString
 	var found bool
-	for i := len(r.bindings) - 1; i >= 0; i-- {
-		b := r.bindings[i]
+	for _, b := range slices.Backward(r.bindings) {
 		if pos >= 0 && b.value.pos >= pos {
 			continue
 		}

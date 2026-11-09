@@ -255,6 +255,11 @@ func (s *Span) Close(st *spb.Status) {
 	s.status = st
 }
 
+// Start reads the span start time.
+func (s *Span) Start() time.Time {
+	return s.start
+}
+
 func (s *Span) protoAttrs() *tracepb.Span_Attributes {
 	if s == nil {
 		return nil
@@ -314,6 +319,16 @@ func (s *Span) ID(projectID string) (trace, span string) {
 		return "", ""
 	}
 	return path.Join("projects", projectID, "traces", hex.EncodeToString(s.t.traceID[:])), hex.EncodeToString(s.spanID[:])
+}
+
+// RawIDs returns the span's 16-byte trace id and 8-byte span id in
+// OpenTelemetry SpanContext byte layout. ok is false for a nil span or one
+// without a trace context.
+func (s *Span) RawIDs() (traceID [16]byte, spanID [8]byte, ok bool) {
+	if s == nil || s.t == nil {
+		return traceID, spanID, false
+	}
+	return s.t.traceID, s.spanID, true
 }
 
 func (s *Span) proto(ctx context.Context, projectID string) *tracepb.Span {

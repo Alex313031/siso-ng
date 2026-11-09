@@ -18,26 +18,24 @@ import (
 type Node struct {
 	next *Node // for bigMap
 
-	id   int
 	path string
 
 	inEdge atomic.Pointer[Edge] // the edge that generates the file for this node.
 
-	nouts atomic.Int64
-
-	outs []*Edge
+	id     int32
+	hasOut atomic.Bool
 }
 
-func (n *Node) ID() int { return n.id }
+func (n *Node) ID() int { return int(n.id) }
 
 func (n *Node) String() string { return n.path }
 
 // Path is the path of the node.
 func (n *Node) Path() string { return n.path }
 
-// OutEdges returns out-edges of the node.
-func (n *Node) OutEdges() []*Edge {
-	return n.outs
+// HasOut reports whether the node has any out-edges.
+func (n *Node) HasOut() bool {
+	return n.hasOut.Load()
 }
 
 func (n *Node) setInEdge(edge *Edge) bool {
@@ -289,6 +287,26 @@ func (e *Edge) Inputs() []*Node {
 func (e *Edge) Ins() []*Node {
 	n := len(e.inputs) - e.implicitDeps - e.orderOnlyDeps
 	return e.inputs[:n]
+}
+
+// ExplicitOutputs returns explicit output nodes of the edge.
+func (e *Edge) ExplicitOutputs() []*Node {
+	return e.outputs[:len(e.outputs)-e.implicitOuts]
+}
+
+// ImplicitOutputs returns implicit output nodes of the edge.
+func (e *Edge) ImplicitOutputs() []*Node {
+	return e.outputs[len(e.outputs)-e.implicitOuts:]
+}
+
+// ImplicitInputs returns implicit input nodes of the edge.
+func (e *Edge) ImplicitInputs() []*Node {
+	return e.inputs[len(e.inputs)-e.orderOnlyDeps-e.implicitDeps : len(e.inputs)-e.orderOnlyDeps]
+}
+
+// OrderOnlyInputs returns order-only input nodes of the edge.
+func (e *Edge) OrderOnlyInputs() []*Node {
+	return e.inputs[len(e.inputs)-e.orderOnlyDeps:]
 }
 
 // TriggerInputs returns inputs nodes of the edge that would trigger

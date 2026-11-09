@@ -11,14 +11,16 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	log "github.com/golang/glog"
 
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi/merkletree"
 )
 
@@ -60,7 +62,9 @@ func treeInputs(ctx context.Context, fn func(context.Context, string) (merkletre
 
 func (b *Builder) resolveSymlinkForInputDeps(ctx context.Context, dir, labelSuffix string, inputDeps map[string][]string) (string, []string, error) {
 	fsys := b.hashFS.FileSystem(ctx, b.path.WorkspaceRoot)
-	fi, err := fsys.Stat(dir)
+	// Existence + visited-symlink chain only; StatIfExists skips the
+	// per-call dir mtime-refresh Lstat (~2.3M/build on chrome).
+	fi, err := fsys.StatIfExists(dir)
 	if log.V(1) {
 		clog.Infof(ctx, "input deps stat %q: %v", dir, err)
 	}
@@ -111,7 +115,7 @@ func (b *Builder) treeInput(ctx context.Context, dir, labelSuffix string, fixFn 
 		return merkletree.TreeEntry{}, err
 	}
 	return merkletree.TreeEntry{
-		Name:   dir,
+		Name:   path.Path(dir),
 		Digest: st.d,
 	}, nil
 }
@@ -130,12 +134,14 @@ func (st *subtree) init(ctx context.Context, b *Builder, dir string, files []str
 		if fixFn != nil {
 			files = fixFn(ctx, files)
 		}
+		dirPath := path.Path(dir)
 		var inputs []string
 		for _, f := range files {
-			if !strings.HasPrefix(f, dir+"/") {
+			fp := path.Path(f)
+			if !fp.HasPrefix(dirPath) {
 				continue
 			}
-			inputs = append(inputs, strings.TrimPrefix(f, dir+"/"))
+			inputs = append(inputs, string(fp.TrimPrefix(dirPath)))
 		}
 		sort.Strings(inputs)
 		rootDir := dir
@@ -143,15 +149,15 @@ func (st *subtree) init(ctx context.Context, b *Builder, dir string, files []str
 			rootDir = filepath.Join(b.path.WorkspaceRoot, dir)
 		}
 		clog.Infof(ctx, "tree init root dir: %q (%q %q)", rootDir, b.path.WorkspaceRoot, dir)
-		ents, err := b.hashFS.Entries(ctx, rootDir, inputs)
+		ents, err := b.hashFS.Entries(ctx, rootDir, path.Paths(inputs))
 		if err != nil {
 			clog.Warningf(ctx, "failed to get subtree entries %s: %v", dir, err)
 			st.err = err
 			return
 		}
 		// keep digest in tree in st.ds
-		ds := digest.NewStore()
-		mt := merkletree.NewPooled(ds)
+		ds := blob.NewStore()
+		mt := merkletree.NewPooled(b.hashFS.DigestFunction(), ds)
 		defer mt.Release()
 		for _, ent := range ents {
 			err := mt.Set(ent)
@@ -172,7 +178,7 @@ func (st *subtree) init(ctx context.Context, b *Builder, dir string, files []str
 		// check subtree's root digest exist in CAS first.
 		// If so, we can assume subtree data exist in CAS.
 		// Otherwise, we need to upload subtree data to CAS.
-		rootDS := digest.NewStore()
+		rootDS := blob.NewStore()
 		data, ok := ds.Get(st.d)
 		if !ok {
 			clog.Warningf(ctx, "no tree root digest in store? %s", st.d)

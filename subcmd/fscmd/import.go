@@ -29,7 +29,7 @@ func (*importCommand) Synopsis() string {
 }
 
 func (*importCommand) Usage() string {
-	return "import siso hashfs data from stdin."
+	return "import siso hashfs data from stdin.\n"
 }
 
 type importCommand struct {

@@ -1,0 +1,13 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule copytree
+   command = python3 ../../tools/copytree.py --out_dir=${out_dir} ../../src
+
+build copytree/: copytree ../../src/foo.txt | ../../tools/copytree.py
+  out_dir = copytree
+
+build all: phony copytree/
+
+build build.ninja: phony

@@ -1,0 +1,14 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule local_action
+  command = python3 ../../tools/action.py ${in} ${out}
+
+build gen/a.out: local_action ../../foo.in
+build gen/b.out: local_action gen/a.out
+build gen/c.out: local_action gen/b.out
+
+build all: phony gen/c.out
+
+build build.ninja: phony

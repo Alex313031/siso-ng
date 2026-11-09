@@ -58,4 +58,28 @@ message State {
 
   // files that are used as inputs, but digest is still unknown.
   repeated string missing_digests = 5;
+
+  // REAPI digest function (rpb.DigestFunction.Value) used to compute the
+  // digests stored in this state. 0/UNKNOWN means sha256 (the historical
+  // default), so old state files keep matching. On load, a mismatch with the
+  // current build's digest function discards the persisted digests.
+  int32 digest_function = 6;
+
+  repeated BuildLabelDictionaryEntry build_label_dictionary = 7;
+  repeated FileBuildLabel file_build_labels = 8;
+}
+
+message BuildLabelDictionaryEntry {
+  uint32 id = 1;
+  BuildLabelMetadata metadata = 2;
+}
+
+message FileBuildLabel {
+  string path = 1;
+  uint64 mask = 2;
+}
+
+message BuildLabelMetadata {
+  string build_label = 1;
+  int64 last_build_timestamp = 2; // unix nano sec.
 }

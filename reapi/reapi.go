@@ -6,6 +6,7 @@
 package reapi
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,11 +16,15 @@ import (
 	"io"
 	"os"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/api/option"
 	gtransport "google.golang.org/api/transport/grpc"
 	"google.golang.org/grpc"
@@ -27,11 +32,15 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding/gzip"
+	grpcexpotel "google.golang.org/grpc/experimental/opentelemetry"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
+	grpcotel "google.golang.org/grpc/stats/opentelemetry"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 	semverpb "go.chromium.org/build/remote-apis/build/bazel/semver"
 
@@ -40,10 +49,12 @@ import (
 	"go.chromium.org/build/siso/o11y/iometrics"
 	"go.chromium.org/build/siso/o11y/monitoring"
 	"go.chromium.org/build/siso/o11y/trace"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/firstbyte"
 	"go.chromium.org/build/siso/reapi/retry"
+	"go.chromium.org/build/siso/sync/semaphore"
 	"go.chromium.org/build/siso/version"
+
+	_ "embed"
 )
 
 // Option contains options of remote exec API.
@@ -75,11 +86,23 @@ type Option struct {
 
 	// use compressed blobs if server supports compressed blobs and size is bigger than this.
 	CompressedBlob int64
+	// use compressed blobs in BatchUpdateBlobs if server supports it and size is bigger than this.
+	// 0 means disabled.
+	BatchCompressedBlob int64
 	// compressor for ByteStream Read/Write APIs.
 	compressor rpb.Compressor_Value
+	// compressor for BatchUpdateBlobs API.
+	compressorForBatchUpdateBlobs rpb.Compressor_Value
+
 	// Threshold that decides whether to use ByteStream API (compression-aware)
 	// instead of BatchReadBlobs if blob size is bigger than this.
 	ByteStreamReadThreshold int64
+
+	// Threshold that decides whether to use Chunked Blobs.
+	ChunkedBlobsThreshold int64
+
+	// threshold for batch for chunks.
+	chunkBatchThreshold int64
 
 	// Enables GRPC compression. If enabled, blob-level compression will be
 	// forcibly disabled.
@@ -90,22 +113,64 @@ type Option struct {
 	// with WaitExecution to mitigate grpc/network issue.
 	KeepExecStream bool
 
+	// Use GetTree for WalkDir.
+	// If false, use BatchReadBlobs instead.
+	WalkDirStream bool
+
 	ConnPool        int
+	DataConnPool    int
 	KeepAliveParams keepalive.ClientParameters
+
+	// StatsHandler, if non-nil, is wired into every gRPC ClientConn via
+	// grpc.WithStatsHandler. Used by the resource package to sample TTFB
+	// for the adaptive flush gate.
+	StatsHandler stats.Handler
 
 	// RE API version to use by siso, in format of v<major>.<minor>
 	// e.g. "v2.0".
-	// default to use high api version advertised by the server
-	// capabilities.
+	// default to use the highest version that both siso and the server
+	// support.
 	REAPIVersion string
 
-	// UploadConcurrency caps in-flight upload RPCs per UploadAll call.
+	// DigestFunction selects the content digest function by name
+	// (e.g. "sha256", "sha1", "blake3"). Empty means "sha256".
+	DigestFunction string
+
+	// UploadConcurrency caps in-flight upload RPCs per upload request.
 	// Zero (default) means serial; set to max(32, GOMAXPROCS*4) or similar
 	// for callers that benefit from parallel upload (e.g. `siso isolate`).
 	UploadConcurrency int
 
+	// UploadLimit caps the number of UploadAll requests in flight at
+	// once (the "reapi-upload" semaphore). Zero means DefaultUploadLimit.
+	UploadLimit int
+
 	// MaxRetries is the maximum number of retries for retriable errors.
 	MaxRetries int
+
+	// TracerProvider, when non-nil, enables grpc-native OpenTelemetry tracing.
+	// Each RPC propagates its context via grpc-trace-bin for server-side
+	// recording (e.g. Dapper). Setting it replaces gtransport's default
+	// telemetry handler.
+	TracerProvider oteltrace.TracerProvider
+
+	// MeterProvider, when non-nil, enables grpc-native OpenTelemetry client
+	// metrics through this provider. Setting it replaces gtransport's default
+	// telemetry handler.
+	MeterProvider otelmetric.MeterProvider
+
+	// TraceCookie, when non-empty, is attached as the `cookie` gRPC metadata
+	// header on every RPC to this backend (to force server-side trace
+	// sampling, e.g. Dapper). Scoped to this connection so it never reaches a
+	// non-RBE gRPC service.
+	TraceCookie string
+
+	// LocalCache is local cache for reapi.
+	LocalCache *LocalCache
+
+	// Disable Two Phase Caching method (for test).
+	// TODO: implement Two Phase Caching method in kajiya
+	DisableTwoPhaseCachingMethods bool
 }
 
 // Envs returns environment flags for reapi.
@@ -161,13 +226,20 @@ func (o *Option) RegisterFlags(fs *flag.FlagSet, envs map[string]string) {
 
 	fs.Int64Var(&o.CompressedBlob, o.Prefix+"_compress_blob", 1024, "use compressed blobs if server supports compressed blobs and size is bigger than this. specify 0 to disable blob-level compression."+purpose)
 
-	fs.Int64Var(&o.ByteStreamReadThreshold, o.Prefix+"_byte_stream_read_threshold", 2*1024*1024, "if blob size >= threshold, use ByteStream API (compression-aware)"+purpose)
+	fs.Int64Var(&o.BatchCompressedBlob, o.Prefix+"_batch_compress_blob", 0, "use compressed blobs in BatchUpdateBlobs if server supports it and size is bigger than this. specify 0 to disable."+purpose)
+
+	fs.Int64Var(&o.ByteStreamReadThreshold, o.Prefix+"_byte_stream_read_threshold", 1024*1024, "if blob size >= threshold, use ByteStream API (compression-aware)"+purpose)
+
+	fs.Int64Var(&o.ChunkedBlobsThreshold, o.Prefix+"_chunked_blobs_threshold", 0, "If blob size >= threshold, try to use chunked blob)"+purpose)
 
 	fs.BoolVar(&o.EnableGRPCCompression, o.Prefix+"_enable_grpc_compression", false, "enable grpc compression.  if enabled, blob-level compression will be forcibly disabled."+purpose)
 
 	fs.BoolVar(&o.KeepExecStream, o.Prefix+"_keep_exec_stream", false, "keep Execute stream open as long as possible")
 
+	fs.BoolVar(&o.WalkDirStream, o.Prefix+"_walkdir_stream", false, "use GetTree for WalkDir")
+
 	fs.IntVar(&o.ConnPool, o.Prefix+"_grpc_conn_pool", 25, "grpc connection pool")
+	fs.IntVar(&o.DataConnPool, o.Prefix+"_grpc_data_conn_pool", 25, "grpc connection pool for data (bytestream Read, Write)")
 
 	// https://grpc.io/docs/guides/keepalive/#keepalive-configuration-specification
 	// b/286237547 - RBE suggests 30s
@@ -175,18 +247,17 @@ func (o *Option) RegisterFlags(fs *flag.FlagSet, envs map[string]string) {
 	fs.DurationVar(&o.KeepAliveParams.Timeout, o.Prefix+"_grpc_keepalive_timeout", 20*time.Second, "grpc keepalive timeout"+purpose)
 	fs.BoolVar(&o.KeepAliveParams.PermitWithoutStream, o.Prefix+"_grpc_keepalive_permit_without_stream", false, "grpc keepalive permit without stream"+purpose)
 
-	fs.StringVar(&o.REAPIVersion, o.Prefix+"_version_to_use", "", "specify re api version to use, in format of v<major>.<minor>. e.g. v2.0")
+	fs.StringVar(&o.REAPIVersion, o.Prefix+"_version_to_use", "", "specify re api version to use, in format of v<major>.<minor>. e.g. v2.0. default: the highest version both siso and the server support")
+
+	fs.StringVar(&o.DigestFunction, o.Prefix+"_digest_function", "sha256", "content digest function: sha256, sha1, gitsha1, blake3, md5, sha384, sha512, murmur3, vso, or sha256tree"+purpose)
+
+	fs.StringVar(&o.TraceCookie, o.Prefix+"_trace_cookie", "", "if set, sent as the `cookie` gRPC metadata header on every RPC to this backend, to force server-side trace sampling (e.g. Dapper)"+purpose)
 
 	// Flags only supported for "execution".
 	if o.Prefix == "reapi" {
 		fs.IntVar(&o.ExecutionPriority, o.Prefix+"_priority", 0, "reapi priority for action executions"+purpose+". The semantics and supported values depend on the backend")
 	}
 	fs.IntVar(&o.MaxRetries, o.Prefix+"_max_retries", 10, "max retries for remote execution")
-	if o.Prefix == "reapi" {
-		// for temporary backward compatible for android
-		// TODO: remove it.
-		fs.IntVar(&o.MaxRetries, "max_rbe_retries", 10, "alias of --reapi_max_retries.")
-	}
 }
 
 func isGoogleRBE(address string) bool {
@@ -211,10 +282,10 @@ func (o *Option) String() string {
 }
 
 // UpdateProjectID updates the Option for projID and returns cloud project ID to use.
-// Just returns empty string if backend is not RBE.
+// Just returns original projID if backend is not RBE.
 func (o *Option) UpdateProjectID(projID string) string {
 	if !isGoogleRBE(o.Address) {
-		return ""
+		return projID
 	}
 	if projID != "" && !strings.HasPrefix(o.Instance, "projects/") {
 		o.Instance = path.Join("projects", projID, "instances", o.Instance)
@@ -283,92 +354,49 @@ type grpcClientConn interface {
 
 // Client is a remote exec API client.
 type Client struct {
-	opt     Option
-	cred    cred.Cred
-	conn    grpcClientConn
-	casConn grpcClientConn
+	opt         Option
+	digestFn    digest.Function
+	cred        cred.Cred
+	conn        grpcClientConn
+	casConn     grpcClientConn
+	casDataConn grpcClientConn
 
 	mu           sync.Mutex
 	capabilities *rpb.ServerCapabilities
-	apiVersion   *semverpb.SemVer
+	apiVersion   Version
 
 	knownDigests sync.Map // key:digest.Digest, value: *uploadOp or true
+
+	// uploader runs the CAS upload requests made by UploadAll, owned by
+	// the Client (lifetime derived from the context given to
+	// New/NewFromConn, closed by Close), so in-flight uploads are
+	// canceled when the build stops, not when an individual requester
+	// gives up.
+	uploader *uploader
 
 	zstdDecoderPool *sync.Pool
 
 	m *iometrics.IOMetrics
+
+	walkdirCache sync.Map // key:digest.Digest, value:*rpb.Directory, shared; must not be modified
 }
 
 // serviceConfig is gRPC service config for RE API.
 // https://github.com/bazelbuild/bazel/blob/7.1.1/src/main/java/com/google/devtools/build/lib/remote/RemoteRetrier.java#L47
-var serviceConfig = `
-{
-	"loadBalancingConfig": [{"round_robin":{}}],
-	"methodConfig": [
-	  {
-		"name": [
-                  { "service": "build.bazel.remote.execution.v2.Execution" }
-                ],
-		"timeout": "600s",
-		"retryPolicy": {
-			"maxAttempts": 5,
-			"initialBackoff": "1s",
-			"maxBackoff": "120s",
-			"backoffMultiplier": 1.6,
-			"retryableStatusCodes": [
-				"ABORTED",
-				"INTERNAL",
-				"RESOURCE_EXHAUSTED",
-				"UNAVAILABLE",
-				"UNKNOWN"
-			]
-		}
-	  },
-          {
-		"name": [
-                  {
-                    "service": "build.bazel.remote.execution.v2.ActionCache",
-                    "method": "GetActionResult"
-                  }
-                ],
-		"timeout": "10s",
-		"retryPolicy": {
-			"maxAttempts": 5,
-			"initialBackoff": "0.1s",
-			"maxBackoff": "1s",
-			"backoffMultiplier": 1.6,
-			"retryableStatusCodes": [
-				"ABORTED",
-				"INTERNAL",
-				"RESOURCE_EXHAUSTED",
-				"UNAVAILABLE",
-				"UNKNOWN"
-			]
-		}
-          },
-	  {
-		"name": [
-                  { "service": "build.bazel.remote.execution.v2.ActionCache" },
-                  { "service": "build.bazel.remote.execution.v2.ContentAddressableStorage" },
-                  { "service": "build.bazel.remote.execution.v2.Capabilities" }
-                ],
-		"timeout": "300s",
-		"retryPolicy": {
-			"maxAttempts": 5,
-			"initialBackoff": "0.1s",
-			"maxBackoff": "1s",
-			"backoffMultiplier": 1.6,
-			"retryableStatusCodes": [
-				"ABORTED",
-				"INTERNAL",
-				"RESOURCE_EXHAUSTED",
-				"UNAVAILABLE",
-				"UNKNOWN"
-			]
-		}
-	  }
-        ]
-}`
+//
+//go:embed service_config.json
+var serviceConfig string
+
+// keepaliveDialOptions returns the dial options that enable client keepalive
+// with params, or none if every parameter is zero, which disables keepalive.
+// grpc.WithKeepaliveParams can't express that: grpc-go raises a zero interval
+// to its 10 s minimum.
+func keepaliveDialOptions(params keepalive.ClientParameters) []grpc.DialOption {
+	if params.Time == 0 && params.Timeout == 0 && !params.PermitWithoutStream {
+		return nil
+	}
+	return []grpc.DialOption{grpc.WithKeepaliveParams(params)}
+}
 
 func DialOptions(keepAliveParams keepalive.ClientParameters) []grpc.DialOption {
 	// TODO(b/273639326): handle auth failures gracefully.
@@ -376,10 +404,10 @@ func DialOptions(keepAliveParams keepalive.ClientParameters) []grpc.DialOption {
 	// https://github.com/grpc/grpc/blob/c16338581dba2b054bf52484266b79e6934bbc1c/doc/service_config.md
 	// https://github.com/grpc/proposal/blob/9f993b522267ed297fe54c9ee32cfc13699166c7/A6-client-retries.md
 	// timeout=300s may cause deadline exceeded to fetch large *.so file?
-	dopts := append([]grpc.DialOption(nil),
-		grpc.WithKeepaliveParams(keepAliveParams),
+	var dopts []grpc.DialOption
+	dopts = append(dopts, keepaliveDialOptions(keepAliveParams)...)
+	dopts = append(dopts,
 		grpc.WithDisableServiceConfig(),
-		// no retry for ActionCache
 		grpc.WithDefaultServiceConfig(serviceConfig),
 		// active streams and per-RPC stages into bytestream.* histograms
 		grpc.WithStatsHandler(monitoring.BytestreamStatsHandler()),
@@ -390,33 +418,104 @@ func DialOptions(keepAliveParams keepalive.ClientParameters) []grpc.DialOption {
 	return dopts
 }
 
+// otelDialOption installs the requested grpc-native OpenTelemetry tracing and
+// metrics instrumentation.
+func otelDialOption(tp oteltrace.TracerProvider, mp otelmetric.MeterProvider) grpc.DialOption {
+	var opt grpcotel.Options
+	if tp != nil {
+		opt.TraceOptions = grpcexpotel.TraceOptions{
+			TracerProvider:    tp,
+			TextMapPropagator: grpcotel.GRPCTraceBinPropagator{},
+		}
+	}
+	if mp != nil {
+		opt.MetricsOptions = grpcotel.MetricsOptions{
+			MeterProvider: mp,
+			// Keep the fleet-visible metric set stable across grpc-go upgrades.
+			Metrics: stats.NewMetricSet(
+				grpcotel.ClientAttemptStartedMetricName,
+				grpcotel.ClientAttemptDurationMetricName,
+				grpcotel.ClientAttemptSentCompressedTotalMessageSizeMetricName,
+				grpcotel.ClientAttemptRcvdCompressedTotalMessageSizeMetricName,
+				grpcotel.ClientCallDurationMetricName,
+			),
+		}
+	}
+	return grpcotel.DialOption(opt)
+}
+
+// cookieInterceptors return unary and stream client interceptors that attach
+// cookie as the `cookie` gRPC metadata header to every RPC on the connection.
+// Scoping it here keeps the (debug) cookie off any non-RBE gRPC service.
+func cookieInterceptors(cookie string) (grpc.UnaryClientInterceptor, grpc.StreamClientInterceptor) {
+	unary := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		return invoker(metadata.AppendToOutgoingContext(ctx, "cookie", cookie), method, req, reply, cc, opts...)
+	}
+	stream := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		return streamer(metadata.AppendToOutgoingContext(ctx, "cookie", cookie), desc, cc, method, opts...)
+	}
+	return unary, stream
+}
+
+// DialError is reapi dial error.
+type DialError struct {
+	Err error
+}
+
+func (e DialError) Error() string {
+	return fmt.Sprintf("%v", e.Err)
+}
+
+func (e DialError) Unwrap() error {
+	return e.Err
+}
+
 // New creates new remote exec API client.
 func New(ctx context.Context, cred cred.Cred, opt Option) (*Client, error) {
 	defer trace.Begin(ctx, "reapi.New").End()
 	if opt.Address == "" {
-		return nil, errors.New("no reapi address")
+		return nil, DialError{Err: errors.New("no reapi address")}
 	}
 	if isGoogleRBE(opt.Address) && opt.Instance == "" {
-		return nil, errors.New("no reapi instance")
+		return nil, DialError{Err: errors.New("no reapi instance")}
 	}
-	clog.Infof(ctx, "address: %q instance: %q", opt.Address, opt.Instance)
-	conn, err := newConn(ctx, opt.Address, cred, opt)
+	if opt.EnableGRPCCompression && (opt.CompressedBlob != 0 || opt.BatchCompressedBlob != 0) {
+		opt.CompressedBlob = 0
+		opt.BatchCompressedBlob = 0
+		clog.Warningf(ctx, "disabling blob compression because grpc compression is enabled")
+	}
+	address := opt.Address
+	clog.Infof(ctx, "address: %q (%d) instance: %q", address, opt.ConnPool, opt.Instance)
+	conn, err := newConn(ctx, address, cred, opt.ConnPool, opt)
 	if err != nil {
-		return nil, err
+		return nil, DialError{Err: err}
 	}
 	casConn := conn
 	if opt.CASAddress != "" {
-		clog.Infof(ctx, "cas address: %q", opt.CASAddress)
-		casConn, err = newConn(ctx, opt.CASAddress, cred, opt)
+		address = opt.CASAddress
+		clog.Infof(ctx, "cas address: %q (%d)", address, opt.ConnPool)
+		casConn, err = newConn(ctx, address, cred, opt.ConnPool, opt)
 		if err != nil {
 			conn.Close()
-			return nil, err
+			return nil, DialError{Err: err}
 		}
 	}
-	return NewFromConn(ctx, opt, cred, conn, casConn)
+	casDataConn := casConn
+	if opt.DataConnPool > 0 {
+		clog.Infof(ctx, "data address: %q (%d)", address, opt.DataConnPool)
+		casDataConn, err = newConn(ctx, address, cred, opt.DataConnPool, opt)
+		if err != nil {
+			conn.Close()
+			if conn != casConn {
+				casConn.Close()
+			}
+			return nil, DialError{Err: err}
+		}
+	}
+	return NewFromConn(ctx, opt, cred, conn, casConn, casDataConn)
 }
 
-func newConn(ctx context.Context, addr string, cred cred.Cred, opt Option) (grpcClientConn, error) {
+func newConn(ctx context.Context, addr string, cred cred.Cred, pool int, opt Option) (grpcClientConn, error) {
 	// Force the gRPC DNS resolver by prefixing "dns:///" when the caller
 	// did not supply a scheme. gtransport.DialPool rides the deprecated
 	// grpc.DialContext path whose default resolver is "passthrough",
@@ -432,20 +531,38 @@ func newConn(ctx context.Context, addr string, cred cred.Cred, opt Option) (grpc
 	}
 	copts := []option.ClientOption{
 		option.WithEndpoint(endpoint),
-		option.WithGRPCConnectionPool(opt.ConnPool),
+		option.WithGRPCConnectionPool(pool),
 	}
 	if !isGoogleRBE(addr) {
 		// disable Google Application Default for non RBE backend.
 		// user should specify credential helper for the backend.
 		copts = append(copts, option.WithoutAuthentication())
 	}
-	dopts := DialOptions(opt.KeepAliveParams)
+	keepAliveParams := opt.KeepAliveParams
+	if strings.HasPrefix(addr, "unix://") {
+		// Unix Domain Sockets operate in local kernel memory on the same host.
+		// Disconnects are signaled immediately by the OS via EOF/POLLHUP, and there
+		// are no NAT middleboxes or firewalls. Disabling gRPC keepalive on UDS
+		// prevents false-positive PING ACK timeouts under high local build load.
+		clog.Infof(ctx, "disabling keepalive on unix domain socket: %q", addr)
+		keepAliveParams = keepalive.ClientParameters{}
+	}
+	dopts := DialOptions(keepAliveParams)
+	if opt.TracerProvider != nil || opt.MeterProvider != nil {
+		// gtransport combines tracing and metrics in one handler. Disable it
+		// whenever either is replaced to avoid duplicate telemetry.
+		copts = append(copts, option.WithTelemetryDisabled())
+		dopts = append(dopts, otelDialOption(opt.TracerProvider, opt.MeterProvider))
+	}
+	if opt.TraceCookie != "" {
+		unary, stream := cookieInterceptors(opt.TraceCookie)
+		dopts = append(dopts, grpc.WithChainUnaryInterceptor(unary), grpc.WithChainStreamInterceptor(stream))
+	}
+	if opt.StatsHandler != nil {
+		dopts = append(dopts, grpc.WithStatsHandler(opt.StatsHandler))
+	}
 	if opt.EnableGRPCCompression {
 		dopts = append(dopts, grpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
-		if opt.CompressedBlob != 0 {
-			opt.CompressedBlob = 0
-			clog.Warningf(ctx, "disabling blob compression because grpc compression is enabled")
-		}
 	}
 	var conn grpcClientConn
 	var err error
@@ -515,8 +632,8 @@ func newConn(ctx context.Context, addr string, cred cred.Cred, opt Option) (grpc
 	return conn, nil
 }
 
-// NewFromConn creates new remote exec API client from conn and casConn.
-func NewFromConn(ctx context.Context, opt Option, cred cred.Cred, conn, casConn grpcClientConn) (*Client, error) {
+// NewFromConn creates new remote exec API client from conn, casConn, and casDataConn.
+func NewFromConn(ctx context.Context, opt Option, cred cred.Cred, conn, casConn, casDataConn grpcClientConn) (*Client, error) {
 	zstdDecoderPool := &sync.Pool{}
 	zstdDecoderPool.New = func() any {
 		d, err := zstd.NewReader(nil, zstdDecoderOpts...)
@@ -529,16 +646,44 @@ func NewFromConn(ctx context.Context, opt Option, cred cred.Cred, conn, casConn 
 		}
 		return pd
 	}
+	fn, err := ParseDigestFunction(opt.DigestFunction)
+	if err != nil {
+		conn.Close()
+		if casConn != nil && casConn != conn {
+			casConn.Close()
+		}
+		if casDataConn != nil && casDataConn != casConn {
+			casDataConn.Close()
+		}
+		return nil, err
+	}
 	c := &Client{
 		opt:             opt,
+		digestFn:        fn,
 		cred:            cred,
 		conn:            conn,
 		casConn:         casConn,
+		casDataConn:     casDataConn,
 		zstdDecoderPool: zstdDecoderPool,
 		m:               iometrics.New("reapi"),
 	}
-	c.knownDigests.Store(digest.Empty, true)
+	c.knownDigests.Store(c.digestFn.Empty(), true)
+	c.uploader = newUploader(ctx, c, opt.UploadLimit)
 	return c, nil
+}
+
+// ParseDigestFunction resolves the content digest function from the
+// -..._digest_function flag value. An empty name means sha256.
+func ParseDigestFunction(name string) (digest.Function, error) {
+	if name == "" {
+		name = "sha256"
+	}
+	return digest.ParseFunction(name)
+}
+
+// DigestFunction returns the content digest function used with this backend.
+func (c *Client) DigestFunction() digest.Function {
+	return c.digestFn
 }
 
 // Init initializes the client by fetching capabilities and negotiating compression.
@@ -565,50 +710,131 @@ func (c *Client) Init(ctx context.Context) error {
 		return err
 	})
 	if err != nil {
-		c.conn.Close()
+		c.Close()
 		return fmt.Errorf("failed to get capabilities: %w", err)
 	}
 	clog.Infof(ctx, "capabilities of %s: %s", c.opt.Instance, capa)
+	if err := validateDigestFunction(c.digestFn, capa); err != nil {
+		c.Close()
+		return err
+	}
+	compressedBlob := c.opt.CompressedBlob
+	var compressor rpb.Compressor_Value
 	if c.opt.CompressedBlob > 0 {
-		c.opt.compressor = selectCompressor(capa.GetCacheCapabilities().GetSupportedCompressors())
-		if c.opt.compressor != rpb.Compressor_IDENTITY {
-			clog.Infof(ctx, "compressed-blobs/%s for > %d", strings.ToLower(c.opt.compressor.String()), c.opt.CompressedBlob)
+		compressor = selectCompressor(capa.GetCacheCapabilities().GetSupportedCompressors())
+		if compressor != rpb.Compressor_IDENTITY {
+			clog.Infof(ctx, "compressed-blobs/%s for > %d", strings.ToLower(compressor.String()), c.opt.CompressedBlob)
 		} else {
 			clog.Infof(ctx, "compressed-blobs is not supported")
+			compressedBlob = 0
+		}
+	}
+	batchCompressedBlob := c.opt.BatchCompressedBlob
+	var compressorForBatchUpdateBlobs rpb.Compressor_Value
+	if c.opt.BatchCompressedBlob > 0 {
+		compressorForBatchUpdateBlobs = selectCompressor(capa.GetCacheCapabilities().GetSupportedBatchUpdateCompressors())
+		if compressorForBatchUpdateBlobs != rpb.Compressor_IDENTITY {
+			clog.Infof(ctx, "batch-update-blobs/%s for > %d", strings.ToLower(compressorForBatchUpdateBlobs.String()), c.opt.BatchCompressedBlob)
+		} else {
+			clog.Infof(ctx, "batch-update-blobs compression is not supported")
+			batchCompressedBlob = 0
 		}
 	}
 	clog.Infof(ctx, "byte stream read threshold: %d", c.opt.ByteStreamReadThreshold)
-	var apiVersion *semverpb.SemVer
-	if c.opt.REAPIVersion != "" {
-		var major, minor int32
-		_, err := fmt.Sscanf(c.opt.REAPIVersion, "v%d.%d", &major, &minor)
-		if err != nil {
-			clog.Warningf(ctx, "failed to parse reapi version %q: %v", c.opt.REAPIVersion, err)
-		} else {
-			apiVersion = &semverpb.SemVer{
-				Major: major,
-				Minor: minor,
-			}
-			highVer := capa.GetHighApiVersion()
-			if highVer.GetMajor() < major || (highVer.GetMajor() == major && highVer.GetMinor() < minor) {
-				clog.Errorf(ctx, "higher api version is specified than server capabilities: %v > %v", apiVersion, highVer)
-			}
-			lowVer := capa.GetLowApiVersion()
-			if lowVer.GetMajor() > major || (lowVer.GetMajor() == major && lowVer.GetMinor() > minor) {
-				clog.Errorf(ctx, "lower api version is specified than server capabilities: %v < %v", apiVersion, lowVer)
-			}
+	apiVersion, err := negotiateAPIVersion(capa, c.opt.REAPIVersion)
+	if err != nil {
+		c.Close()
+		return err
+	}
+	// prefer compressed bytestream.
+	chunkBatchThreshold := c.opt.CompressedBlob
+	if c.opt.BatchCompressedBlob > 0 {
+		// if batch compressed is enabled, use max_batch_total_size_bytes for batching.
+		chunkBatchThreshold = defaultBatchReadByteLimit
+		if max := c.capabilities.GetCacheCapabilities().GetMaxBatchTotalSizeBytes(); max > 0 {
+			chunkBatchThreshold = max
 		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.capabilities = capa
 	c.apiVersion = apiVersion
+	c.opt.CompressedBlob = compressedBlob
+	c.opt.compressor = compressor
+	c.opt.BatchCompressedBlob = batchCompressedBlob
+	c.opt.compressorForBatchUpdateBlobs = compressorForBatchUpdateBlobs
+	c.opt.chunkBatchThreshold = chunkBatchThreshold
 	return nil
 }
 
-// Close closes the client.
+// validateDigestFunction checks that the configured digest function is
+// advertised by the server's cache capabilities and, when the server offers
+// remote execution, by its execution capabilities too (otherwise CAS uploads
+// would succeed but Execute would fail later). An empty advertised list means
+// an old server that only speaks sha256: clients infer sha256 in that case,
+// but any other function is rejected.
+func validateDigestFunction(fn digest.Function, capa *rpb.ServerCapabilities) error {
+	if err := checkAdvertisedDigestFunctions(fn, capa.GetCacheCapabilities().GetDigestFunctions(), "cache"); err != nil {
+		return err
+	}
+	ec := capa.GetExecutionCapabilities()
+	if !ec.GetExecEnabled() {
+		return nil
+	}
+	advertised := ec.GetDigestFunctions()
+	if len(advertised) == 0 && ec.GetDigestFunction() != rpb.DigestFunction_UNKNOWN {
+		// Per the spec, the repeated digest_functions field takes precedence,
+		// falling back to the legacy singular field if it is unset.
+		advertised = []rpb.DigestFunction_Value{ec.GetDigestFunction()}
+	}
+	return checkAdvertisedDigestFunctions(fn, advertised, "execution")
+}
+
+// checkAdvertisedDigestFunctions checks fn against one capability's advertised
+// digest functions.
+func checkAdvertisedDigestFunctions(fn digest.Function, advertised []rpb.DigestFunction_Value, capability string) error {
+	if len(advertised) == 0 {
+		if fn == digest.SHA256 {
+			return nil
+		}
+		return fmt.Errorf("digest function %s not supported; server advertised no %s digest functions", fn, capability)
+	}
+	if slices.Contains(advertised, fn.Value()) {
+		return nil
+	}
+	return fmt.Errorf("digest function %s is not supported by the server's %s capabilities; advertised: %v", fn, capability, advertised)
+}
+
+// Close cancels in-flight upload requests, stops the upload workers,
+// and closes the client's connections, including the separate CAS
+// connection when one was dialed.
 func (c *Client) Close() error {
-	return c.conn.Close()
+	if c.uploader != nil {
+		c.uploader.close(ErrClientClosed)
+	}
+	err := c.conn.Close()
+	if c.casConn != nil && c.casConn != c.conn {
+		cerr := c.casConn.Close()
+		if err == nil {
+			err = cerr
+		}
+	}
+	if c.casDataConn != nil && c.casDataConn != c.casConn {
+		cerr := c.casDataConn.Close()
+		if err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
+// UploadSemaphore returns the semaphore that bounds in-flight UploadAll
+// requests, for stats. It returns nil for a nil client.
+func (c *Client) UploadSemaphore() *semaphore.Semaphore {
+	if c == nil || c.uploader == nil {
+		return nil
+	}
+	return c.uploader.sema
 }
 
 // IOMetrics returns an IOMetrics of the client.
@@ -621,20 +847,36 @@ func (c *Client) IOMetrics() *iometrics.IOMetrics {
 
 // Proto fetches contents of digest into proto message.
 func (c *Client) Proto(ctx context.Context, d digest.Digest, p proto.Message) error {
+	if c != nil && c.opt.LocalCache != nil {
+		err := c.opt.LocalCache.Proto(ctx, d, p)
+		if err == nil {
+			return nil
+		}
+	}
 	b, err := c.Get(ctx, d, fmt.Sprintf("%s -> %T", d, p))
 	if err != nil {
 		return err
 	}
-	return proto.Unmarshal(b, p)
+	err = proto.Unmarshal(b, p)
+	if err != nil {
+		return err
+	}
+	if c != nil && c.opt.LocalCache != nil {
+		err = c.opt.LocalCache.SetProto(ctx, d, p)
+		if err != nil {
+			clog.Warningf(ctx, "store proto %s: %v", d, err)
+		}
+	}
+	return nil
 }
 
 // GetActionResultTimeout caps a single GetActionResult attempt.
-// Picked at the observed p95 of OK responses (~1.2s on chrome
-// cache-warm); past p95 is pathological, cancel-and-retry on a
-// fresh stream beats waiting toward the 10s service-config deadline.
+// 1.2s from chrome's p95 seems to be too short. b/540566219
+// Cancel-and-retry on a fresh stream beats waiting toward the 10s
+// service-config deadline.
 // Applied to attempt 0 only; retries run to the natural 10s deadline.
 // Set to 0 to disable.
-var GetActionResultTimeout = 1200 * time.Millisecond
+var GetActionResultTimeout = 2 * time.Second
 
 // keepFirstAttempt reports whether to return the first GetActionResult
 // attempt or fall back to a retry. The deadline can fire in the gap
@@ -647,12 +889,36 @@ func keepFirstAttempt(callCtx context.Context, timeoutCause, callErr error) bool
 	return !cutByOurTimeout
 }
 
+// ValidateActionResult checks whether the action result is valid.
+func ValidateActionResult(result *rpb.ActionResult) bool {
+	if result == nil {
+		return false
+	}
+	if result.ExitCode == 0 && len(result.GetOutputFiles()) == 0 && len(result.GetOutputDirectories()) == 0 && len(result.GetOutputSymlinks()) == 0 &&
+		len(result.GetOutputFileSymlinks()) == 0 && len(result.GetOutputDirectorySymlinks()) == 0 { //nolint:staticcheck // existing deprecation
+		// succeeded result should have at least one output. b/350360391
+		// A dir-only output has no OutputFiles but does have an
+		// OutputDirectory, so accept that too (else it re-executes every build).
+		return false
+	}
+	return true
+}
+
 // GetActionResult gets the action result by the digest.
 func (c *Client) GetActionResult(ctx context.Context, d digest.Digest) (*rpb.ActionResult, error) {
+	if c != nil && c.opt.LocalCache != nil {
+		ar, err := c.opt.LocalCache.GetActionResult(ctx, d)
+		if err == nil {
+			if ar.ExitCode != 0 || ValidateActionResult(ar) {
+				return ar, nil
+			}
+		}
+	}
 	client := rpb.NewActionCacheClient(c.casConn)
 	req := &rpb.GetActionResultRequest{
-		InstanceName: c.opt.Instance,
-		ActionDigest: d.Proto(),
+		InstanceName:   c.opt.Instance,
+		ActionDigest:   d.Proto(),
+		DigestFunction: c.digestFn.Value(),
 	}
 	// Attempt 0 runs under a short deadline so a stalled lookup
 	// doesn't sit the full 10s service-config deadline. Only our
@@ -668,8 +934,14 @@ func (c *Client) GetActionResult(ctx context.Context, d digest.Digest) (*rpb.Act
 		// Decide before cancel() overwrites the deadline cause.
 		keep := keepFirstAttempt(callCtx, cause, err)
 		cancel()
+		clog.Infof(ctx, "GetActionResult keep=%t err=%v", keep, err)
 		if keep {
 			c.m.OpsDone(err)
+			if err == nil && result != nil && result.ExitCode == 0 && ValidateActionResult(result) && c.opt.LocalCache != nil {
+				if werr := c.opt.LocalCache.SetActionResult(ctx, d, result); werr != nil {
+					clog.Warningf(ctx, "failed to write action result with digest %s to local cache: %v", d.String(), werr)
+				}
+			}
 			return result, err
 		}
 		monitoring.RecordCancellation(ctx, "cache-check", "pre_first_byte")
@@ -681,7 +953,20 @@ func (c *Client) GetActionResult(ctx context.Context, d digest.Digest) (*rpb.Act
 		monitoring.RecordRetryDuration(ctx, "cache-check", time.Since(start), err)
 	}
 	c.m.OpsDone(err)
+	if err == nil && result != nil && result.ExitCode == 0 && ValidateActionResult(result) && c.opt.LocalCache != nil {
+		if werr := c.opt.LocalCache.SetActionResult(ctx, d, result); werr != nil {
+			clog.Warningf(ctx, "failed to write action result with digest %s to local cache: %v", d.String(), werr)
+		}
+	}
 	return result, err
+}
+
+// SetActionResult sets the action result in local cache if configured.
+func (c *Client) SetActionResult(ctx context.Context, d digest.Digest, ar *rpb.ActionResult) error {
+	if c.opt.LocalCache != nil {
+		return c.opt.LocalCache.SetActionResult(ctx, d, ar)
+	}
+	return nil
 }
 
 // UpdateActionResultEnabled reports whether UpdateActionResult is supported or not.
@@ -696,27 +981,33 @@ func (c *Client) UpdateActionResultEnabled() bool {
 
 // UpdateActionResult updates the action result by the digest.
 func (c *Client) UpdateActionResult(ctx context.Context, d digest.Digest, result *rpb.ActionResult) error {
+	if !c.APIVersion().useOutputSymlinks() {
+		// backend may not support output_symlinks.
+		// use output_file_symlinks instead.
+		result = proto.CloneOf(result)
+		result.OutputFileSymlinks = result.OutputSymlinks //nolint:staticcheck // existing deprecation
+		result.OutputSymlinks = nil
+	}
+
 	client := rpb.NewActionCacheClient(c.casConn)
 	_, err := client.UpdateActionResult(ctx, &rpb.UpdateActionResultRequest{
-		InstanceName: c.opt.Instance,
-		ActionDigest: d.Proto(),
-		ActionResult: result,
+		InstanceName:   c.opt.Instance,
+		ActionDigest:   d.Proto(),
+		ActionResult:   result,
+		DigestFunction: c.digestFn.Value(),
 	})
 	c.m.OpsDone(err)
 	return err
 }
 
-// APIVersion returns api version to use.
-func (c *Client) APIVersion() *semverpb.SemVer {
+// APIVersion returns the api version negotiated by Init.
+func (c *Client) APIVersion() Version {
 	if c == nil {
-		return nil
+		return Version{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.apiVersion != nil {
-		return c.apiVersion
-	}
-	return c.capabilities.GetHighApiVersion()
+	return c.apiVersion
 }
 
 // Instance returns the instance name.
@@ -725,6 +1016,26 @@ func (c *Client) Instance() string {
 		return ""
 	}
 	return c.opt.Instance
+}
+
+// Version is a RE API version.
+type Version struct {
+	Major, Minor int32
+}
+
+// versionOf converts a SemVer to a Version.
+func versionOf(v *semverpb.SemVer) Version {
+	return Version{Major: v.GetMajor(), Minor: v.GetMinor()}
+}
+
+// AtLeast reports whether v is the same as or newer than w.
+func (v Version) AtLeast(w Version) bool {
+	return v.Major > w.Major || v.Major == w.Major && v.Minor >= w.Minor
+}
+
+// String returns v as <major>.<minor>.
+func (v Version) String() string {
+	return fmt.Sprintf("%d.%d", v.Major, v.Minor)
 }
 
 // UseActionForPlatformProperties returns true
@@ -739,8 +1050,8 @@ func (c *Client) Instance() string {
 //	 // DEPRECATED as of v2.2: platform properties are now specified directly
 //	 // in the action.
 //	 Platform platform
-func UseActionForPlatformProperties(apiVer *semverpb.SemVer) bool {
-	return apiVer.GetMajor() >= 2 && apiVer.GetMinor() >= 2
+func (v Version) UseActionForPlatformProperties() bool {
+	return v.AtLeast(Version{2, 2})
 }
 
 // UseOutputPaths returns true
@@ -758,12 +1069,96 @@ func UseActionForPlatformProperties(apiVer *semverpb.SemVer) bool {
 //	  // and `output_directories` fields.  If `output_paths` is used,
 //	  // `output_files` and `output_directories` will be ignored!
 //	  repeated string output_paths
-func UseOutputPaths(apiVer *semverpb.SemVer) bool {
-	return apiVer.GetMajor() >= 2 && apiVer.GetMinor() >= 1
+func (v Version) UseOutputPaths() bool {
+	return v.AtLeast(Version{2, 1})
+}
+
+// useOutputSymlinks returns true
+// when output_symlinks instead of output_file_symlinks or
+// output_directory_symlinks in ActionResult.
+//
+//	message ActionResult
+//	     // DEPRECATED as of v2.1. Servers that wish to be compatible with
+//	     // v2.0 API should still populate this field in addition to
+//	     // `output_symlinks`.
+//	     repeated string output_file_symlinks
+//
+//	     // DEPRECATED as of v2.1. Servers that wish to be compatible with
+//	     // v2.0 API should still populate this field in addition to
+//	     // `output_symlinks`.
+//	     repeated string output_directory_symlinks
+//
+//	     // New in v2.1: this field will only be populated if the command
+//	     // `output_paths` field was used, and not the pre v2.1
+//	     // `output_files` or `output_directories` fields.
+//	     repeated string output_symlinks
+func (v Version) useOutputSymlinks() bool {
+	return v.AtLeast(Version{2, 1})
+}
+
+// Range of RE API versions that siso implements.
+var (
+	minAPIVersion = Version{2, 0}
+	maxAPIVersion = Version{2, 3}
+)
+
+// negotiateAPIVersion returns the requested api version (v<major>.<minor>),
+// or if empty, the highest version that both siso and the server support.
+// It fails if that version is outside either range.
+// A server that doesn't advertise a version is treated as v2.0.
+func negotiateAPIVersion(capa *rpb.ServerCapabilities, requested string) (Version, error) {
+	v20 := Version{2, 0}
+	serverLow := cmp.Or(versionOf(capa.GetLowApiVersion()), v20)
+	serverHigh := cmp.Or(versionOf(capa.GetHighApiVersion()), v20)
+	low, high := minAPIVersion, maxAPIVersion
+	if serverLow.AtLeast(low) {
+		low = serverLow
+	}
+	if high.AtLeast(serverHigh) {
+		high = serverHigh
+	}
+	ranges := fmt.Sprintf("server supports %s..%s, siso supports %s..%s", serverLow, serverHigh, minAPIVersion, maxAPIVersion)
+	if requested == "" {
+		if !high.AtLeast(low) {
+			return Version{}, fmt.Errorf("no common reapi version: %s", ranges)
+		}
+		return high, nil
+	}
+	v, err := parseAPIVersion(requested)
+	if err != nil {
+		return Version{}, err
+	}
+	if !v.AtLeast(low) || !high.AtLeast(v) {
+		return Version{}, fmt.Errorf("unsupported reapi version %s: %s", requested, ranges)
+	}
+	return v, nil
+}
+
+// parseAPIVersion parses an api version in format of v<major>.<minor>.
+func parseAPIVersion(s string) (Version, error) {
+	majorStr, minorStr, ok := strings.Cut(strings.TrimPrefix(s, "v"), ".")
+	major, majorErr := strconv.ParseUint(majorStr, 10, 31)
+	minor, minorErr := strconv.ParseUint(minorStr, 10, 31)
+	if !strings.HasPrefix(s, "v") || !ok || majorErr != nil || minorErr != nil {
+		return Version{}, fmt.Errorf("invalid reapi version %q: want v<major>.<minor>", s)
+	}
+	return Version{Major: int32(major), Minor: int32(minor)}, nil
 }
 
 // NewContext returns new context with request metadata.
 func NewContext(ctx context.Context, rmd *rpb.RequestMetadata) context.Context {
+	// Carry the current trace span (if any) as an OpenTelemetry span context so
+	// RBE RPCs join that span's trace server-side (e.g. Dapper). Inert without a
+	// configured TracerProvider; see Option.TracerProvider.
+	if sp := trace.CurSpan(ctx); sp != nil {
+		if tid, sid, ok := sp.RawIDs(); ok {
+			ctx = oteltrace.ContextWithSpanContext(ctx, oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+				TraceID:    tid,
+				SpanID:     sid,
+				TraceFlags: oteltrace.FlagsSampled,
+			}))
+		}
+	}
 	if rmd == nil {
 		rmd = &rpb.RequestMetadata{}
 	}
@@ -790,7 +1185,7 @@ func NewContext(ctx context.Context, rmd *rpb.RequestMetadata) context.Context {
 	} else {
 		md = md.Copy()
 	}
-	md.Set("build.bazel.remote.execution.v2.requestmetadata-bin", string(b))
+	md.Set(requestMetadataKey, string(b))
 	return metadata.NewOutgoingContext(ctx, md)
 }
 
@@ -800,7 +1195,7 @@ func MetadataFromOutgoingContext(ctx context.Context) (*rpb.RequestMetadata, boo
 	if !ok {
 		return nil, false
 	}
-	v, ok := md["build.bazel.remote.execution.v2.requestmetadata-bin"]
+	v, ok := md[requestMetadataKey]
 	if !ok {
 		return nil, false
 	}

@@ -1,0 +1,837 @@
+/* Copyright 2024 The Chromium Authors
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file. */
+
+/* Page layout. */
+
+html, body {
+    margin: 0;
+    padding: 0;
+    --header-height: 36px;
+}
+
+#page {
+    display: grid;
+    min-height: 100vh;
+    grid-template-columns: 80px auto;
+    grid-template-rows: auto auto 1fr;
+    grid-template-areas:
+        "header header"
+        "navrail tabs"
+        "navrail content";
+    &:has(#page-sidebar) {
+        grid-template-columns: 80px auto 300px;
+        grid-template-areas:
+            "header  header  header"
+            "navrail  tabs   tabs"
+            "navrail content sidebar";
+    }
+
+    .header {
+        grid-area: header;
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background-color: var(--md-sys-color-surface-container);
+        height: var(--header-height);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0 8px;
+        --md-text-button-container-height: 28px;
+        --md-icon-button-state-layer-height: 28px;
+    }
+
+    .header-title {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 0;
+    }
+
+    .header-title h1,
+    .header-title .subtitle,
+    .header-title .breadcrumbs,
+    .header-title .breadcrumb {
+        margin: 0;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        font-size: var(--md-sys-typescale-title-medium-size);
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+    }
+
+    .header-title .subtitle {
+        font-size: var(--md-sys-typescale-title-small-size);
+        font-weight: var(--md-sys-typescale-title-small-weight);
+    }
+
+    .breadcrumb::before {
+        content: "\203A"; /* › character */
+        padding: 0 4px;
+    }
+
+    .breadcrumb-menu-button {
+        --md-icon-size: 18px;
+        --md-text-button-container-height: 28px;
+        --md-text-button-label-text-color: var(--md-sys-color-on-surface-variant);
+    }
+    .breadcrumb-menu-button md-icon::before {
+        content: 'arrow_drop_down';
+    }
+
+    .mtime-status {
+        font-size: var(--md-sys-typescale-title-small-size);
+        font-weight: normal;
+        font-style: italic;
+    }
+}
+
+/* Dark mode toggle icon. Respects OS preference by default. */
+.toggle-dark-mode md-icon::before {
+    content: 'brightness_4';
+}
+@media (prefers-color-scheme: dark) {
+    .toggle-dark-mode md-icon::before {
+        content: 'brightness_7';
+    }
+}
+/* Explicit overrides if set by the user. */
+:root.light .toggle-dark-mode md-icon::before {
+    content: 'brightness_4';
+}
+:root.dark .toggle-dark-mode md-icon::before {
+    content: 'brightness_7';
+}
+
+#page-navrail {
+    grid-area: navrail;
+    align-self: start;
+    position: sticky;
+    top: var(--header-height);
+
+    /* Simulation of https://m3.material.io/components/navigation-rail/overview
+     * since Material Web is in maintenance mode and this component is missing
+     * at time of writing. */
+    .page-tab {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        position: relative;
+        text-align: center;
+        --page-tab-width: 80px;
+        --page-tab-icon-width: 56px;
+        --page-tab-icon-height: 32px;
+        width: var(--page-tab-width);
+        margin-bottom: 8px;
+        font-size: var(--md-sys-typescale-label-medium-size);
+        font-weight: var(--md-sys-typescale-label-medium-weight);
+        color: var(--md-sys-color-on-surface);
+        &:hover {
+            text-decoration: none;
+        }
+
+        md-icon {
+            height: var(--page-tab-icon-height);
+            width: var(--page-tab-icon-width);
+            margin: 0 auto;
+        }
+        &.selected md-icon {
+            background: var(--md-sys-color-secondary-container);
+            border-radius: 999px;
+            font-variation-settings: 'FILL' 1;
+        }
+
+        md-ripple {
+            position: absolute;
+            height: var(--page-tab-icon-height);
+            width: var(--page-tab-icon-width);
+            margin: 0 auto;
+            border-radius: 999px;
+        }
+    }
+}
+#page-view {
+    display: contents;
+}
+#page-tabs {
+    grid-area: tabs;
+
+    /* Simulation of https://m3.material.io/components/button-groups/overview
+     * (for the connected button group variant only)
+     * since Material Web is in maintenance mode and this component is missing
+     * at time of writing. */
+    --tab-height: 40px;
+    --tab-line-height: var(--md-sys-typescale-label-large-line-height, 1.25rem);
+    --tab-text-size: var(--md-sys-typescale-label-large-size, 0.875rem);
+    --tab-text-weight: var(--md-sys-typescale-label-large-weight, var(--md-ref-typeface-weight-medium, 500));
+    --tab-icon-size: 18px;
+    --tab-leading-space: 24px;
+    --tab-trailing-space: 24px;
+    .page-tab {
+        display: inline-flex;
+        place-items: center;
+        margin-bottom: 4px;
+        box-sizing: border-box;
+        background: var(--md-filled-tonal-button-container-color, var(--md-sys-color-secondary-container));
+        color: var(--md-filled-tonal-button-label-text-color, var(--md-sys-color-on-secondary-container));
+        font-size: var(--tab-text-size);
+        font-weight: var(--tab-text-weight);
+        min-height: var(--tab-height);
+        padding-block: calc((var(--tab-height) - max(var(--tab-line-height), var(--tab-icon-size))) / 2);
+        padding-inline-start: var(--tab-leading-space);
+        padding-inline-end: var(--tab-trailing-space);
+        border-radius: var(--md-sys-shape-corner-extra-small);
+        transition: border-radius 350ms cubic-bezier(0.27, 1.06, 0.18, 1.00);
+        &:first-of-type {
+            border-start-start-radius: var(--md-sys-shape-corner-full);
+            border-end-start-radius: var(--md-sys-shape-corner-full);
+        }
+        &:last-of-type {
+            border-start-end-radius: var(--md-sys-shape-corner-full);
+            border-end-end-radius: var(--md-sys-shape-corner-full);
+        }
+        &:hover {
+            text-decoration: none;
+        }
+        &.selected {
+            background: var(--md-filled-button-container-color, var(--md-sys-color-primary-container));
+            color: var(--md-filled-button-label-text-color, var(--md-sys-color-on-primary-container));
+            border-radius: var(--md-sys-shape-corner-full);
+        }
+    }
+}
+#page-content {
+    grid-area: content;
+    margin-right: 12px;
+}
+#page-sidebar {
+    grid-area: sidebar;
+    /* Even though this is part of the grid, it needs to be explicitly set for
+     * some reason, otherwise child elements won't wrap. TODO: why? */
+    width: 300px;
+}
+
+.surface {
+    background: var(--md-sys-color-surface);
+    border-radius: var(--md-sys-shape-corner-large);
+    padding: 16px;
+}
+.build-status.surface {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    padding: 12px 16px;
+    font-size: var(--md-sys-typescale-title-medium-size);
+    font-weight: var(--md-sys-typescale-title-small-weight);
+    &.success {
+        background: var(--siso-sys-color-success-container);
+        color: var(--siso-sys-color-on-success-container);
+    }
+    &.failure {
+        background: var(--md-sys-color-error-container);
+        color: var(--md-sys-color-on-error-container);
+    }
+}
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    &.success {
+        color: var(--siso-sys-color-success);
+    }
+    &.failure {
+        color: var(--md-sys-color-error);
+    }
+    &.unknown {
+        color: var(--md-sys-color-on-surface-variant);
+    }
+}
+
+/* Steps page. */
+
+.revs-timeline {
+    list-style: none;
+    padding: 0;
+    --timeline-vertical-padding: 4px;
+    --timeline-horizontal-padding: 16px;
+    --timeline-vertical-spacing: 12px;
+    --timeline-dot-size: 10px;
+    --timeline-dot-indent: 4px;
+
+    > li {
+        position: relative;
+        padding: 0 0 var(--timeline-vertical-spacing) 0;
+        --md-icon-size: 20px;
+    }
+    .rev-label {
+        position: relative;
+        padding:
+            var(--timeline-vertical-padding)
+            var(--timeline-horizontal-padding)
+            var(--timeline-vertical-padding)
+            calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
+        border-radius: 999px;
+        text-decoration: none;
+        font-weight: var(--md-sys-typescale-label-medium-weight);
+    }
+    .rev-label.disabled {
+        font-style: italic;
+    }
+    .rev-label.disabled,
+    .rev-label .rev-label-note {
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+    }
+    .rev-info {
+        padding:
+            var(--timeline-vertical-padding)
+            var(--timeline-horizontal-padding)
+            0
+            calc(var(--timeline-horizontal-padding) + var(--timeline-dot-indent));
+        color: var(--md-sys-color-on-surface-variant);
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+        font-size: var(--md-sys-typescale-body-medium-size);
+    }
+    .rev-sublinks {
+        list-style: none;
+        padding: 0;
+    }
+    .rev-sublinks li {
+        position: relative;
+        margin: 4px 0;
+    }
+    .rev-sublinks li.selected {
+        font-weight: bold;
+    }
+
+    > li:before {
+        /* Render the timeline dot. */
+        content: '';
+        width: var(--timeline-dot-size);
+        height: var(--timeline-dot-size);
+        border-radius: 50%;
+        background: var(--md-sys-color-outline);
+        position: absolute;
+        top: calc(var(--timeline-dot-size)/2);
+        left: var(--timeline-dot-indent);
+    }
+    > li:after {
+        /* Render the timeline line. */
+        content: '';
+        width: 2px;
+        height: 100%;
+        background: var(--md-sys-color-outline);
+        position: absolute;
+        left: calc(var(--timeline-dot-indent) + var(--timeline-dot-size)/2 - 1px);
+        top: calc(var(--timeline-dot-size)/2);
+    }
+    > li:last-child:after {
+        /* The end of the timeline should fade into blank. */
+        background: linear-gradient(var(--md-sys-color-outline), transparent);
+    }
+
+    > li.selected .rev-label {
+        background: var(--md-sys-color-secondary-container);
+        color: var(--md-sys-color-on-secondary-container);
+        z-index: 1;
+    }
+    > li.selected:before {
+        background: var(--md-sys-color-on-secondary-container);
+        z-index: 2;
+    }
+}
+
+.data-table-filter {
+    position: sticky;
+    top: calc(16px + var(--header-height));
+}
+.step-views {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    /* Temporary hack to show unimplemented views */
+    --md-outlined-button-container-height: 32px;
+    --md-outlined-button-leading-space: 20px;
+    --md-outlined-button-trailing-space: 20px;
+
+    h3 {
+        margin: 0;
+        font-size: var(--md-sys-typescale-title-medium-size);
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+    }
+    label {
+        box-sizing: border-box;
+        display: inline-flex;
+        align-items: center;
+        position: relative;
+        height: 32px;
+        padding: 0 20px;
+        border: 1px solid var(--md-sys-color-outline);
+        border-radius: 999px;
+        font-size: var(--md-sys-typescale-label-large-size);
+        font-weight: var(--md-sys-typescale-label-large-weight);
+        cursor: pointer;
+    }
+    input[type="radio"] {
+        display: none;
+    }
+    input[type="radio"]:checked + label {
+        background: var(--md-sys-color-secondary-container);
+        color: var(--md-sys-color-primary);
+    }
+}
+
+.step-paginator {
+    margin: 16px 0;
+}
+
+.page-controls {
+    display: flex;
+    margin: 8px 0;
+
+    md-outlined-text-field {
+        width: 80px;
+        height: var(--md-icon-button-state-layer-height);
+        --md-outlined-field-bottom-space: 12px;
+        --md-outlined-field-top-space: 12px;
+        --md-outlined-field-trailing-space: 12px;
+        --md-outlined-field-leading-space: 12px;
+    }
+}
+
+.filter-controls {
+    margin: 8px 0;
+
+    h3 {
+        font-size: var(--md-sys-typescale-title-medium-size);
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+    }
+
+    md-filter-chip {
+        --md-filter-chip-label-text-size: 13px;
+        --md-filter-chip-leading-space: 10px;
+        --md-filter-chip-trailing-space: 10px;
+        --md-filter-chip-container-height: 26px;
+    }
+
+    md-chip-set input[type=checkbox] {
+        display: none;
+    }
+}
+
+.menu-popover-button {
+    position: relative;
+    background: none;
+    border: none;
+    border-radius: 999px;
+    font-family: var(--md-ref-typeface-plain);
+    font-size: var(--md-sys-typescale-label-large-size);
+    color: var(--md-text-button-label-text-color, var(--md-sys-color-primary));
+    min-height: var(--md-text-button-container-height, 40px);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 8px;
+}
+
+/* Container for popover menus.
+ * The inner .menu-popover-content paints an outer shadow into this container. */
+.menu-popover {
+    background: transparent;
+    border: none;
+    margin: -16px;
+    padding: 16px;
+    position-area: block-end span-inline-end;
+    /* Don't capture pointer events, inner container owns them. */
+    pointer-events: none;
+
+    .menu-popover-content {
+        position: relative;
+        pointer-events: auto;
+        background: var(--md-sys-color-surface-container);
+        --md-elevation-level: 2;
+        padding: 8px 16px;
+        /* Reuse Material Design menu border radius. */
+        border-radius: var(--md-menu-container-shape, var(--md-sys-shape-corner-extra-small, 4px));
+    }
+    .menu-popover-content ul {
+        list-style: none;
+        padding: 0;
+    }
+    .menu-popover-content li {
+        padding: 4px 0;
+    }
+}
+
+.filter-button {
+    margin-top: 6px;
+}
+.filter-popover {
+    position-area: center right;
+    position-try-fallbacks: top right;
+}
+
+.data-table-container {
+    overflow-x: scroll;
+
+    table {
+        position: relative;
+        border-collapse: collapse;
+        min-width: 1200px;
+        width: 100%;
+        line-height: var(--md-sys-typescale-body-small-line-height);
+        letter-spacing: 0.01rem;
+        table-layout: fixed;
+    }
+
+    thead {
+        position: sticky;
+        top: 0;
+        /* Blur the background when scrolling past the top. */
+        background:
+            color-mix(in srgb, var(--md-sys-color-surface), transparent 33%);
+        backdrop-filter: blur(10px);
+    }
+    table::before {
+        /* We don't want the blur when scrolled at the top.
+        * This is a hack that stops the blur only at the top. */
+        position: absolute;
+        left: 0; right: 0; bottom: 0; top: 0;
+        display: block;
+        content: ' ';
+        z-index: -1;
+    }
+    thead th.thin-column {
+        width: 60px;
+    }
+    thead th.timestamp-column {
+        width: 110px;
+    }
+    thead th.timeline-column {
+        width: 300px;
+    }
+    thead th {
+        font-size: var(--md-sys-typescale-body-medium-size);
+        font-weight: var(--md-ref-typeface-weight-medium);
+    }
+    thead th:has(md-text-button) {
+        /* Give padding responsibility to the button. */
+        padding-left: 0;
+        padding-right: 0;
+    }
+    thead md-text-button {
+        padding-left: 16px;
+        padding-right: 16px;
+    }
+
+    th {
+        text-align: start;
+    }
+
+    th,
+    td {
+        padding: 6px 16px;
+    }
+    tbody tr {
+        border-top: 1px solid var(--md-sys-color-outline-variant);
+        border-bottom: 1px solid var(--md-sys-color-outline-variant);
+    }
+    tbody th {
+        overflow-wrap: break-word;
+    }
+
+    .subrow {
+        color: var(--md-sys-color-on-surface-variant);
+        font-size: var(--md-sys-typescale-body-small-size);
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+        letter-spacing: 0.02rem;
+    }
+
+    tbody tr:hover {
+        background: var(--md-sys-color-surface-container);
+    }
+    tbody th,
+    tbody td {
+        font-size: var(--md-sys-typescale-body-medium-size);
+        font-weight: var(--md-sys-typescale-body-medium-weight);
+    }
+
+    .timestamp {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+    }
+}
+
+th.remote-indicator {
+    text-align: right;
+}
+td.remote-indicator {
+    text-align: center;
+}
+.remote-indicator md-icon.icon-cache-hit {
+    color: var(--siso-sys-color-success);
+    font-variation-settings: 'FILL' 1;
+}
+
+.step-rule:not(:empty) {
+    background: var(--md-sys-color-surface-container);
+    color: var(--md-sys-color-on-surface-container);
+    padding: 2px 4px;
+    border-radius: var(--md-sys-shape-corner-large);
+}
+
+.step-timeline-bar {
+    outline: 1px solid var(--md-sys-color-outline);
+}
+
+/* Individual step page. */
+
+.step-page {
+    h2 {
+        font-weight: var(--md-sys-typescale-title-medium-weight);
+        font-size: var(--md-sys-typescale-title-medium-size);
+        line-height: var(--md-sys-typescale-title-medium-line-height);
+    }
+
+    dt {
+        font-weight: bold;
+    }
+
+    dd {
+        display: flex;
+        align-items: center;
+        margin-bottom: 4px;
+        word-break: break-all;
+    }
+
+    details {
+        margin-top: 8px;
+    }
+}
+
+.step-outputs {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0;
+    max-height: 300px;
+    overflow-y: auto;
+
+    li {
+        padding: 2px 0;
+    }
+}
+
+.step-details {
+    list-style: none;
+    padding: 0;
+
+    li {
+        min-height: 40px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+    li > md-icon {
+        margin-right: 10px;
+    }
+}
+
+.step-tools form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* Global styles. */
+
+body {
+    font-family: var(--md-ref-typeface-plain);
+    background-color: var(--md-sys-color-surface-container);
+    color: var(--md-sys-color-on-surface);
+}
+
+#progress-indicator {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 999;
+    &.htmx-request {
+        display: block;
+    }
+}
+
+a {
+    color: var(--md-sys-color-primary);
+    text-decoration: none;
+    &:focus-visible, &:hover {
+        text-decoration: underline;
+    }
+}
+
+/* Link buttons.
+ *
+ * Use this to style a <button> to look like a hyperlink.
+ * This is useful for situations where a deemphasized appearance is desired.
+ *
+ * Consider using <md-text-button> instead if the significantly enlarged
+ * touch-friendly target and Material Design ripple behavior are acceptable.
+ *
+ * For context on why <button> is preferred over <a>, even if a text-like
+ * appearance is desired:
+ * https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/a#onclick_events
+ *
+ * Adding a Material Design icon is supported, but text must be wrapped in
+ * an item with class="text" in order to display underlines correctly.
+ *
+ * Examples:
+ *
+ *     <button class="link-button">Hello world</button>
+ *
+ *     <button class="link-button">
+ *         <md-icon>check</md-icon>
+ *         <span class="text">Done</span>
+ *     </button>
+ */
+.link-button {
+    /* This is the part to style it like a link. */
+    border: 0;
+    background: transparent;
+    color: var(--md-sys-color-primary);
+    font-family: inherit;
+    font-weight: var(--md-ref-typeface-weight-regular);
+    cursor: pointer;
+    &:hover {
+        text-decoration: underline;
+    }
+    /* Vertically center everything, since you're most likely going to
+     * just have an icon and text here at most. */
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+.link-button:has(md-icon):has(.text) {
+    /* If the link button has both an md-icon and .text element,
+     * then disable underline on the md-icon and only enable on .text */
+    &:hover {
+        text-decoration: none;
+    }
+    &:hover .text {
+        text-decoration: underline;
+    }
+}
+
+/* Code blocks https://meyerweb.com/eric/thoughts/2022/12/29/styling-a-pre-that-contains-a-code/ */
+pre:has(> code) {
+    overflow-x: auto;
+    background: var(--md-sys-color-surface-container);
+    border: 1px solid var(--md-sys-color-outline);
+    padding: 8px;
+}
+
+:root {
+    /* Typeface */
+    --md-ref-typeface-weight-regular: 400;
+    --md-ref-typeface-weight-medium: 500;
+    --md-ref-typeface-weight-bold: 700;
+    --md-ref-typeface-brand: system-ui;
+    --md-ref-typeface-plain: system-ui;
+
+    /* Display */
+    --md-sys-typescale-display-small-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-display-small-size: 2.25rem;
+    --md-sys-typescale-display-small-line-height: 2.75rem;
+
+    --md-sys-typescale-display-medium-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-display-medium-size: 2.8125rem;
+    --md-sys-typescale-display-medium-line-height: 3.25rem;
+
+    --md-sys-typescale-display-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-display-large-size: 3.5625rem;
+    --md-sys-typescale-display-large-line-height: 4rem;
+
+    /* Headline */
+    --md-sys-typescale-headline-small-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-headline-small-size: 1.5rem;
+    --md-sys-typescale-headline-small-line-height: 2rem;
+
+    --md-sys-typescale-headline-medium-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-headline-medium-size: 1.75rem;
+    --md-sys-typescale-headline-medium-line-height: 2.25rem;
+
+    --md-sys-typescale-headline-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-headline-large-size: 2rem;
+    --md-sys-typescale-headline-large-line-height: 2.5rem;
+
+    /* Title */
+    --md-sys-typescale-title-small-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-title-small-size: 0.875rem;
+    --md-sys-typescale-title-small-line-height: 1.25rem;
+
+    --md-sys-typescale-title-medium-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-title-medium-size: 1rem;
+    --md-sys-typescale-title-medium-line-height: 1.5rem;
+
+    --md-sys-typescale-title-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-title-large-size: 1.375rem;
+    --md-sys-typescale-title-large-line-height: 1.75rem;
+
+    /* Body */
+    --md-sys-typescale-body-small-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-body-small-size: 0.75rem;
+    --md-sys-typescale-body-small-line-height: 1rem;
+
+    --md-sys-typescale-body-medium-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-body-medium-size: 0.875rem;
+    --md-sys-typescale-body-medium-line-height: 1.25rem;
+
+    --md-sys-typescale-body-large-weight:
+        var(--md-ref-typeface-weight-regular);
+    --md-sys-typescale-body-large-size: 1rem;
+    --md-sys-typescale-body-large-line-height: 1.5rem;
+
+    /* Label */
+    --md-sys-typescale-label-small-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-label-small-size: 0.6875rem;
+    --md-sys-typescale-label-small-line-height: 1rem;
+
+    --md-sys-typescale-label-medium-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-label-medium-size: 0.75rem;
+    --md-sys-typescale-label-medium-line-height: 1rem;
+    --md-sys-typescale-label-medium-weight-prominent:
+        var(--md-ref-typeface-weight-bold);
+
+    --md-sys-typescale-label-large-weight:
+        var(--md-ref-typeface-weight-medium);
+    --md-sys-typescale-label-large-size: 0.875rem;
+    --md-sys-typescale-label-large-line-height: 1.25rem;
+    --md-sys-typescale-label-large-weight-prominent:
+        var(--md-ref-typeface-weight-bold);
+
+    /* Shapes */
+    --md-sys-shape-corner-extra-small: 4px;
+    --md-sys-shape-corner-small: 8px;
+    --md-sys-shape-corner-medium: 12px;
+    --md-sys-shape-corner-large: 16px;
+    --md-sys-shape-corner-full: 9999px;
+
+    /* Misc */
+    --md-icon-button-state-layer-height: 40px;
+}

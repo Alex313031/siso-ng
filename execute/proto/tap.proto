@@ -1,0 +1,23 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+syntax = "proto3";
+
+package siso.execute;
+
+option go_package = "go.chromium.org/build/siso/execute/proto";
+
+// TapResult is a result of command tapping.
+// will be stored in ActionResult.execution_metadata.auxiliary_metadata
+// if spawnhelper supports tapping.
+message TapResult {
+  repeated string Reads = 1 [json_name = "reads"];
+  repeated string Writes = 2 [json_name = "writes"];
+  repeated string Deletes = 3 [json_name = "deletes"];
+
+  // report tap error. command succeeded, but some error in tapping.
+  // will ignore not populate two phase caching as tap result is
+  // not reliable.
+  string Error = 4 [json_name = "error"];
+}

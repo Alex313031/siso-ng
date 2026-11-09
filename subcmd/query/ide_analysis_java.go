@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"go.chromium.org/build/siso/o11y/clog"
+	sisopath "go.chromium.org/build/siso/path"
 	pb "go.chromium.org/build/siso/toolsupport/ciderutil/proto"
 	"go.chromium.org/build/siso/toolsupport/ninjautil"
 	"go.chromium.org/build/siso/toolsupport/shutil"
@@ -190,7 +191,7 @@ func (a *ideAnalyzer) appendIndirectJavaBuildableUnits(ctx context.Context, edge
 			path := out.Path()
 			switch filepath.Ext(path) {
 			case ".jar":
-				buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, a.path.MaybeFromRelative(ctx, path))
+				buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, sisopath.New(a.path.MaybeFromRelative(ctx, path)))
 				if err != nil {
 					clog.Warningf(ctx, "not exist generated file %q: %v", path, err)
 					continue
@@ -209,7 +210,7 @@ func (a *ideAnalyzer) appendIndirectJavaBuildableUnits(ctx context.Context, edge
 			path := out.Path()
 			switch filepath.Ext(path) {
 			case ".java", ".jar", ".class":
-				buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, a.path.MaybeFromRelative(ctx, path))
+				buf, err := a.hashFS.ReadFile(ctx, a.path.WorkspaceRoot, sisopath.New(a.path.MaybeFromRelative(ctx, path)))
 				if err != nil {
 					clog.Warningf(ctx, "not exist generated file %q: %v", path, err)
 					continue

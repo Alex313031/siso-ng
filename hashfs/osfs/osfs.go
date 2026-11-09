@@ -22,12 +22,15 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"go.chromium.org/build/hashigo/digest"
+
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/iometrics"
 	"go.chromium.org/build/siso/o11y/monitoring"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/firstbyte"
 	"go.chromium.org/build/siso/sync/semaphore"
+	"go.chromium.org/build/siso/toolsupport/abfsutil"
 	"go.chromium.org/build/siso/toolsupport/cartfsutil"
 )
 
@@ -53,8 +56,11 @@ const defaultDigestXattr = "google.digest.sha256"
 type OSFS struct {
 	*iometrics.IOMetrics
 
+	digestFn        digest.Function
 	digestXattrName string
 	onCog           bool
+	cartFS          *cartfsutil.Client
+	abfs            *abfsutil.Client
 }
 
 // Option is an option for osfs.
@@ -65,12 +71,18 @@ type Option struct {
 	// set explicitly to opt in on other filesystems that publish it.
 	DigestXattrName string
 
+	// DigestFunction is the content digest function. The zero value means
+	// SHA-256.
+	DigestFunction digest.Function
+
 	// OnCog indicates the exec root is on the Cog filesystem.
 	// Enables a stat-before-utimes workaround for b/356987531.
 	OnCog bool
 	// CartFS is client of CartFS.
 	// TODO(b/513044090): decide xattr or GetDigest API.
 	CartFS *cartfsutil.Client
+	// ABFS is client of ABFS.
+	ABFS *abfsutil.Client
 }
 
 func (o *Option) RegisterFlags(flagSet *flag.FlagSet) {
@@ -80,7 +92,8 @@ func (o *Option) RegisterFlags(flagSet *flag.FlagSet) {
 // New creates new OSFS.
 func New(ctx context.Context, name string, opt Option) *OSFS {
 	digestXattrName := opt.DigestXattrName
-	if digestXattrName == "" && xattr.XATTR_SUPPORTED && (opt.OnCog || opt.CartFS != nil) {
+	// b/549654852: cartfs will drop xattr support
+	if digestXattrName == "" && xattr.XATTR_SUPPORTED && opt.OnCog {
 		digestXattrName = defaultDigestXattr
 	}
 	if !xattr.XATTR_SUPPORTED {
@@ -89,10 +102,17 @@ func New(ctx context.Context, name string, opt Option) *OSFS {
 	if digestXattrName != "" {
 		clog.Infof(ctx, "use xattr %s for file digest", digestXattrName)
 	}
+	fn := opt.DigestFunction
+	if fn.IsZero() {
+		fn = digest.SHA256
+	}
 	return &OSFS{
 		IOMetrics:       iometrics.New(name),
+		digestFn:        fn,
 		digestXattrName: digestXattrName,
 		onCog:           opt.OnCog,
+		cartFS:          opt.CartFS,
+		abfs:            opt.ABFS,
 	}
 }
 
@@ -129,15 +149,15 @@ func (ofs *OSFS) Chtimes(ctx context.Context, name string, atime, mtime time.Tim
 	return err
 }
 
-// AsFileSource asserts digest.Source value holds FileSource type,
+// AsFileSource asserts blob.Source value holds FileSource type,
 // and return bool whether it holds or not.
-func (*OSFS) AsFileSource(ds digest.Source) (FileSource, bool) {
+func (*OSFS) AsFileSource(ds blob.Source) (FileSource, bool) {
 	s, ok := ds.(FileSource)
 	return s, ok
 }
 
 // FileSource creates new FileSource for name.
-// For FileDigestFromXattr, if size is non-negative, it will be used.
+// For FileDigestFromFS, if size is non-negative, it will be used.
 // If size is negative, it will check file info.
 func (ofs *OSFS) FileSource(name string, size int64) FileSource {
 	return FileSource{Fname: name, size: size, fs: ofs}
@@ -192,10 +212,21 @@ func (ofs *OSFS) Remove(ctx context.Context, name string) error {
 	return err
 }
 
+// RemoveAll removes name and any children it contains.
+func (ofs *OSFS) RemoveAll(ctx context.Context, name string) error {
+	started := time.Now()
+	err := os.RemoveAll(name)
+	ofs.OpsDone(err)
+	if dur := time.Since(started); dur > 1*time.Minute {
+		logSlow(ctx, name, dur, err)
+	}
+	return err
+}
+
 // Rename renames oldpath to newpath.
 func (ofs *OSFS) Rename(ctx context.Context, oldpath, newpath string) error {
 	started := time.Now()
-	err := os.Rename(oldpath, newpath)
+	err := rename(oldpath, newpath)
 	ofs.OpsDone(err)
 	if dur := time.Since(started); dur > 1*time.Minute {
 		logSlow(ctx, newpath, dur, err)
@@ -319,7 +350,7 @@ func firstByteTimeoutFromCtx(ctx context.Context) (time.Duration, bool) {
 }
 
 // WriteDigestData writes digest source into the named file.
-func (ofs *OSFS) WriteDigestData(ctx context.Context, name string, src digest.Source, perm fs.FileMode, timeout time.Duration) error {
+func (ofs *OSFS) WriteDigestData(ctx context.Context, name string, src blob.Source, perm fs.FileMode, timeout time.Duration) error {
 	started := time.Now()
 	var n int64
 	var rd measuringReader
@@ -425,25 +456,45 @@ func (ofs *OSFS) WriteDigestData(ctx context.Context, name string, src digest.So
 	return err
 }
 
-// FileDigestFromXattr returns file's digest via xattr if possible.
-func (ofs *OSFS) FileDigestFromXattr(ctx context.Context, name string, size int64) (digest.Digest, error) {
-	if ofs.digestXattrName == "" {
+// DigestFunction returns the content digest function used by this filesystem.
+func (ofs *OSFS) DigestFunction() digest.Function {
+	return ofs.digestFn
+}
+
+var xattrLGet = xattr.LGet
+
+// FileDigestFromFS returns file's digest via xattr or cartfs GetDigest if possible.
+func (ofs *OSFS) FileDigestFromFS(ctx context.Context, name string, size int64) (digest.Digest, error) {
+	// The xattr caches a sha256 digest, so it is only valid when sha256 is the
+	// active digest function. For any other function, recompute.
+	if ofs.digestFn != digest.SHA256 {
 		return digest.Digest{}, errors.ErrUnsupported
 	}
-	d, err := xattr.LGet(name, ofs.digestXattrName)
-	ofs.OpsDone(err)
-	if err != nil {
-		return digest.Digest{}, err
-	}
-	if size < 0 {
-		fi, err := os.Lstat(name)
+	if ofs.digestXattrName != "" {
+		d, err := xattrLGet(name, ofs.digestXattrName)
 		ofs.OpsDone(err)
-		size = fi.Size()
+		if err == nil {
+			if size < 0 {
+				fi, err := os.Lstat(name)
+				ofs.OpsDone(err)
+				if err != nil {
+					return digest.Digest{}, err
+				}
+				size = fi.Size()
+			}
+			return digest.Digest{
+				Hash:      string(d),
+				SizeBytes: size,
+			}, nil
+		}
 	}
-	return digest.Digest{
-		Hash:      string(d),
-		SizeBytes: size,
-	}, nil
+	if ofs.cartFS != nil {
+		return ofs.cartFS.Digest(ctx, name)
+	}
+	if ofs.abfs != nil {
+		return ofs.abfs.Digest(ctx, name)
+	}
+	return digest.Digest{}, errors.ErrUnsupported
 }
 
 // FileSource is a file source.
@@ -458,7 +509,7 @@ func (FileSource) IsLocal() {}
 
 // Open opens the named file for reading.
 func (fsc FileSource) Open(ctx context.Context) (io.ReadCloser, error) {
-	r, err := os.Open(fsc.Fname)
+	r, err := openRead(fsc.Fname)
 	return &file{ctx: ctx, file: r, started: time.Now(), fs: fsc.fs}, err
 }
 
@@ -466,9 +517,26 @@ func (fsc FileSource) String() string {
 	return fmt.Sprintf("file://%s", fsc.Fname)
 }
 
-// FileDigestFromXattr returns file's digest via xattr if possible.
-func (fsc FileSource) FileDigestFromXattr(ctx context.Context) (digest.Digest, error) {
-	return fsc.fs.FileDigestFromXattr(ctx, fsc.Fname, fsc.size)
+// Size returns the file's content size, stat-ing the file if it is not already
+// known. Used by git-framing digest functions, which need the size up front.
+func (fsc FileSource) Size() (int64, error) {
+	if fsc.size >= 0 {
+		return fsc.size, nil
+	}
+	// Stat (not Lstat) so the reported size matches the bytes Open reads: for a
+	// symlink to a file, Open follows the link and reads the target, and
+	// git-framing digests enforce that the framed size equals the bytes read.
+	fi, err := os.Stat(fsc.Fname)
+	fsc.fs.OpsDone(err)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// FileDigestFromFS returns file's digest via xattr or cartfs GetDigest if possible.
+func (fsc FileSource) FileDigestFromFS(ctx context.Context) (digest.Digest, error) {
+	return fsc.fs.FileDigestFromFS(ctx, fsc.Fname, fsc.size)
 }
 
 type file struct {

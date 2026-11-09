@@ -41,8 +41,13 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 	ctx, span := trace.NewSpan(ctx, "racing")
 	defer span.Close(nil)
 
-	step.metrics.Racing = true
-
+	// for local action, two phase caching is done in execLocal.
+	if b.allowRemote(step) && b.allowTwoPhaseCaching(step) {
+		ok, err := b.twoPhaseCachingLookup(ctx, step)
+		if ok {
+			return err
+		}
+	}
 	preprocErr := preprocCmd(ctx, b, step)
 	if preprocErr != nil {
 		// Can't determine inputs for remote - just run locally.
@@ -65,6 +70,8 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 		return b.execLocal(ctx, step)
 	}
 
+	step.metrics.Racing = true
+
 	// Clone the step for the local racer so the two sides don't
 	// interfere with each other's mutable state.
 	localStep := step.Clone()
@@ -83,11 +90,11 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 	// Post-processing runs after the race is decided to avoid hashFS
 	// races with the local goroutine's RecordOutputsFromLocal.
 	go func() {
-		// ctx is the build context; raceCtx is canceled when the
-		// race decides. Use ctx for CAS uploads so they survive
-		// race cancellation and don't poison shared upload
-		// operations used by other steps (reclient-style).
-		err := b.execRemoteExecute(ctx, raceCtx, step)
+		// raceCtx is canceled when the race decides. CAS input uploads
+		// are owned by the reapi client (not by this goroutine), so
+		// cancellation returns promptly without waiting for, or
+		// poisoning, uploads shared with other steps. b/565765743
+		err := b.execRemoteExecute(raceCtx, step)
 		if isContextCanceledErr(err) {
 			ch <- raceResult{resultType: raceCanceled, err: err}
 			return
@@ -96,16 +103,6 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 			if result, _ := step.cmd.ActionResult(); result != nil && result.GetExitCode() != 0 {
 				err = execute.ExitError{ExitCode: int(result.GetExitCode())}
 			}
-		}
-		if err != nil {
-			ok, ferr := b.remoteClaimFallbackIfAllowed(ctx, step, err)
-			if !ok {
-				ch <- raceResult{resultType: raceRemote, err: ferr}
-				return
-			}
-			b.setupFallback(ctx, step, err)
-			ch <- raceResult{resultType: raceRemoteFallback, err: err}
-			return
 		}
 		ch <- raceResult{resultType: raceRemote, err: err}
 	}()
@@ -122,13 +119,21 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 
 	// Wait for the first non-canceled result.
 	first := <-ch
+	if first.resultType == raceRemote && first.err != nil {
+		if ok, err := b.remoteClaimFallbackIfAllowed(ctx, step, first.err); ok {
+			b.setupFallback(ctx, step, first.err)
+			first.resultType = raceRemoteFallback
+		} else {
+			first.err = err
+		}
+	}
 
 	// Determine the winner.
 	var winner raceResult
 	switch first.resultType {
 	case raceCanceled:
 		// First result was a cancellation (e.g. couldn't acquire
-		// semaphore, or gRPC canceled from shared CAS upload).
+		// semaphore, or the build is shutting down).
 		// Wait for the second result instead.
 		winner = <-ch
 		// Both goroutines have now sent their results;
@@ -138,6 +143,33 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 		// Do not cancel local, wait for it to finish.
 		winner = <-ch
 	default:
+		if first.resultType == raceLocal && isKilledBySignal(first.err) {
+			// The local racer was killed by a signal, most likely by the
+			// kernel OOM killer (with the oom-score-adj experiment, local
+			// actions run with oom_score_adj=1000, so they are picked before
+			// siso). The remote racer is unaffected, so let it finish instead
+			// of failing the step. b/571235311
+			clog.Warningf(ctx, "racing: local killed (%v), waiting for remote", first.err)
+			second := <-ch
+			switch {
+			case second.resultType == raceRemote && second.err == nil:
+				winner = second
+			case second.resultType == raceRemote && ctx.Err() == nil:
+				// Remote failed too: same policy as any other remote failure.
+				ok, ferr := b.remoteClaimFallbackIfAllowed(ctx, step, second.err)
+				if !ok {
+					winner = raceResult{resultType: raceRemote, err: ferr}
+					break
+				}
+				b.setupFallback(ctx, step, second.err)
+				// The local racer already died above, so re-run the step
+				// locally as the fallback.
+				return b.execLocal(ctx, step)
+			default:
+				winner = first
+			}
+			break
+		}
 		// Cancel the loser.
 		raceCancel()
 		// Wait for the second goroutine to finish before returning,
@@ -190,6 +222,12 @@ func (b *Builder) runRacing(ctx context.Context, step *Step) error {
 		// Flush the outputs to the local disk.
 		if err := b.outputs(ctx, step); err != nil {
 			return b.fallbackLocal(ctx, step, err)
+		}
+		if ctx.Err() == nil && b.allowCacheWrite(step) && step.metrics.TwoPhaseCachingKey != "" {
+			err := b.twoPhaseCaching.Add(ctx, step.metrics.TwoPhaseCachingKey, step)
+			if err != nil {
+				clog.Warningf(ctx, "two phase caching: add %v", err)
+			}
 		}
 		return nil
 
@@ -258,4 +296,16 @@ func isContextCanceledErr(err error) bool {
 		return se.GRPCStatus().Code() == codes.Canceled
 	}
 	return false
+}
+
+// isKilledBySignal reports whether err is a local command exit caused by a
+// signal, e.g. SIGKILL from the kernel OOM killer. localexec reports -1 for
+// a process killed by a signal, and sandbox wrappers such as nsjail exit
+// with 128+signal (137 for SIGKILL).
+func isKilledBySignal(err error) bool {
+	eerr, ok := errors.AsType[execute.ExitError](err)
+	if !ok {
+		return false
+	}
+	return eerr.ExitCode == -1 || eerr.ExitCode == 128+9 // 9: SIGKILL
 }

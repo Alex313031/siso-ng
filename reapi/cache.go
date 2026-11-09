@@ -10,13 +10,11 @@ import (
 	"fmt"
 	"io"
 
-	bpb "google.golang.org/genproto/googleapis/bytestream"
-
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/o11y/clog"
-	"go.chromium.org/build/siso/reapi/bytestreamio"
-	"go.chromium.org/build/siso/reapi/digest"
 )
 
 // CacheStore provides a thin wrapper around REAPI client that gets and uploads blobs and action results.
@@ -43,13 +41,7 @@ func (c CacheStore) GetActionResult(ctx context.Context, d digest.Digest) (*rpb.
 // SetActionResult sets action result for the action identified by the digest.
 // If a failing action is provided, caching will be skipped.
 func (c CacheStore) SetActionResult(ctx context.Context, d digest.Digest, ar *rpb.ActionResult) error {
-	// Intentionally no-op. Setting the action result could allow a malicious
-	// actor to perform arbitrary code execution.
-	// May reconsider in the future for trusted workers, but for now, do nothing.
-
-	// Intentionally return no error, as it is intended for this function to be
-	// called.
-	return nil
+	return c.client.SetActionResult(ctx, d, ar)
 }
 
 // GetContent gets contents for the fname identified by the digest.
@@ -59,11 +51,11 @@ func (c CacheStore) GetContent(ctx context.Context, d digest.Digest, fname strin
 
 // SetContent sets contents for the fname identified by the digest.
 func (c CacheStore) SetContent(ctx context.Context, d digest.Digest, fname string, content []byte) error {
-	data := digest.FromBytes(fname, content)
+	data := blob.FromBytes(c.client.digestFn, fname, content)
 	if d != data.Digest() {
 		return fmt.Errorf("digest mismatch: d=%s content=%s", d, data.Digest())
 	}
-	ds := digest.NewStore()
+	ds := blob.NewStore()
 	ds.Set(data)
 	_, err := c.client.UploadAll(ctx, ds)
 	return err
@@ -71,6 +63,9 @@ func (c CacheStore) SetContent(ctx context.Context, d digest.Digest, fname strin
 
 // HasContent returns whether digest is in cache store.
 func (c CacheStore) HasContent(ctx context.Context, d digest.Digest) bool {
+	if c.client.opt.LocalCache != nil && c.client.opt.LocalCache.HasContent(ctx, d) {
+		return true
+	}
 	missing, err := c.client.Missing(ctx, []digest.Digest{d})
 	if err != nil {
 		clog.Warningf(ctx, "failed to call missing [%s]: %v", d, err)
@@ -80,7 +75,7 @@ func (c CacheStore) HasContent(ctx context.Context, d digest.Digest) bool {
 }
 
 // Source returns digest source for fname identified by the digest.
-func (c CacheStore) Source(_ context.Context, d digest.Digest, fname string) digest.Source {
+func (c CacheStore) Source(_ context.Context, d digest.Digest, fname string) blob.Source {
 	return digestSource{
 		c:     c.client,
 		d:     d,
@@ -89,7 +84,7 @@ func (c CacheStore) Source(_ context.Context, d digest.Digest, fname string) dig
 }
 
 type digestSourceReader struct {
-	r      io.ReadCloser
+	rd     io.ReadCloser
 	n      int
 	size   int64
 	c      *Client
@@ -97,7 +92,7 @@ type digestSourceReader struct {
 }
 
 func (r *digestSourceReader) Read(buf []byte) (int, error) {
-	n, err := r.r.Read(buf)
+	n, err := r.rd.Read(buf)
 	r.n += n
 	if err == io.EOF && int64(r.n) != r.size {
 		err = io.ErrUnexpectedEOF
@@ -110,14 +105,14 @@ func (r *digestSourceReader) Close() error {
 	// and cancel directly instead of draining a possibly large residual.
 	var eofErr error
 	if int64(r.n) == r.size {
-		eofErr = expectEOF(r.r)
+		eofErr = expectEOF(r.rd)
 	}
-	closeErr := r.r.Close()
-	r.c.m.ReadDone(r.n, cmp.Or(closeErr, eofErr))
+	rdCloseErr := r.rd.Close()
+	r.c.m.ReadDone(r.n, cmp.Or(rdCloseErr, eofErr))
 	if r.cancel != nil {
 		r.cancel()
 	}
-	return closeErr
+	return rdCloseErr
 }
 
 type digestSource struct {
@@ -127,24 +122,24 @@ type digestSource struct {
 }
 
 func (s digestSource) Open(ctx context.Context) (io.ReadCloser, error) {
-	// The context passed to bytestreamio.Open is used for the gRPC stream.
+	// The context passed to bytestreamioOpen is used for the gRPC stream.
 	// We need to cancel this context to close the stream when we are done reading
 	// or if an error occurs during setup, otherwise we leak the stream until the
 	// parent context (step context) is canceled.
 	ctx, cancel := context.WithCancel(ctx)
-	r, err := bytestreamio.Open(ctx, bpb.NewByteStreamClient(s.c.casConn), s.c.resourceName(s.d))
+	r, err := s.c.bytestreamioOpen(ctx, s.d, s.fname)
 	if err != nil {
 		cancel()
 		s.c.m.ReadDone(0, err)
 		return nil, err
 	}
-	rd, err := s.c.newDecoder(r, s.d)
-	if err != nil {
-		cancel()
-		s.c.m.ReadDone(0, err)
-		return nil, err
-	}
-	return &digestSourceReader{r: rd, size: s.d.SizeBytes, c: s.c, cancel: cancel}, err
+	return &digestSourceReader{rd: r, size: s.d.SizeBytes, c: s.c, cancel: cancel}, nil
+}
+
+// ReadAll returns the full blob content in a single CAS fetch, retrying on
+// retriable errors. blob.DataToBytes uses this instead of Open+read.
+func (s digestSource) ReadAll(ctx context.Context) ([]byte, error) {
+	return s.c.Get(ctx, s.d, s.fname)
 }
 
 func (s digestSource) String() string {

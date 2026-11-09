@@ -6,6 +6,7 @@ package ninja
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/o11y/resultstore"
 	"go.chromium.org/build/siso/o11y/trace"
 	"go.chromium.org/build/siso/reapi"
 	"go.chromium.org/build/siso/subcmd/alex313031"
@@ -98,6 +100,7 @@ type NinjaFlags struct {
 	strictRemote    bool
 	failuresAllowed int
 	actionSalt      string
+	localActionSalt string
 
 	ninjaJobs      int
 	ninjaLoadLimit int
@@ -106,13 +109,22 @@ type NinjaFlags struct {
 	localJobs  int
 	fname      string
 
+	spawnHelper string
+
 	cacheEnableRead bool
 
 	configFilename string
 
 	outputLocalStrategy string
 
+	// locallyNeeded is non-nil only for the "graph" strategy; the scheduler
+	// fills it and the OutputLocal closure reads it.
+	locallyNeeded *build.LocallyNeededSet
+
 	depsLogFile string
+	weightsFile string
+
+	missingDeps string
 
 	stateDir string
 
@@ -133,8 +145,11 @@ type NinjaFlags struct {
 	reExecEnable       bool
 	reCacheEnableRead  bool
 	reCacheEnableWrite bool
+	localCacheEnable   bool
+	cacheDir           string
 
 	cartfsEndpoint string
+	abfsEndpoint   string
 
 	enableCloudLogging          bool
 	enableResultstore           bool
@@ -155,6 +170,8 @@ type NinjaFlags struct {
 	cleandead  bool
 	debugMode  debugMode
 	adjustWarn string
+
+	blockActionNetworkAccess bool
 }
 
 func (c *Command) SetFlags(flagSet *flag.FlagSet) {
@@ -201,6 +218,7 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(&c.strictRemote, "strict_remote", false, "don't use local for remote step. i.e. no fastlocal, no local fallback")
 	flagSet.IntVar(&c.failuresAllowed, "k", 1, "keep going until N jobs fail (0 means inifinity)")
 	flagSet.StringVar(&c.actionSalt, "action_salt", "", "action salt")
+	flagSet.StringVar(&c.localActionSalt, "local_action_salt", "", "action salt for local steps")
 
 	flagSet.IntVar(&c.ninjaJobs, "j", 0, "Deprecated. use -remote_jobs and -local_jobs instead")
 	flagSet.IntVar(&c.ninjaLoadLimit, "l", -1, "not supported.")
@@ -208,12 +226,16 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 	flagSet.IntVar(&c.remoteJobs, "remote_jobs", 0, "run N remote jobs in parallel. when the value is no positive, the default will be computed based on # of CPUs.")
 	flagSet.StringVar(&c.fname, "f", "build.ninja", "input build manifest filename (relative to -C)")
 
-	c.setLocalCacheFlags(flagSet)
+	flagSet.StringVar(&c.spawnHelper, "spawn_helper", "", "command name of external spawn helper. use builtin spawn helper if empty.")
+	flagSet.BoolVar(&c.blockActionNetworkAccess, "block_action_network_access", false, "run spawnhelper in without network connectivity.")
+
 	flagSet.BoolVar(&c.cacheEnableRead, "cache_enable_read", true, "cache enable read")
 
 	flagSet.StringVar(&c.configFilename, "load", "@config//main.star", "config filename (@config// is --config_repo_dir)")
-	flagSet.StringVar(&c.outputLocalStrategy, "output_local_strategy", "full", `strategy for output_local. "full": download all outputs. "greedy": downloads most outputs except intermediate objs. "minimum": downloads as few as possible`)
+	flagSet.StringVar(&c.outputLocalStrategy, "output_local_strategy", "full", `strategy for output_local. "full": download all outputs. "greedy": downloads most outputs except intermediate objs. "minimum": downloads as few as possible. "graph": downloads only remote outputs that a local step will consume, decided at schedule time from the dep graph, spreading downloads over the compile burst. "pathfilter:<path_filter>": use path filter. "patterns:<pattern-list>": colon-separated pathfilter's patterns`)
 	flagSet.StringVar(&c.depsLogFile, "deps_log", ".siso_deps", "deps log filename (relative to -C, -state_dir)")
+	flagSet.StringVar(&c.weightsFile, "weights_file", os.Getenv("SISO_WEIGHTS_FILE"), "path to step weights JSON(.gz) file (relative to workspace). can be set by $SISO_WEIGHTS_FILE")
+	flagSet.StringVar(&c.missingDeps, "missing_deps", "ignore", "how to handle missing dependencies: ignore (skip check), warn (warning on stderr), error (fail build at completion), fatal (fail step immediately)")
 
 	flagSet.StringVar(&c.stateDir, "state_dir", "", "state directory (relative to -C) [default: same dir as build.ninja]")
 
@@ -245,9 +267,13 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(&c.reExecEnable, "re_exec_enable", true, "remote exec enable")
 	flagSet.BoolVar(&c.reCacheEnableRead, "re_cache_enable_read", true, "remote exec cache enable read")
 	flagSet.BoolVar(&c.reCacheEnableWrite, "re_cache_enable_write", false, "remote exec cache allow local trusted uploads")
+	flagSet.BoolVar(&c.localCacheEnable, "local_cache_enable", false, "local cache enable")
+	flagSet.StringVar(&c.cacheDir, "cache_dir", defaultCacheDir(), "cache directory")
 
 	// TODO(b/513044090): discover cartfs endpoint automatically?
 	flagSet.StringVar(&c.cartfsEndpoint, "cartfs_endpoint", "", "cartfs server endpoint. e.g. localhost:65001")
+
+	flagSet.StringVar(&c.abfsEndpoint, "abfs_endpoint", "", "abfs server endpoint e.g. unix://.abfs.sock")
 
 	flagSet.DurationVar(&c.traceThreshold, "trace_threshold", 1*time.Minute, "threshold for trace record")
 	flagSet.DurationVar(&c.traceSpanThreshold, "trace_span_threshold", 100*time.Millisecond, "theshold for trace span record")
@@ -352,6 +378,13 @@ func (c *Command) changeToWorkdir(ctx context.Context) (*build.Path, error) {
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("%s not found in %s. need `-C <dir>`?", c.fname, filepath.Join(workspaceRoot, dir))
 	}
+	if c.subtool == "" && c.quiet {
+		q, ok := ui.Default.(quietUI)
+		if !ok {
+			q = quietUI{}
+		}
+		q.printPsHint(c.outDir.Dir)
+	}
 	return build.NewPath(workspaceRoot, dir), err
 }
 
@@ -363,9 +396,12 @@ func (c *Command) resolveFlags() error {
 	if err != nil {
 		return flagError{err: err}
 	}
-	c.cleandead, err = checkSubtool(c.subtool)
+	cleandead, err := checkSubtool(c.subtool)
 	if err != nil {
 		return err
+	}
+	if cleandead {
+		c.cleandead = true
 	}
 
 	if c.ninjaJobs >= 0 {
@@ -379,6 +415,11 @@ func (c *Command) resolveFlags() error {
 	}
 	if c.adjustWarn != "" {
 		ui.Default.Warningf("-w is specified. but not supported. b/288807840\n")
+	}
+	switch c.missingDeps {
+	case "ignore", "warn", "error", "fatal":
+	default:
+		return flagError{err: fmt.Errorf("unknown missing_deps mode: %q. should be ignore/warn/error/fatal", c.missingDeps)}
 	}
 
 	if err = uuid.Validate(c.buildID); err != nil {
@@ -397,8 +438,12 @@ func (c *Command) enableOfflineMode(ctx context.Context) {
 		ui.Default.Warningf(ui.SGR(ui.Red, "offline mode\n"))
 	}
 	clog.Warningf(ctx, "offline mode")
+	// Keep -reapi_digest_function across the reset: offline builds still
+	// hash and interpret the persisted fs state under it.
+	digestFunction := c.reopt.DigestFunction
 	c.reopt = new(reapi.Option)
 	c.reopt.Insecure = true
+	c.reopt.DigestFunction = digestFunction
 	c.projectID = ""
 	c.collectorAddress = ""
 	c.enableCloudLogging = false
@@ -429,20 +474,29 @@ func initDepsLog(ctx context.Context, stateDir string, depsLogFile string) (*nin
 
 // initBuildOpts initializes the `build.Options` struct by collecting
 // various configuration settings and parameters.
-func (c *Command) initBuildOpts(ctx context.Context, projectID string, buildPath *build.Path, config *buildconfig.Config, ds build.DataSource, hashFS *hashfs.HashFS, limits build.Limits, tracer *trace.Tracer, traceExporter *trace.Exporter, logWriters logWriters) build.Options {
+func (c *Command) initBuildOpts(ctx context.Context, projectID string, buildPath *build.Path, config *buildconfig.Config, ds build.DataSource, hashFS *hashfs.HashFS, limits build.Limits, tracer *trace.Tracer, traceExporter *trace.Exporter, logWriters logWriters, resultstoreUploader *resultstore.Uploader) build.Options {
 	defer trace.Begin(ctx, "initBuildOpts").End()
 	var actionSaltBytes []byte
 	if c.actionSalt != "" {
 		actionSaltBytes = []byte(c.actionSalt)
 	}
+	var localActionSaltBytes []byte
+	if c.localActionSalt != "" {
+		localActionSaltBytes = []byte(c.localActionSalt)
+	}
 
 	cache, err := build.NewCache(ctx, build.CacheOptions{
-		Store:      ds.Cache,
+		Store:      ds.CacheStore(),
 		EnableRead: c.cacheEnableRead,
 	})
 	if err != nil {
 		clog.Warningf(ctx, "no cache enabled: %v", err)
 	}
+	var resultSink build.ResultSink
+	if resultstoreUploader != nil {
+		resultSink = resultstoreUploader
+	}
+	weightsFile := c.resolveWeightsFlag(buildPath)
 	return build.Options{
 		JobID:                 c.jobID,
 		ID:                    c.buildID,
@@ -456,6 +510,8 @@ func (c *Command) initBuildOpts(ctx context.Context, projectID string, buildPath
 		RECacheEnableRead:     c.reCacheEnableRead,
 		RECacheEnableWrite:    c.reCacheEnableWrite,
 		ActionSalt:            actionSaltBytes,
+		LocalActionSalt:       localActionSaltBytes,
+		LocallyNeeded:         c.locallyNeeded,
 		Cache:                 cache,
 		FailureSummaryWriter:  logWriters.failureSummaryWriter,
 		FailedCommandsWriter:  logWriters.failedCommandsWriter,
@@ -466,6 +522,7 @@ func (c *Command) initBuildOpts(ctx context.Context, projectID string, buildPath
 		TraceExporter:         traceExporter,
 		Tracer:                tracer,
 		Pprof:                 c.buildPprof,
+		ResultSink:            resultSink,
 		Clobber:               c.clobber,
 		FastExit:              c.fastExit,
 		Prepare:               c.prepare,
@@ -478,7 +535,17 @@ func (c *Command) initBuildOpts(ctx context.Context, projectID string, buildPath
 		KeepDepfile:           c.debugMode.Keepdepfile,
 		Limits:                limits,
 		UploadBuildNinjaFiles: c.enableBuildNinjaFilesUpload,
+		WeightsFile:           weightsFile,
+		BuildLabel:            c.fsopt.BuildLabel,
+		MissingDeps:           build.MissingDepsMode(c.missingDeps),
 	}
+}
+
+func (c *Command) resolveWeightsFlag(buildPath *build.Path) string {
+	if c.weightsFile == "" || filepath.IsAbs(c.weightsFile) || buildPath == nil || buildPath.WorkspaceRoot == "" {
+		return c.weightsFile
+	}
+	return filepath.Join(buildPath.WorkspaceRoot, c.weightsFile)
 }
 
 func defaultCacheDir() string {
@@ -490,10 +557,55 @@ func defaultCacheDir() string {
 	return filepath.Join(d, "siso")
 }
 
-// initOutputLocal returns a function that determines whether a given file
-// should be outputted locally based on the chosen strategy. This is used to
-// control which files are downloaded from the remote cache.
-func initOutputLocal(outputLocalStrategy string) (func(context.Context, string) bool, error) {
+// setupOutputLocal initializes c.outputLocal (and c.locallyNeeded for "graph").
+func (c *Command) setupOutputLocal(ctx context.Context) error {
+	if c.subtool == "cleandead" {
+		// Subtool "cleandead" only cleans dead generated files and does not
+		// materialize build outputs, so preserve remote-only entries in
+		// .siso_fs_state regardless of -output_local_strategy.
+		c.outputLocal = func(context.Context, string) bool { return false }
+		return nil
+	}
+	// "graph" is the one stateful strategy: the scheduler fills a set the
+	// predicate reads. Create it here so the predicate (c.outputLocal) and the
+	// scheduler's target (LocallyNeeded in the build options) are the same set.
+	if c.outputLocalStrategy == "graph" {
+		c.locallyNeeded = build.NewLocallyNeededSet()
+		c.outputLocal = c.locallyNeeded.OutputLocal
+		return nil
+	}
+	var err error
+	c.outputLocal, err = initOutputLocal(ctx, c.outputLocalStrategy)
+	return err
+}
+
+// initOutputLocal returns the predicate for the chosen output_local strategy
+// (which outputs to write to local disk vs leave in the cache). The "graph"
+// strategy is stateful (the scheduler fills a set the predicate reads) and is
+// handled by the caller, not here.
+func initOutputLocal(ctx context.Context, outputLocalStrategy string) (func(context.Context, string) bool, error) {
+	filter, ok := strings.CutPrefix(outputLocalStrategy, "pathfilter:")
+	if ok {
+		var pathFilter ninjabuild.PathFilter
+		err := json.Unmarshal([]byte(filter), &pathFilter)
+		if err != nil {
+			return nil, fmt.Errorf("wrong pathfilter json %q: %w", filter, err)
+		}
+		f := pathFilter.Filter(ctx, "output_local_strategy")
+		return func(ctx context.Context, fname string) bool {
+			return f(ctx, fname, false)
+		}, nil
+	}
+	filter, ok = strings.CutPrefix(outputLocalStrategy, "patterns:")
+	if ok {
+		pathFilter := ninjabuild.PathFilter{
+			Patterns: strings.Split(filter, ":"),
+		}
+		f := pathFilter.Filter(ctx, "output_local_strategy")
+		return func(ctx context.Context, fname string) bool {
+			return f(ctx, fname, false)
+		}, nil
+	}
 	switch outputLocalStrategy {
 	case "full":
 		return func(context.Context, string) bool { return true }, nil
@@ -501,7 +613,9 @@ func initOutputLocal(outputLocalStrategy string) (func(context.Context, string) 
 		return func(ctx context.Context, fname string) bool {
 			// Note: d. wil be downloaded to get deps anyway,
 			// but will not be written to disk.
-			switch filepath.Ext(fname) {
+			// Strip a dir output's trailing slash; the same output is probed
+			// both with and without it, and filepath.Ext is slash-sensitive.
+			switch filepath.Ext(strings.TrimSuffix(fname, "/")) {
 			case ".o", ".obj", ".a", ".d", ".stamp", ".pcm":
 				return false
 			}
@@ -513,14 +627,17 @@ func initOutputLocal(outputLocalStrategy string) (func(context.Context, string) 
 			// .h,/.hxx/.hpp/.inc/.c/.cc/.cxx/.cpp/.m/.mm for gcc deps or msvc showIncludes
 			// .json/.js/.ts for tsconfig.json, .js for grit etc.
 			// .py for protobuf py etc.
-			switch filepath.Ext(fname) {
-			case ".h", ".hxx", ".hpp", ".inc", ".c", ".cc", "cxx", ".cpp", ".m", ".mm", ".json", ".js", ".ts", ".py":
+			// .jdeps for Android javac/kotlin/ksp input-delta incremental
+			// compilation, which reads the prior build's .jdeps lookup caches.
+			// Strip a directory output's trailing slash (see "greedy").
+			switch filepath.Ext(strings.TrimSuffix(fname, "/")) {
+			case ".h", ".hxx", ".hpp", ".inc", ".c", ".cc", ".cxx", ".cpp", ".m", ".mm", ".json", ".js", ".ts", ".py", ".jdeps":
 				return true
 			}
 			return false
 		}, nil
 	default:
-		return nil, fmt.Errorf("unknown output local strategy: %q. should be full/greedy/minimum", outputLocalStrategy)
+		return nil, fmt.Errorf("unknown output local strategy: %q. should be full/greedy/minimum/graph", outputLocalStrategy)
 	}
 }
 
@@ -654,14 +771,4 @@ func initFSMonitor(ctx context.Context, workspaceRoot string) hashfs.FSMonitor {
 		ui.Default.Errorf("%s", ui.SGR(ui.BackgroundRed, fmt.Sprintf("unknown SISO_FSMONITOR=%q (%q)\n", fsmonitor, fsm)))
 	}
 	return nil
-}
-
-type localCacheOptions struct {
-	localCacheEnable bool
-	cacheDir         string
-}
-
-func (c *Command) setLocalCacheFlags(flagSet *flag.FlagSet) {
-	flagSet.BoolVar(&c.localCacheEnable, "local_cache_enable", false, "local cache enable")
-	flagSet.StringVar(&c.cacheDir, "cache_dir", defaultCacheDir(), "cache directory")
 }

@@ -204,8 +204,7 @@ func (c *summaryCommand) run(ctx context.Context) error {
 	if len(topMetrics) > longCount {
 		topMetrics = topMetrics[:longCount]
 	}
-	for i := len(topMetrics) - 1; i >= 0; i-- {
-		tm := topMetrics[i]
+	for _, tm := range slices.Backward(topMetrics) {
 		fmt.Printf("      %8s weighted to build %s (%s elapsed time)\n",
 			formatDuration(tm.WeightedDuration()),
 			tm.Output,
@@ -232,8 +231,7 @@ func (c *summaryCommand) run(ctx context.Context) error {
 	if len(am) > longCount {
 		am = am[:longCount]
 	}
-	for i := len(am) - 1; i >= 0; i-- {
-		s := am[i]
+	for _, s := range slices.Backward(am) {
 		fmt.Printf("      %8s weighted to generate %d %s files (%s elapsed time sum)\n",
 			formatDuration(s.WeightedDuration),
 			s.Count,

@@ -1,0 +1,43 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+load("@builtin//encoding.star", "json")
+load("@builtin//struct.star", "module")
+
+def init(ctx):
+    step_config = {
+        "platforms": {
+            "default": {
+                "OSFamily": "Linux",
+                "container-image": "docker://gcr.io/test/test",
+            },
+        },
+        "env": {
+            "excludes": ["RBE_metrics_project"],
+            "cache_key_omits": ["HOME", "USER", "HOSTNAME", "TOP", "CIPD_PROXY_URL"],
+            "cache_key_substitutions": {
+                "/workspace": "CWD",
+            },
+            "cache_key_trim_prefixes": ["CWD/"],
+        },
+        "rules": [
+            {
+                "name": "gcc",
+                "action": "gcc",
+                "remote": True,
+                "restat_content": True,
+            },
+            {
+                "name": "action",
+                "action": "action",
+                "restat_content": True,
+            },
+        ],
+    }
+    return module(
+        "config",
+        step_config = json.encode(step_config),
+        filegroups = {},
+        handlers = {},
+    )

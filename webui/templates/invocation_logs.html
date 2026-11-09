@@ -1,0 +1,80 @@
+{{/* Copyright 2024 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "breadcrumbs"}}
+  {{if .useLit}}
+    <div class="breadcrumb">
+      <span class="breadcrumb-label">Raw Logs (Lit)</span>
+    </div>
+  {{else if .file}}
+    <div class="breadcrumb">
+      <a href="{{.outdirRevBaseURL}}/logs/" class="breadcrumb-label">Raw Logs</a>
+    </div>
+    <div class="breadcrumb">
+      <span class="breadcrumb-label">{{.file}}</span>
+    </div>
+  {{else}}
+    <div class="breadcrumb">
+      <span class="breadcrumb-label">Raw Logs</span>
+    </div>
+  {{end}}
+{{end}}
+
+{{define "tabs"}}
+  {{template "invocation_tabs" .}}
+{{end}}
+
+{{define "sidebar"}}
+{{$outdirRevBaseURL:=.outdirRevBaseURL}}
+{{$currentURL:=.currentURL}}
+{{$currentRev:=.currentRev}}
+{{$allowedFiles:=.allowedFiles}}
+<aside id="page-sidebar">
+  <ul class="revs-timeline">
+    {{range $r := .revs}}
+    <li{{if eq $r.Rev $currentRev}} class="selected"{{end}}>
+      <a class="rev-label" href="{{$outdirRevBaseURL}}/../{{.Rev}}/{{if $.useLit}}logs_lit{{else}}logs{{end}}/">
+        <span class="rev-label-note">Logs in</span>
+        {{buildTimeHumanReadable $r}}
+        <md-ripple></md-ripple>
+      </a>
+      <div class="rev-info">
+        {{if not .Started.IsZero}}
+        <relative-time datetime="{{timeRFC3339 .Started.Time}}"></relative-time>{{if .Started.Inferred}} <abbr title="Inferred start time (file modification time minus duration)">*</abbr>{{end}}
+        {{end}}
+        {{if and (eq $r.Rev $currentRev) (not $.useLit)}}
+        <ul class="rev-sublinks">
+          {{range $allowedFile := $allowedFiles}}
+            {{$logURL := printf "%s/logs/%s" $outdirRevBaseURL $allowedFile}}
+            <li{{if (urlPathEq $currentURL $logURL)}} class="selected"{{end}}>
+              <a href="{{$logURL}}">
+                {{$allowedFile}}
+              </a>
+            </li>
+          {{end}}
+        </ul>
+        {{end}}
+      </div>
+    </li>
+    {{end}}
+  </ul>
+</aside>
+{{end}}
+
+{{define "content"}}
+{{$outdirRevBaseURL:=.outdirRevBaseURL}}
+{{$currentURL:=.currentURL}}
+{{$currentRev:=.currentRev}}
+{{$allowedFiles:=.allowedFiles}}
+<div class="surface">
+{{if .useLit}}
+  <siso-log-links
+    base-url="{{.outdirRevBaseURL}}"
+    files="{{joinStrings .allowedFiles ","}}">
+  </siso-log-links>
+{{else}}
+<pre><code>{{.fileContents}}</code></pre>
+{{end}}
+</div>
+{{end}}

@@ -22,6 +22,7 @@ import (
 
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi"
 	"go.chromium.org/build/siso/toolsupport/msvcutil"
 	"go.chromium.org/build/siso/ui"
@@ -89,15 +90,24 @@ func (b *Builder) runStep(ctx context.Context, step *Step) (retErr error) {
 		if !step.metrics.skip {
 			step.endTime = time.Now()
 			duration := step.endTime.Sub(step.startTime)
+			// Most metrics are manually measured within each execution strategy,
+			// here are some top-level metrics.
 			step.metrics.Duration = IntervalMetric(duration)
 			step.metrics.ActionEndTime = IntervalMetric(step.endTime.Sub(b.start))
 			step.metrics.Err = retErr != nil
+			// Some timings are measured using spans instead, extrapolate those
+			// into the step metrics now.
+			if tc != nil {
+				step.metrics.updateFromTrace(tc.Spans(), b.start)
+			}
+			step.metrics.done(ctx, b, step, b.start)
+			// Other metrics.
 			stepLogEntry(ctx, logger, step, duration, retErr)
 			b.recordMetrics(ctx, step.metrics)
 			b.recordNinjaLogs(ctx, step)
 			b.recordCloudMonitoringActionMetrics(ctx, step, retErr)
 			b.stats.update(ctx, &step.metrics, step.cmd.Pure)
-			b.finalizeTrace(ctx, tc)
+			b.finalizeTrace(ctx, tc, step)
 			b.outputFailureSummary(ctx, step, retErr)
 			b.outputFailedCommands(ctx, step, retErr)
 		}
@@ -105,10 +115,17 @@ func (b *Builder) runStep(ctx context.Context, step *Step) (retErr error) {
 		step.cmd = nil
 	}(span)
 
-	stepManifest := newStepManifest(ctx, step.def)
+	stepManifest := b.newStepManifest(ctx, step.def)
 
 	if !b.needToRun(ctx, step.def, stepManifest) {
 		step.metrics.skip = true
+		if b.buildLabel != "" {
+			outPaths := make([]string, 0, len(stepManifest.outputs))
+			for _, out := range stepManifest.outputs {
+				outPaths = append(outPaths, b.path.MaybeToRelative(ctx, string(out)))
+			}
+			b.hashFS.UpdateBuildLabelMask(ctx, b.path.AbsBase(), b.buildLabel, outPaths)
+		}
 		b.plan.completeStep(ctx, step)
 		b.stats.update(ctx, &step.metrics, true)
 		return nil
@@ -171,11 +188,14 @@ func (b *Builder) runStep(ctx context.Context, step *Step) (retErr error) {
 	} else if exited {
 		// store handler generated outputs to local disk.
 		// better to upload to CAS, or store in fs_state?
-		clog.Infof(ctx, "outputs[handler] %d", len(step.cmd.Outputs))
-		start := time.Now()
-		err = b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, step.cmd.Outputs)
-		step.metrics.MaterializeOutputsTime = IntervalMetric(time.Since(start))
+		clog.Infof(ctx, "outputs[handler] %d", len(step.cmd.Outputs)+len(step.cmd.OutputDirs))
+		_, mspan := trace.NewSpan(ctx, spanMaterializeOutputs)
+		err = b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, step.cmd.FlushOutputs())
+		mspan.Close(nil)
 		if err == nil {
+			if b.buildLabel != "" {
+				b.hashFS.UpdateBuildLabelMask(ctx, b.path.AbsBase(), b.buildLabel, step.outputPaths)
+			}
 			b.plan.completeStep(ctx, step)
 			return nil
 		}
@@ -190,7 +210,7 @@ func (b *Builder) runStep(ctx context.Context, step *Step) (retErr error) {
 	defer func() {
 		if retErr != nil && !errors.Is(retErr, context.Canceled) {
 			// force flush to disk
-			ferr := b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, []string{step.cmd.RSPFile})
+			ferr := b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, []path.Path{step.cmd.RSPFile})
 			clog.Warningf(ctx, "failed to exec %v: preserve rsp=%s flush:%v", retErr, step.cmd.RSPFile, ferr)
 			return
 		}
@@ -200,13 +220,12 @@ func (b *Builder) runStep(ctx context.Context, step *Step) (retErr error) {
 		depsClean(ctx, b, step, err)
 	}()
 
-	// expand inputs to get full action inputs unless deps=gcc,msvc with main supported source files such as .c, .cc, .mm etc.
-	// deps gcc,msvc for rust and cxx module compiles will still rely on `depsExpandInputs` instead of scandeps.
-	depsExpandInputs(ctx, b, step)
-
 	// BuildActionStarted is called just before remote exec calls or
 	// local execution.
 	defer b.actionFinished(ctx, step)
+	if step.cmd.Restat || step.cmd.RestatContent {
+		step.cmd.RecordPreOutputs(ctx)
+	}
 	runCmd := b.runStrategy(step)
 	err = runCmd(ctx, step)
 	clog.Infof(ctx, "done err=%v", err)
@@ -246,6 +265,10 @@ func (b *Builder) runStep(ctx context.Context, step *Step) (retErr error) {
 			b.progress.enqueueOutput(ui.SGR(ui.Green, fmt.Sprintf("last failed target fixed: %s", out)) + "\n")
 		}
 	}
+	if b.buildLabel != "" {
+		b.hashFS.UpdateBuildLabelMask(ctx, b.path.AbsBase(), b.buildLabel, step.outputPaths)
+	}
+
 	b.plan.completeStep(ctx, step)
 	return nil
 }
@@ -258,14 +281,14 @@ func stepStartLog(ctx context.Context, logger *clog.Logger, step *Step, descript
 		"description": description,
 		"action":      step.def.ActionName(),
 		"span_name":   spanName,
-		"output0":     step.def.Outputs(ctx)[0],
+		"output0":     string(step.def.Outputs(ctx)[0]),
 	}
 	logger.Log(logEntry)
 }
 
 func (b *Builder) stepSpanInit(ctx context.Context, span *trace.Span, step *Step, description, spanName string) {
 	span.SetAttr("ready_time", time.Since(step.readyTime).Milliseconds())
-	span.SetAttr("prev", step.prevStepID)
+	span.SetAttr("prev", step.prevStepIDs[0])
 	span.SetAttr("queue_time", time.Since(step.queueTime).Milliseconds())
 	span.SetAttr("queue_size", step.queueSize)
 	span.SetAttr("build_id", b.id)
@@ -274,7 +297,7 @@ func (b *Builder) stepSpanInit(ctx context.Context, span *trace.Span, step *Step
 	span.SetAttr("description", description)
 	span.SetAttr("action", step.def.ActionName())
 	span.SetAttr("span_name", spanName)
-	span.SetAttr("output0", step.def.Outputs(ctx)[0])
+	span.SetAttr("output0", string(step.def.Outputs(ctx)[0]))
 	if next := step.def.Next(); next != nil {
 		span.SetAttr("next_id", step.def.Next().String())
 	}
@@ -296,7 +319,11 @@ func (b *Builder) handleStep(ctx context.Context, step *Step) (bool, error) {
 	exited := result != nil
 	if exited {
 		step.metrics.ActionStartTime = IntervalMetric(started.Sub(b.start))
-		step.metrics.RunTime = IntervalMetric(time.Since(started))
+		span.Add(ctx, trace.SpanData{
+			Name:  spanHandleStepRun,
+			Start: started,
+			End:   time.Now(),
+		})
 		step.metrics.NoExec = true
 	}
 	return exited, nil
@@ -328,7 +355,7 @@ func (b *Builder) outputFailureSummary(ctx context.Context, step *Step, err erro
 		fmt.Fprintf(&buf, "auxiliary outputs:\n")
 		for _, name := range slices.Sorted(maps.Keys(step.cmd.AuxiliaryOutputDigests)) {
 			digest := step.cmd.AuxiliaryOutputDigests[name]
-			fmt.Fprintf(&buf, "%s\n", formatAuxiliaryOutput(name, digest, b.reapiclient.Instance()))
+			fmt.Fprintf(&buf, "%s\n", formatAuxiliaryOutput(name, digest, b.reapiclient.Instance(), b.hashFS.DigestFunction()))
 		}
 	}
 	fmt.Fprintf(&buf, "%v\n", err)

@@ -15,6 +15,8 @@ import (
 	"sort"
 	"testing"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
@@ -111,7 +113,7 @@ func TestBuild_Copy(t *testing.T) {
 			if err != nil {
 				t.Errorf("hashfs.Load=%v; want nil err", err)
 			}
-			m := hashfs.StateMap(st)
+			m := hashfs.StateMap(digest.SHA256, st)
 
 			wantFiles := []string{
 				"out/siso/gen/cache/info.txt",
@@ -149,7 +151,7 @@ func TestBuild_Copy(t *testing.T) {
 			if err != nil {
 				t.Errorf("hashfs.Load=%v; want nil err", err)
 			}
-			m = hashfs.StateMap(st)
+			m = hashfs.StateMap(digest.SHA256, st)
 
 			wantFiles = []string{
 				"out/siso/gen/cache/data/data.txt",

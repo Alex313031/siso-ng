@@ -63,7 +63,7 @@ func (s statementType) String() string {
 // isStatement checks buf[i:] is a statement for name, and
 // returns position after name if so.
 func isStatement(buf []byte, i int, name []byte) (int, bool) {
-	if !bytes.HasPrefix(buf[i:], name) {
+	if !bytes.HasPrefix(buf[i:], name) || i+len(name) >= len(buf) {
 		return -1, false
 	}
 	ch := buf[i+len(name)]

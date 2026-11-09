@@ -10,11 +10,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/google/subcommands"
+	"golang.org/x/net/trace"
+	"google.golang.org/grpc"
 
 	"go.chromium.org/build/siso/auth/cred"
 	"go.chromium.org/build/siso/reapi"
@@ -29,7 +33,7 @@ const usage = `proxy RE API service.
 `
 
 // Cmd returns the Command for the `proxy` subcommand provided by this package.
-func Cmd(authOpts cred.Options) *Command {
+func Cmd(authOpts func() cred.Options) *Command {
 	return &Command{
 		authOpts: authOpts,
 	}
@@ -49,10 +53,11 @@ func (*Command) Usage() string {
 
 // Command implements proxy subcommand.
 type Command struct {
-	authOpts  cred.Options
+	authOpts  func() cred.Options
 	projectID string
 	reopt     *reapi.Option
 	addr      string
+	traceAddr string
 }
 
 func (c *Command) SetFlags(flagSet *flag.FlagSet) {
@@ -60,6 +65,7 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 	c.reopt = new(reapi.Option)
 	c.reopt.RegisterFlags(flagSet, reapi.Envs("REAPI"))
 	flagSet.StringVar(&c.addr, "addr", "", "address to listen on")
+	flagSet.StringVar(&c.traceAddr, "trace_addr", os.Getenv("SISO_PROXY_TRACE_ADDR"), "address to listen on for trace debug")
 }
 
 func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
@@ -80,6 +86,17 @@ func (c *Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) 
 func (c *Command) run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if c.traceAddr != "" {
+		grpc.EnableTracing = true
+		// allow any data from anywhere
+		trace.AuthRequest = func(*http.Request) (bool, bool) { return true, true }
+		go func() {
+			err := http.ListenAndServe(c.traceAddr, nil)
+			if err != nil {
+				log.Fatalf("trace page: %v", err)
+			}
+		}()
+	}
 
 	c.reopt.UpdateProjectID(c.projectID)
 	var credential cred.Cred
@@ -88,7 +105,7 @@ func (c *Command) run(ctx context.Context) error {
 		return fmt.Errorf("reapi option is invalid: %w", err)
 	}
 	if c.reopt.NeedCred() {
-		credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts)
+		credential, err = cred.New(ctx, c.reopt.ServiceURI(), c.authOpts())
 		if err != nil {
 			return err
 		}

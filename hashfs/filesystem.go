@@ -17,6 +17,7 @@ import (
 	log "github.com/golang/glog"
 
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 )
 
 // File implements https://pkg.go.dev/io/fs#File.
@@ -157,7 +158,6 @@ func resolveSymlinkPath(root, path, target string) string {
 			}
 		}
 	}
-	name = filepath.ToSlash(name)
 	relPath, err := filepath.Rel(root, name)
 	if err == nil && filepath.IsLocal(relPath) {
 		name = relPath
@@ -176,7 +176,7 @@ func (fsys FileSystem) ReadDir(name string) ([]fs.DirEntry, error) {
 		if log.V(1) {
 			clog.Infof(fsys.ctx, "fsys readdir %q %q", root, name)
 		}
-		ents, err := fsys.hashFS.ReadDir(fsys.ctx, root, name)
+		ents, err := fsys.hashFS.ReadDir(fsys.ctx, root, path.Path(name))
 		if err != nil {
 			if serr, ok := errors.AsType[SymlinkError](err); ok {
 				name = resolveSymlinkPath(fsys.dir, serr.Path, serr.Target)
@@ -212,7 +212,7 @@ func (fsys FileSystem) ReadFile(name string) ([]byte, error) {
 		if log.V(1) {
 			clog.Infof(fsys.ctx, "fsys readfile %q %q", root, name)
 		}
-		buf, err := fsys.hashFS.ReadFile(fsys.ctx, root, name)
+		buf, err := fsys.hashFS.ReadFile(fsys.ctx, root, path.Path(name))
 		if err != nil {
 			if serr, ok := errors.AsType[SymlinkError](err); ok {
 				name = resolveSymlinkPath(fsys.dir, serr.Path, serr.Target)
@@ -235,7 +235,7 @@ func (fsys FileSystem) ReadFile(name string) ([]byte, error) {
 
 // ReadLink returns the destination of the named symbolic link.
 func (fsys FileSystem) ReadLink(name string) (string, error) {
-	fi, err := fsys.hashFS.Stat(fsys.ctx, fsys.dir, name)
+	fi, err := fsys.hashFS.Stat(fsys.ctx, fsys.dir, path.Path(name))
 	if err != nil {
 		return "", &fs.PathError{
 			Op:   "readlink",
@@ -257,7 +257,7 @@ func (fsys FileSystem) ReadLink(name string) (string, error) {
 // Lstat returns a FileInfo describing the named file.
 // Lstat makes no attempt to follow the link.
 func (fsys FileSystem) Lstat(name string) (fs.FileInfo, error) {
-	fi, err := fsys.hashFS.Stat(fsys.ctx, fsys.dir, name)
+	fi, err := fsys.hashFS.Stat(fsys.ctx, fsys.dir, path.Path(name))
 	if err != nil {
 		return nil, &fs.PathError{
 			Op:   "lstat",
@@ -275,6 +275,23 @@ func (fsys FileSystem) Lstat(name string) (fs.FileInfo, error) {
 // i.e. Even if err != nil, fs.FileInfo may be valid for Visited or
 // VisitedPaths, so can get intermediate symlinks's FileInfo.
 func (fsys FileSystem) Stat(name string) (fs.FileInfo, error) {
+	return fsys.statWith(name, fsys.hashFS.Stat)
+}
+
+// StatIfExists is like Stat but routes through HashFS.StatIfExists,
+// skipping the mtime-refresh Lstat for cached directory entries.
+// Use when only existence/type (and optionally VisitedPaths) is needed.
+func (fsys FileSystem) StatIfExists(name string) (fs.FileInfo, error) {
+	return fsys.statWith(name, fsys.hashFS.StatIfExists)
+}
+
+// StatMtime is like Stat but does not queue a digest for new entries.
+// Use when only mtime, size, cmdhash, or isChanged is needed.
+func (fsys FileSystem) StatMtime(name string) (fs.FileInfo, error) {
+	return fsys.statWith(name, fsys.hashFS.StatMtime)
+}
+
+func (fsys FileSystem) statWith(name string, statFn func(context.Context, string, path.Path) (FileInfo, error)) (fs.FileInfo, error) {
 	pathname := name
 	var fis []FileInfo
 	for range maxSymlinks {
@@ -285,17 +302,17 @@ func (fsys FileSystem) Stat(name string) (fs.FileInfo, error) {
 		if log.V(1) {
 			clog.Infof(fsys.ctx, "fsys stat %q %q", root, name)
 		}
-		fi, err := fsys.hashFS.Stat(fsys.ctx, root, name)
+		fi, err := statFn(fsys.ctx, root, path.Path(name))
 		if err != nil {
 			return FileInfo{
-					root:  root,
-					fname: name,
-					fis:   fis,
-				}, &fs.PathError{
-					Op:   "stat",
-					Path: pathname,
-					Err:  err,
-				}
+				root:  root,
+				fname: path.Path(name),
+				fis:   fis,
+			}, &fs.PathError{
+				Op:   "stat",
+				Path: pathname,
+				Err:  err,
+			}
 		}
 		target := fi.Target()
 		if target == "" {
@@ -303,18 +320,18 @@ func (fsys FileSystem) Stat(name string) (fs.FileInfo, error) {
 			return fi, nil
 		}
 		fis = append(fis, fi)
-		name = resolveSymlinkPath(fsys.dir, fi.Path(), target)
+		name = resolveSymlinkPath(fsys.dir, string(fi.Path()), target)
 		continue
 	}
 	return FileInfo{
-			root:  fsys.dir,
-			fname: pathname,
-			fis:   fis,
-		}, &fs.PathError{
-			Op:   "stat",
-			Path: pathname,
-			Err:  syscall.ELOOP,
-		}
+		root:  fsys.dir,
+		fname: path.Path(pathname),
+		fis:   fis,
+	}, &fs.PathError{
+		Op:   "stat",
+		Path: pathname,
+		Err:  syscall.ELOOP,
+	}
 }
 
 // Visited returns visited FileInfo to get the fi by Stat, including fi itself.
@@ -337,7 +354,7 @@ func (fsys FileSystem) Visited(fi fs.FileInfo) []FileInfo {
 func (fsys FileSystem) VisitedPaths(fi fs.FileInfo) []string {
 	var visited []string
 	for _, fi := range fsys.Visited(fi) {
-		fname := fi.Path()
+		fname := string(fi.Path())
 		rel, err := filepath.Rel(fsys.dir, fname)
 		if err != nil {
 			continue
@@ -360,7 +377,7 @@ resolve:
 		elems := strings.Split(name, "/")
 		for i := range elems {
 			pathname := strings.Join(elems[:i+1], "/")
-			fi, err := fsys.hashFS.Stat(fsys.ctx, fsys.dir, pathname)
+			fi, err := fsys.hashFS.StatIfExists(fsys.ctx, fsys.dir, path.Path(pathname))
 			if err != nil {
 				clog.Warningf(fsys.ctx, "no intermediate dir for %s: %s: %v", name, pathname, err)
 				break resolve
@@ -381,6 +398,7 @@ resolve:
 				continue resolve
 			}
 		}
+		break
 	}
 	names = append(names, name)
 	return names

@@ -13,6 +13,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ import (
 	log "github.com/golang/glog"
 	"github.com/google/subcommands"
 	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,10 +35,14 @@ import (
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/monitoring"
+	"go.chromium.org/build/siso/o11y/resultstore"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi"
+	"go.chromium.org/build/siso/resource"
 	"go.chromium.org/build/siso/signals"
 	"go.chromium.org/build/siso/subcmd/alex313031"
+	"go.chromium.org/build/siso/toolsupport/abfsutil"
 	"go.chromium.org/build/siso/toolsupport/cartfsutil"
 	"go.chromium.org/build/siso/toolsupport/cogutil"
 	"go.chromium.org/build/siso/toolsupport/soongutil"
@@ -49,7 +56,7 @@ const ninjaUsage = `build the requested targets as ninja.
 `
 
 // Cmd returns the Command for the `ninja` subcommand provided by this package.
-func Cmd(authOpts cred.Options, version string) *Command {
+func Cmd(authOpts func() cred.Options, version string) *Command {
 	return &Command{
 		authOpts: authOpts,
 		version:  version,
@@ -58,14 +65,13 @@ func Cmd(authOpts cred.Options, version string) *Command {
 
 // Command implements ninja subcommand.
 type Command struct {
-	authOpts cred.Options
+	authOpts func() cred.Options
 	version  string
 	started  time.Time
 
 	Flags *flag.FlagSet
 
 	NinjaFlags
-	localCacheOptions
 
 	outputLocal func(context.Context, string) bool
 
@@ -272,11 +278,58 @@ func (c *Command) initCredentials(ctx context.Context) (cred.Cred, error) {
 		return cred.Cred{}, nil
 	}
 
-	credential, err := cred.New(ctx, c.reopt.ServiceURI(), c.authOpts)
+	credential, err := cred.New(ctx, c.reopt.ServiceURI(), c.authOpts())
 	if err != nil {
-		return cred.Cred{}, err
+		return cred.Cred{}, fmt.Errorf("failed to initialize credentials: %w", err)
 	}
 	return credential, nil
+}
+
+// enableAdaptiveFlushGate installs the adaptive flush gate and its TTFB
+// stats handler. The returned stop func (defer it) closes the gate, logs
+// its operating point, and flushes any trace files.
+func (c *Command) enableAdaptiveFlushGate(ctx context.Context) func() {
+	// Seed at the static cap so it isn't throttled below the default.
+	gate := resource.NewNetwork("fs-flush",
+		hashfs.FlushSemaphore.Capacity(), // initial
+		max(runtime.GOMAXPROCS(0)*2, 16), // floor
+		1<<20,                            // ceiling
+	)
+	c.fsopt.FlushGate = gate
+	c.reopt.StatsHandler = resource.NewStatsHandler(gate)
+
+	var traceCSV *os.File
+	if slices.Contains(build.EnabledExperiments(), "adaptive-flush-trace") {
+		// cwd is already the build output dir (set by c.setup).
+		if f, err := os.Create("siso_network_gate.csv"); err == nil {
+			fmt.Fprintln(f, "ms,N,in_flight_peak,ttfb_p50_ms,baseline_ms,samples,decision")
+			gate.SetTraceWriter(f)
+			traceCSV = f
+		} else {
+			clog.Warningf(ctx, "network gate trace: create: %v", err)
+		}
+	}
+
+	return func() {
+		gate.Close() // stop the controller before closing the trace sinks
+		clog.Infof(ctx, "flush gate %q: final cap=%d peak in-flight=%d requests=%d",
+			gate.Name(), gate.Capacity(), gate.MaxInFlight(), gate.NumRequests())
+		if traceCSV != nil {
+			traceCSV.Close()
+			dumpFlushGate(ctx, gate)
+		}
+	}
+}
+
+// dumpFlushGate writes the Gradient2 summary to a debug file.
+func dumpFlushGate(ctx context.Context, gate *resource.Network) {
+	f, err := os.Create("/tmp/siso_flush_gate.txt")
+	if err != nil {
+		clog.Warningf(ctx, "dump flush gate stats: create: %v", err)
+		return
+	}
+	defer f.Close()
+	gate.Dump(f)
 }
 
 // Exposed for e2e testing. To be reevaluated.
@@ -316,9 +369,10 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 	// don't use the helper.
 	spawnHelperLog := filepath.Join(c.logDir, "siso_spawn_helper")
 	rotateFiles(ctx, spawnHelperLog)
-	if err := localexec.StartHelper(ctx, spawnHelperLog); err != nil {
+	if err := localexec.StartSpawnHelper(ctx, c.spawnHelper, spawnHelperLog, c.blockActionNetworkAccess); err != nil {
 		return stats, err
 	}
+	defer localexec.StopSpawnHelper(ctx)
 
 	limits := c.computeLimits(ctx)
 	projectID := c.reopt.UpdateProjectID(c.projectID)
@@ -386,6 +440,7 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 		if err != nil {
 			return stats, err
 		}
+		c.reopt.MeterProvider = e
 		// Export all the metrics before shutting down as we still need the cloud logger to be present.
 		defer func() {
 			// Report build metrics.
@@ -419,6 +474,13 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 			closeDuration := time.Since(closeStart)
 			clog.Infof(ctx, "cloud trace shutdown took: %s", closeDuration)
 		}()
+		// reapi (set below) uses this provider to propagate trace context to
+		// RBE via grpc-trace-bin. Always sample so every RBE RPC is recorded
+		// server-side. It has no exporter on purpose: the spans only carry
+		// context to the server, they are not exported as client-side traces.
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+		defer func() { _ = tp.Shutdown(ctx) }()
+		c.reopt.TracerProvider = tp
 	}
 	// upload build pprof
 
@@ -440,8 +502,7 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 	// initBuildOpts (loadNinjaFiles goroutine) and setupHashFS (main
 	// goroutine) both read it; previously they raced through
 	// c.fsopt.OutputLocal.
-	c.outputLocal, err = initOutputLocal(c.outputLocalStrategy)
-	if err != nil {
+	if err = c.setupOutputLocal(ctx); err != nil {
 		return stats, err
 	}
 
@@ -450,13 +511,25 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 	var ninjaLogWriter io.Writer // ninjaLogWriter is used to pass the ninja log writer from CheckManifest to the main thread's bopts to avoid truncation.
 	octx := ctx
 
+	// Resolve the content digest function once and thread it into every
+	// HashFS (including the temporary ones below); the reapi client resolves
+	// the same flag in reapi.New. Parsed regardless of whether REAPI is
+	// configured: offline/local builds keep hashing and interpreting the
+	// persisted fs state under -reapi_digest_function instead of falling
+	// back to sha256 and discarding a non-sha256 build's state.
+	digestFn, err := reapi.ParseDigestFunction(c.reopt.DigestFunction)
+	if err != nil {
+		return stats, err
+	}
+	c.fsopt.DigestFunction = digestFn
+
 	// When check manifest is done including regenerating manifest, it's ready to start loading Ninja files. This channel is used to start ninja loading
 	checkManifestDone := make(chan error)
 	go func() {
 		ctx := trace.NewThread(octx, "checkManifest")
 		// use temporary hashfs to check manifest and load manifest
 		// files.
-		tempHashFS, err := hashfs.New(ctx, hashfs.Option{})
+		tempHashFS, err := hashfs.New(ctx, hashfs.Option{DigestFunction: digestFn})
 		if err != nil {
 			checkManifestDone <- err
 			return
@@ -464,7 +537,7 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 		defer tempHashFS.Close(ctx)
 		emptyDepsLog := &ninjabuild.DepsLog{}
 		tempDS := build.DataSource{}
-		bopts := c.initBuildOpts(ctx, projectID, buildPath, config, tempDS, tempHashFS, limits, tracer, nil, logWriters)
+		bopts := c.initBuildOpts(ctx, projectID, buildPath, config, tempDS, tempHashFS, limits, tracer, nil, logWriters, nil)
 		needHashFSRefresh, err = ninjabuild.CheckManifest(ctx, c.fname, buildPath, config, tempHashFS, emptyDepsLog, &bopts)
 		if err != nil {
 			checkManifestDone <- err
@@ -485,10 +558,25 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 		return nil
 	})
 
+	var localCache *reapi.LocalCache
+	if c.cacheDir != "" && c.localCacheEnable {
+		lc, err := reapi.NewLocalCache(c.cacheDir)
+		if err != nil {
+			return stats, err
+		}
+		localCache = lc
+	}
+	c.reopt.LocalCache = localCache
+
 	var reapiClient *reapi.Client
 	if err := c.reopt.CheckValid(); err == nil {
 		ui.Default.Infof("use %s\n", c.reopt)
 		ctx = reapi.NewContext(ctx, nil)
+		if slices.Contains(build.EnabledExperiments(), "adaptive-flush") {
+			stop := c.enableAdaptiveFlushGate(ctx)
+			defer stop()
+		}
+		c.reopt.UploadLimit = limits.Upload
 		reapiClient, err = reapi.New(ctx, credential, *c.reopt)
 		if err != nil {
 			return stats, err
@@ -515,6 +603,8 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 			}
 			return eg.Wait()
 		})
+	} else if v := os.Getenv("RBE_server_address"); v != "" {
+		ui.Default.Infof("use reproxy %s\n", v)
 	} else {
 		if c.strictRemote {
 			return stats, flagError{err: fmt.Errorf("no reapi specified, but remote is requested as --strict_remote: %w", err)}
@@ -523,11 +613,8 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 			return stats, flagError{err: fmt.Errorf("no reapi specified, but remote is requested as --remote_jobs=%d: %w", c.remoteJobs, err)}
 		}
 	}
-	if !c.localCacheEnable {
-		c.cacheDir = ""
-	}
 
-	ds := build.NewDataSource(ctx, credential, c.localCacheEnable, c.cacheDir, reapiClient)
+	ds := build.NewDataSource(ctx, localCache, reapiClient)
 	defer func() {
 		err := ds.Close(ctx)
 		if err != nil {
@@ -567,14 +654,16 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 		return stats, errNothingToDo
 	}
 
+	var resultstoreUploader *resultstore.Uploader
 	if c.enableResultstore {
-		cleanup, err := c.setupResultStore(ctx, projectID, buildPath, properties, credential, hashFS)
+		var cleanup func(error)
+		resultstoreUploader, cleanup, err = c.setupResultStore(ctx, projectID, buildPath, properties, credential, hashFS, reapiClient)
 		if err != nil {
 			return stats, err
 		}
 		defer func() { cleanup(finalErr) }()
 	}
-	bopts := c.initBuildOpts(ctx, projectID, buildPath, config, ds, hashFS, limits, tracer, traceExporter, logWriters)
+	bopts := c.initBuildOpts(ctx, projectID, buildPath, config, ds, hashFS, limits, tracer, traceExporter, logWriters, resultstoreUploader)
 
 	err = <-checkManifestDone
 	if err != nil {
@@ -600,7 +689,7 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 			return stats, err
 		}
 		// to avoid unexpected reconcile mtime
-		hashFS.Forget(ctx, buildPath.WorkspaceRoot, []string{buildPath.MaybeFromRelative(ctx, "build.ninja.stamp")})
+		hashFS.Forget(ctx, buildPath.WorkspaceRoot, []path.Path{path.Path(buildPath.MaybeFromRelative(ctx, "build.ninja.stamp"))})
 		err = hashFS.Refresh(ctx)
 		if err != nil {
 			clog.Warningf(ctx, "%s modified. failed to refresh hashfs %s: %v", c.fname, time.Since(started), err)
@@ -624,13 +713,16 @@ func (c *Command) Run(ctx context.Context) (stats build.Stats, finalErr error) {
 	}
 
 	spin.Start("load siso config")
-	stepConfig, err := ninjabuild.NewStepConfig(ctx, config, buildPath, c.fname, c.stateDir)
+	stepConfig, err := ninjabuild.NewStepConfig(ctx, digestFn, config, buildPath, c.fname, c.stateDir)
 	if err != nil {
 		spin.Stop(err)
 		return stats, err
 	}
 	spin.Stop(nil)
-	graph := ninjabuild.NewGraph(ctx, c.fname, nstate, config, buildPath, hashFS, stepConfig, localDepsLog)
+	graph, err := ninjabuild.NewGraph(ctx, c.fname, nstate, config, buildPath, hashFS, stepConfig, localDepsLog)
+	if err != nil {
+		return stats, err
+	}
 
 	// Set last failure targets if necessary, and remove the last failed targets file unconditionally.
 	if c.fastLastFailure && !c.clobber {
@@ -721,7 +813,7 @@ func (c *Command) postRun(ctx context.Context, stats build.Stats, runErr error) 
 				return subcommands.ExitFailure
 			}
 			if errTooManyFallback, ok := errors.AsType[build.TooManyFallbackError](errBuild.Err); ok {
-				if _, ok := errors.AsType[execute.ExitError](errTooManyFallback.Err); !ok {
+				if !isBuildError(errTooManyFallback.Err) {
 					msgPrefix := "Infra failure"
 					result.InfraFailure = true
 					result.Message = fmt.Sprintf("%s: %v", msgPrefix, errTooManyFallback)
@@ -732,7 +824,18 @@ func (c *Command) postRun(ctx context.Context, stats build.Stats, runErr error) 
 					ui.Default.Errorf("\n%6s %s: %v\n", dur, msgPrefix, errTooManyFallback)
 					return subcommands.ExitFailure
 				}
-				// fallthrough if too many fallback with exit error.
+				// fallthrough if too many fallback with exit error or deps error.
+			}
+			if isInfraError(errBuild.Err) {
+				msgPrefix := "Infra failure"
+				result.InfraFailure = true
+				result.Message = fmt.Sprintf("%s: %v", msgPrefix, errBuild.Err)
+				if ui.IsTerminal() {
+					dur = ui.SGR(ui.Bold, dur)
+					msgPrefix = ui.SGR(ui.BackgroundRed, msgPrefix)
+				}
+				ui.Default.Errorf("\n%6s %s: %v\n", dur, msgPrefix, errBuild.Err)
+				return subcommands.ExitFailure
 			}
 			msgPrefix := "Build Failure"
 			result.Message = fmt.Sprintf("%s: %v", msgPrefix, runErr)
@@ -758,11 +861,15 @@ func (c *Command) postRun(ctx context.Context, stats build.Stats, runErr error) 
 			ui.Default.Warningf("%s\n", suggest)
 		} else {
 			msgPrefix := "Error"
+			if isInfraError(runErr) {
+				msgPrefix = "Infra failure"
+				result.InfraFailure = true
+			}
 			result.Message = fmt.Sprintf("%s: %v", msgPrefix, runErr)
 			if ui.IsTerminal() {
 				msgPrefix = ui.SGR(ui.BackgroundRed, msgPrefix)
 			}
-			if status.Code(runErr) == codes.Unavailable {
+			if reapiErr, ok := errors.AsType[reapi.DialError](runErr); ok && status.Code(reapiErr.Err) == codes.Unavailable {
 				ui.Default.Errorf("\n%6s %s: could not connect to backend. If you want to build offline, pass `-o` or `--offline`\n %v\n", ui.FormatDuration(time.Since(c.started)), msgPrefix, runErr)
 			} else {
 				ui.Default.Errorf("\n%6s %s: %v\n", ui.FormatDuration(time.Since(c.started)), msgPrefix, runErr)
@@ -877,7 +984,14 @@ func (c *Command) setupHashFS(ctx context.Context, buildPath *build.Path, ds bui
 		ui.Default.PrintLines(ui.SGR(ui.Yellow, "build on cartfs\n"))
 		c.fsopt.CartFS = cartfs
 	}
-
+	if c.abfsEndpoint != "" {
+		abfs, err := abfsutil.New(ctx, c.abfsEndpoint, buildPath.WorkspaceRoot)
+		if err != nil {
+			return nil, nil, err
+		}
+		ui.Default.PrintLines(ui.SGR(ui.Yellow, "build on abfs\n"))
+		c.fsopt.ABFS = abfs
+	}
 	c.fsopt.FSMonitor = initFSMonitor(ctx, buildPath.WorkspaceRoot)
 
 	hashFS, err := hashfs.New(ctx, *c.fsopt)
@@ -885,12 +999,6 @@ func (c *Command) setupHashFS(ctx context.Context, buildPath *build.Path, ds bui
 		return nil, nil, err
 	}
 	close := func(targets []string, err error) {
-		if c.fsopt.CartFS != nil {
-			cerr := c.fsopt.CartFS.Close()
-			if cerr != nil {
-				clog.Errorf(ctx, "close cartfs: %v", cerr)
-			}
-		}
 		shouldSetTargets := !c.dryRun && c.subtool == "" && !c.prepare && err == nil
 		hashFS.SetBuildTargets(ctx, targets, shouldSetTargets)
 		cerr := hashFS.Close(ctx)
@@ -899,4 +1007,28 @@ func (c *Command) setupHashFS(ctx context.Context, buildPath *build.Path, ds bui
 		}
 	}
 	return hashFS, close, nil
+}
+
+func isBuildError(err error) bool {
+	if _, ok := errors.AsType[execute.ExitError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[build.DepsError](err); ok {
+		return true
+	}
+	return false
+}
+
+func isInfraError(err error) bool {
+	if _, ok := errors.AsType[cred.AuthError](err); ok {
+		return true
+	}
+	if errors.Is(err, reapi.ErrBadPlatformContainerImage) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Unauthenticated, codes.PermissionDenied:
+		return true
+	}
+	return false
 }

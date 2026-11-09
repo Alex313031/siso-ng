@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 )
 
@@ -90,8 +91,7 @@ type buildScope struct {
 
 // lookupVar looks up var in a build statement, if any.
 func (b *buildScope) lookupVar(pos int, name []byte) (evalString, bool) {
-	for i := len(b.statements) - 1; i >= 0; i-- {
-		st := b.statements[i]
+	for _, st := range slices.Backward(b.statements) {
 		if pos >= 0 && st.pos >= pos {
 			continue
 		}

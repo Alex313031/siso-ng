@@ -9,12 +9,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/reapitest"
 )
 
@@ -120,9 +121,9 @@ func TestBuild_MultiOut_Remote(t *testing.T) {
 	if err != nil {
 		t.Errorf("hashfs.Load=%v; want nil err", err)
 	}
-	wantOut1Digest := digest.FromBytes("", out1Data).Digest()
-	wantOut2Digest := digest.FromBytes("", out2Data).Digest()
-	m := hashfs.StateMap(st)
+	wantOut1Digest := blob.FromBytes(digest.SHA256, "", out1Data).Digest()
+	wantOut2Digest := blob.FromBytes(digest.SHA256, "", out2Data).Digest()
+	m := hashfs.StateMap(digest.SHA256, st)
 	e1, ok := m[filepath.ToSlash(filepath.Join(dir, "out/siso/out1"))]
 	if !ok {
 		t.Errorf("out1 not found: %v", m)

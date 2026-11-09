@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	stdpath "path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -23,13 +24,14 @@ import (
 	log "github.com/golang/glog"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
-	semverpb "go.chromium.org/build/remote-apis/build/bazel/semver"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/merkletree"
 )
 
@@ -58,9 +60,21 @@ type Cmd struct {
 	// Env specifies the environment of the process.
 	Env []string
 
+	// EnvCacheKeyOmits specifies environment variable names to omit when
+	// constructing RBE Command_EnvironmentVariable entries.
+	EnvCacheKeyOmits map[string]bool
+
+	// EnvCacheKeySubstitutions maps strings to their replacements when normalizing
+	// environment variable values for RBE Command_EnvironmentVariable entries.
+	EnvCacheKeySubstitutions map[string]string
+
+	// EnvCacheKeyTrimPrefixes lists prefixes to strip from normalized environment
+	// variable values when the value does not contain a path list separator.
+	EnvCacheKeyTrimPrefixes []string
+
 	// RSPFile is the filename of the response file for the cmd.
 	// If set,  Siso will write the RSPFileContent to the file before executing the action, and delete the file after executing the cmd successfully.
-	RSPFile string
+	RSPFile path.Path
 
 	// RSPFileContent is the content of the response file for the cmd.
 	// The bindings are already expanded.
@@ -76,11 +90,11 @@ type Cmd struct {
 	WorkspaceRoot string
 
 	// WorkDir specifies the working directory of the cmd, relative to WorkspaceRoot.
-	WorkDir string
+	WorkDir path.Path
 
 	// Inputs are input files of the cmd, relative to WorkspaceRoot.
 	// They may be overridden by deps inputs.
-	Inputs []string
+	Inputs []path.Path
 
 	// ToolInputs are tool input files of the cmd, relative to WorkspaceRoot.
 	// They are specified by the siso config, not overridden by deps.
@@ -88,7 +102,7 @@ type Cmd struct {
 	// These are expected to be toolchain input files, not by specified
 	// by build deps, nor in deps log.
 	// deprecated: use scandeps.step_inputs to filter step inputs.
-	ToolInputs []string
+	ToolInputs []path.Path
 
 	// TreeInputs are precomputed subtree inputs of the cmd.
 	TreeInputs []merkletree.TreeEntry
@@ -99,21 +113,25 @@ type Cmd struct {
 	UseSystemInput bool
 
 	// Outputs are output files of the cmd, relative to WorkspaceRoot.
-	Outputs []string
+	Outputs []path.Path
+
+	// OutputDirs are output directories of the cmd, relative to WorkspaceRoot.
+	OutputDirs []path.Path
 
 	// ReconcileOutputdirs are output directories where the cmd would
 	// modify files/dirs, invisible to build graph.
-	ReconcileOutputdirs []string
+	// They are relative to ExecRoot.
+	ReconcileOutputdirs []path.Path
 
-	// ExecRootInJailDir is an absolute path of jail to capture outputs
-	// after sandbox execution.
-	ExecRootInJailDir string
+	// PostProc is post process to capture outputs from jail after sandbox
+	// execution.
+	PostProc func(context.Context, []path.Path) error
 
 	// Deps specifies deps type of the cmd, "gcc", "msvc".
 	Deps string
 
 	// Depfile specifies a filename for dep info, relative to WorkspaceRoot.
-	Depfile string
+	Depfile path.Path
 
 	// AuxiliaryOutputDigests holds digests of auxiliary outputs.
 	AuxiliaryOutputDigests map[string]digest.Digest
@@ -121,12 +139,12 @@ type Cmd struct {
 	// AuxiliaryLogOutputFiles are output files that siso explicitly logs digest of
 	// but doesn't download to disk or record in hashfs time.
 	// They are relative to WorkspaceRoot.
-	AuxiliaryLogOutputFiles []string
+	AuxiliaryLogOutputFiles []path.Path
 
 	// AuxiliaryLogOutputDirs are output directories that siso explicitly logs digest of
 	// but doesn't download to disk or record in hashfs time.
 	// They are relative to WorkspaceRoot.
-	AuxiliaryLogOutputDirs []string
+	AuxiliaryLogOutputDirs []path.Path
 
 	// If Restat is true,
 	// output files may be used only for inputs. i.e.
@@ -160,7 +178,7 @@ type Cmd struct {
 	HashFS *hashfs.HashFS
 
 	// REAPI version
-	REAPIVersion *semverpb.SemVer
+	REAPIVersion reapi.Version
 
 	// Platform is a platform properties for remote execution.
 	// e.g. OSFamily: {Linux, Windows}
@@ -178,7 +196,7 @@ type Cmd struct {
 	// The key is the filename used in remote execution.
 	// The value is the filename on local disk.
 	// The file names are relative to WorkspaceRoot.
-	RemoteInputs map[string]string
+	RemoteInputs map[path.Path]path.Path
 
 	// CanonicalizeDir specifies whether remote execution will canonicalize
 	// working directory or not.
@@ -209,7 +227,7 @@ type Cmd struct {
 	// outfiles is outputs of the step in build graph.
 	// These outputs will be recorded with cmdhash.
 	// Other outputs in c.Outputs will be recorded without cmdhash.
-	outfiles map[string]bool
+	outfiles map[path.Path]bool
 
 	// preOutputEntries is update entries of outputs before execution.
 	preOutputEntries []hashfs.UpdateEntry
@@ -219,6 +237,11 @@ type Cmd struct {
 	actionDigest digest.Digest
 
 	actionResult *rpb.ActionResult
+
+	// dirOutputsExpanded guards expandDirOutputs against re-entry: it mutates
+	// actionResult in place and a second call would double-append each tree's
+	// files. Reset in Clone and SetActionResult.
+	dirOutputsExpanded bool
 
 	// actionResult is cached result if cachedResult is true.
 	cachedResult bool
@@ -237,16 +260,17 @@ type Cmd struct {
 // Clone creates a shallow clone of the Cmd suitable for use as
 // the local racer in racing mode. All public fields are shared (they are
 // read-only during execution), but private mutable state (action result,
-// stdout/stderr buffers, output entries) is freshly initialized so the
+// stdout/stderr buffers) is freshly initialized so the
 // two racers don't interfere with each other.
 func (c *Cmd) Clone() *Cmd {
 	clone := *c // shallow copy of all fields
+	clone.preOutputEntries = slices.Clone(c.preOutputEntries)
 	// Reset mutable state so the clone is independent.
-	clone.preOutputEntries = nil
 	clone.stdoutBuffer = nil
 	clone.stderrBuffer = nil
 	clone.actionDigest = digest.Digest{}
 	clone.actionResult = nil
+	clone.dirOutputsExpanded = false
 	clone.cachedResult = false
 	clone.remoteFallbackResult = nil
 	clone.remoteFallbackError = nil
@@ -266,32 +290,109 @@ func (c *Cmd) String() string {
 // c.Outputs will be recorded as outputs of the command in hashfs
 // in RecordOutputs or RecordOutputsFromLocal.
 func (c *Cmd) InitOutputs() {
-	c.outfiles = make(map[string]bool)
+	c.outfiles = make(map[path.Path]bool)
 	for _, out := range c.Outputs {
+		c.outfiles[out] = true
+	}
+	for _, out := range c.OutputDirs {
 		c.outfiles[out] = true
 	}
 }
 
 // AllInputs returns all inputs of the cmd.
-func (c *Cmd) AllInputs() []string {
+func (c *Cmd) AllInputs() []path.Path {
 	if c.RSPFile == "" {
 		return c.Inputs
 	}
-	inputs := make([]string, len(c.Inputs)+1)
+	inputs := make([]path.Path, len(c.Inputs)+1)
 	copy(inputs, c.Inputs)
 	inputs[len(inputs)-1] = c.RSPFile
 	return inputs
 }
 
-// AllOutputs returns all outputs of the cmd.
-func (c *Cmd) AllOutputs() []string {
+// DeclaredOutputs returns the step's declared output targets: file outputs
+// and directory outputs, excluding the depfile (a deps side-channel).
+func (c *Cmd) DeclaredOutputs() []path.Path {
+	if len(c.OutputDirs) == 0 {
+		return c.Outputs
+	}
+	outputs := make([]path.Path, 0, len(c.Outputs)+len(c.OutputDirs))
+	outputs = append(outputs, c.Outputs...)
+	outputs = append(outputs, c.OutputDirs...)
+	return outputs
+}
+
+// AllOutputs returns the declared outputs plus the depfile (the on-disk set
+// for the capture/flush/record paths).
+func (c *Cmd) AllOutputs() []path.Path {
+	decl := c.DeclaredOutputs()
+	if c.Depfile == "" {
+		return decl
+	}
+	// Fresh slice: decl may alias c.Outputs, so appending must not write into
+	// c.Outputs' backing array.
+	outputs := make([]path.Path, 0, len(decl)+1)
+	outputs = append(outputs, decl...)
+	outputs = append(outputs, c.Depfile)
+	return outputs
+}
+
+// FlushOutputs returns the on-disk targets to flush after the step: file
+// outputs as-is, directory outputs marked with a trailing slash, plus the
+// depfile. The trailing slash tells HashFS.Flush to materialize a directory
+// target's whole tree; a plain file output that merely resolves to a directory
+// (e.g. a legacy directory-valued "copy" output) is flushed as-is so its
+// contents stay in hashfs and build-without-the-bytes is preserved.
+func (c *Cmd) FlushOutputs() []path.Path {
+	outputs := make([]path.Path, 0, len(c.Outputs)+len(c.OutputDirs)+1)
+	outputs = append(outputs, c.Outputs...)
+	for _, dir := range c.OutputDirs {
+		outputs = append(outputs, dir+"/")
+	}
+	if c.Depfile != "" {
+		outputs = append(outputs, c.Depfile)
+	}
+	return outputs
+}
+
+// FileOutputsWithDepfile returns the file outputs plus the depfile, excluding
+// directory outputs. With no depfile it aliases c.Outputs; callers must not
+// mutate the result.
+func (c *Cmd) FileOutputsWithDepfile() []path.Path {
 	if c.Depfile == "" {
 		return c.Outputs
 	}
-	outputs := make([]string, len(c.Outputs)+1)
-	copy(outputs, c.Outputs)
-	outputs[len(outputs)-1] = c.Depfile
-	return outputs
+	return append(slices.Clone(c.Outputs), c.Depfile)
+}
+
+// OutermostPaths dedups paths and drops any nested under another path in the
+// set (by Path.Dir), preserving input order. Paths must use forward slashes.
+// So a directory carries its whole subtree as one unit, which the jail-capture
+// rename and cleandead both rely on.
+func OutermostPaths(paths []path.Path) []path.Path {
+	set := make(map[path.Path]bool, len(paths))
+	for _, p := range paths {
+		set[p] = true
+	}
+	var out []path.Path
+	seen := make(map[path.Path]bool, len(paths))
+	for _, p := range paths {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		nested := false
+		for d := p.Dir(); d != "." && d != "/" && d != ""; d = d.Dir() {
+			if set[d] {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // remoteArgsWithWrapper returns arguments to the remote command.
@@ -382,7 +483,7 @@ func (c *Cmd) ActionDigest() digest.Digest {
 }
 
 // SetActionDigest sets action digest.
-// This is used to set the digest in test.
+// This is used to set the digest for two phase caching or in test.
 func (c *Cmd) SetActionDigest(d digest.Digest) {
 	c.actionDigest = d
 }
@@ -396,12 +497,15 @@ func (c *Cmd) RemoteChroot() bool {
 
 // Digest computes action digest of the cmd.
 // If ds is nil, then it will reuse the previous calculated digest if any.
-func (c *Cmd) Digest(ctx context.Context, ds *digest.Store) (actionDigest digest.Digest, err error) {
+func (c *Cmd) Digest(ctx context.Context, ds *blob.Store) (actionDigest digest.Digest, err error) {
 	if !c.Pure {
 		return digest.Digest{}, fmt.Errorf("unable to create digest for impure cmd %s", c.ID)
 	}
 	if c.HashFS == nil {
 		return digest.Digest{}, fmt.Errorf("unable to get the input root for %s: missing HashFS", c)
+	}
+	if ds == nil && !c.actionDigest.IsZero() {
+		return c.actionDigest, nil
 	}
 	chrootPath, remoteChroot := c.Platform["dockerChrootPath"]
 	if remoteChroot {
@@ -429,13 +533,13 @@ func (c *Cmd) Digest(ctx context.Context, ds *digest.Store) (actionDigest digest
 		ents, treeInputs = c.chrootDir(ctx, ents, treeInputs)
 	}
 
-	inputRootDigest, err = treeDigest(ctx, treeInputs, ents, ds)
+	inputRootDigest, err = treeDigest(ctx, c.HashFS.DigestFunction(), treeInputs, ents, ds)
 	if err != nil {
 		return digest.Digest{}, fmt.Errorf("failed to get input root for %s: %w", c, err)
 	}
 	treeDuration = time.Since(started)
 
-	commandDigest, err = c.commandDigest(ctx, ds)
+	commandDigest, err = c.CommandDigest(ctx, ds)
 	if err != nil {
 		return digest.Digest{}, fmt.Errorf("failed to build command for %s: %w", c, err)
 	}
@@ -457,10 +561,10 @@ func (c *Cmd) Digest(ctx context.Context, ds *digest.Store) (actionDigest digest
 		DoNotCache:      c.DoNotCache,
 		Salt:            c.ActionSalt,
 	}
-	if reapi.UseActionForPlatformProperties(c.REAPIVersion) {
+	if c.REAPIVersion.UseActionForPlatformProperties() {
 		actionMsg.Platform = c.remoteExecutionPlatform()
 	}
-	action, err := digest.FromProtoMessage(actionMsg)
+	action, err := blob.FromProtoMessage(c.HashFS.DigestFunction(), actionMsg)
 	if err != nil {
 		return digest.Digest{}, fmt.Errorf("failed to build action for %s: %w", c, err)
 	}
@@ -481,14 +585,15 @@ func (c *Cmd) inputTree(ctx context.Context) ([]merkletree.Entry, error) {
 	switch {
 	case c.RemoteChroot():
 		// allow absolute path for inputs when remote chroot.
-		var rootInputs, newInputs []string
+		var rootInputs []path.Path
+		var newInputs []path.Path
 		for _, input := range inputs {
-			if !filepath.IsLocal(input) {
-				if filepath.IsAbs(input) {
+			if !filepath.IsLocal(string(input)) {
+				if filepath.IsAbs(string(input)) {
 					rootInputs = append(rootInputs, input)
 					continue
 				}
-				rootInputs = append(rootInputs, filepath.ToSlash(filepath.Join(c.WorkspaceRoot, input)))
+				rootInputs = append(rootInputs, path.New(filepath.Join(c.WorkspaceRoot, string(input))))
 				continue
 			}
 			newInputs = append(newInputs, input)
@@ -505,9 +610,9 @@ func (c *Cmd) inputTree(ctx context.Context) ([]merkletree.Entry, error) {
 		inputs = newInputs
 
 	case c.UseSystemInput:
-		var newInputs []string
+		var newInputs []path.Path
 		for _, input := range inputs {
-			if !filepath.IsLocal(input) {
+			if !filepath.IsLocal(string(input)) {
 				continue
 			}
 			newInputs = append(newInputs, input)
@@ -516,6 +621,7 @@ func (c *Cmd) inputTree(ctx context.Context) ([]merkletree.Entry, error) {
 		inputs = newInputs
 	}
 
+	inputs = c.dropSubtreeInputs(inputs)
 	ents, err := c.HashFS.Entries(ctx, c.WorkspaceRoot, inputs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get entries for inputs in %s: %w", c.WorkspaceRoot, err)
@@ -536,26 +642,33 @@ func (c *Cmd) inputTree(ctx context.Context) ([]merkletree.Entry, error) {
 	// Construct a reverse map from local path to remote paths.
 	// Note that multiple remote inputs may use the same local input.
 	// Also, make a list of local filepaths to retrieve entries from the HashFS.
-	revm := map[string][]string{}
-	reins := make([]string, 0, len(c.RemoteInputs))
+	revm := map[path.Path][]path.Path{}
+	reins := make([]path.Path, 0, len(c.RemoteInputs))
 	for r, l := range c.RemoteInputs {
+		if strings.HasSuffix(string(l), "/") {
+			// A trailing-slash directory value is expanded into its files by
+			// HashFS.Entries below, after which this directory-keyed reverse
+			// map no longer matches and the remap is silently dropped. Reject
+			// directory values explicitly instead.
+			return nil, fmt.Errorf("remote_inputs value %q for %q is a directory; directory values are not supported", l, r)
+		}
 		reins = append(reins, l)
 		revm[l] = append(revm[l], r)
 	}
 
 	// Retrieve Merkle tree entries from HashFS.
-	sort.Strings(reins)
+	slices.Sort(reins)
 	reents, err := c.HashFS.Entries(ctx, c.WorkspaceRoot, reins)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get entries for remote inputs in %s: %w", c.WorkspaceRoot, err)
 	}
 
 	// Convert local paths to remote paths.
-	remap := map[string]merkletree.Entry{}
+	remap := map[path.Path]merkletree.Entry{}
 	for _, e := range reents {
 		for _, rname := range revm[e.Name] {
 			e.Name = rname
-			remap[rname] = e
+			remap[e.Name] = e
 		}
 	}
 
@@ -579,9 +692,58 @@ func (c *Cmd) inputTree(ctx context.Context) ([]merkletree.Entry, error) {
 	return ents, nil
 }
 
+// dropSubtreeInputs removes inputs at or under a precomputed subtree of
+// c.TreeInputs before their entries are looked up. treeDigest ignores
+// such entries (Set stops at the subtree with ErrPrecomputedSubTree), so
+// the input root digest is unchanged. Like SetTree, it skips a subtree
+// that overlaps an earlier one. Nothing is dropped if a subtree name is
+// invalid, or for remote chroot or remote inputs, which rename entries
+// after the lookup.
+func (c *Cmd) dropSubtreeInputs(inputs []path.Path) []path.Path {
+	if len(c.TreeInputs) == 0 || c.RemoteChroot() || len(c.RemoteInputs) > 0 {
+		return inputs
+	}
+	var cdir path.Path
+	if c.CanonicalizeDir {
+		cdir = c.canonicalDir()
+	}
+	canon := func(p path.Path) path.Path {
+		if cdir == "" {
+			return p
+		}
+		return canonicalizePath(p, c.WorkDir, cdir)
+	}
+	names := make([]path.Path, 0, len(c.TreeInputs))
+	for _, t := range c.TreeInputs {
+		n := canon(t.Name)
+		if t.Digest.IsZero() || n == "." || !filepath.IsLocal(string(n)) || stdpath.Clean(string(n)) != string(n) {
+			return inputs
+		}
+		if slices.ContainsFunc(names, func(a path.Path) bool { return n.HasPrefix(a) || a.HasPrefix(n) }) {
+			continue
+		}
+		names = append(names, n)
+	}
+	under := func(p path.Path) bool {
+		if cdir != "" {
+			// HashFS.Entries expands a directory input "d/" to its
+			// files, and those under c.WorkDir are moved out of d.
+			d := path.Path(strings.TrimSuffix(string(p), "/"))
+			if d != c.WorkDir && c.WorkDir.HasPrefix(d) {
+				return false
+			}
+		}
+		return slices.ContainsFunc(names, canon(p).HasPrefix)
+	}
+	if !slices.ContainsFunc(inputs, under) {
+		return inputs
+	}
+	return slices.DeleteFunc(slices.Clone(inputs), under)
+}
+
 // treeDigest returns a digest for the Merkle tree entries.
-func treeDigest(ctx context.Context, subtrees []merkletree.TreeEntry, entries []merkletree.Entry, ds *digest.Store) (digest.Digest, error) {
-	t := merkletree.NewPooled(ds)
+func treeDigest(ctx context.Context, fn digest.Function, subtrees []merkletree.TreeEntry, entries []merkletree.Entry, ds *blob.Store) (digest.Digest, error) {
+	t := merkletree.NewPooled(fn, ds)
 	defer t.Release()
 	for _, subtree := range subtrees {
 		if log.V(2) {
@@ -641,73 +803,71 @@ func (c *Cmd) canonicalizeDir(ctx context.Context, ents []merkletree.Entry, tree
 }
 
 // canonicalizeEntries canonicalizes working dir to cdir in the entries.
-func (c *Cmd) canonicalizeEntries(cdir string, entries []merkletree.Entry) []merkletree.Entry {
+func (c *Cmd) canonicalizeEntries(cdir path.Path, entries []merkletree.Entry) []merkletree.Entry {
 	for i := range entries {
 		e := &entries[i]
-		e.Name = canonicalizeDir(e.Name, c.WorkDir, cdir)
+		e.Name = canonicalizePath(e.Name, c.WorkDir, cdir)
 	}
 	return entries
 }
 
 // canonicalizeTrees canonicalizes working dir to cdir in the trees.
-func (c *Cmd) canonicalizeTrees(cdir string, trees []merkletree.TreeEntry) []merkletree.TreeEntry {
+func (c *Cmd) canonicalizeTrees(cdir path.Path, trees []merkletree.TreeEntry) []merkletree.TreeEntry {
 	for i := range trees {
 		e := &trees[i]
-		e.Name = canonicalizeDir(e.Name, c.WorkDir, cdir)
+		e.Name = canonicalizePath(e.Name, c.WorkDir, cdir)
 	}
 	return trees
 }
 
 // canonicalDir computes a canonical dir of the working directory.
-func (c *Cmd) canonicalDir() string {
+func (c *Cmd) canonicalDir() path.Path {
 	if c.WorkDir == "" || c.WorkDir == "." {
 		return ""
 	}
-	n := len(strings.Split(filepath.ToSlash(c.WorkDir), "/"))
-	elems := []string{"out"}
+	n := strings.Count(string(c.WorkDir), "/") + 1
+	p := path.Path("out")
 	for i := 1; i < n; i++ {
-		elems = append(elems, "x")
+		p = p.JoinPath("x")
 	}
-	return filepath.ToSlash(filepath.Join(elems...))
+	return p
 }
 
-func canonicalizeDir(fname, dir, cdir string) string {
+func canonicalizePath(fname, dir, cdir path.Path) path.Path {
 	if dir == cdir {
 		return fname
 	}
 	if fname == dir {
 		return cdir
 	}
-	for _, prefix := range []string{dir + "/", dir + `\`} {
-		if f, ok := strings.CutPrefix(fname, prefix); ok {
-			return filepath.ToSlash(filepath.Join(cdir, f))
-		}
+	if fname.HasPrefix(dir) {
+		return cdir.JoinPath(fname.TrimPrefix(dir))
 	}
 	return fname
 }
 
 // chrootDir converts pathnames in ents and treeInputs from workspace relative to "/" relative.
 func (c *Cmd) chrootDir(ctx context.Context, ents []merkletree.Entry, treeInputs []merkletree.TreeEntry) ([]merkletree.Entry, []merkletree.TreeEntry) {
-	dir := filepath.ToSlash(filepath.Clean(c.WorkspaceRoot))
+	dir := path.New(c.WorkspaceRoot)
 	if log.V(1) {
 		clog.Infof(ctx, "chdoor dir: %s", dir)
 	}
 	for i := range ents {
 		e := &ents[i]
-		if filepath.IsAbs(e.Name) {
+		if e.Name.IsAbs() {
 			e.Name = e.Name[1:]
 			continue
 		}
-		e.Name = filepath.ToSlash(filepath.Join(dir, e.Name))[1:]
+		e.Name = dir.JoinPath(e.Name)[1:]
 	}
 	treeInputs = slices.Clone(treeInputs)
 	for i := range treeInputs {
 		e := &treeInputs[i]
-		if filepath.IsAbs(e.Name) {
+		if e.Name.IsAbs() {
 			e.Name = e.Name[1:]
 			continue
 		}
-		e.Name = filepath.ToSlash(filepath.Join(dir, e.Name))[1:]
+		e.Name = dir.JoinPath(e.Name)[1:]
 	}
 	return ents, treeInputs
 }
@@ -727,44 +887,53 @@ func (c *Cmd) remoteExecutionPlatform() *rpb.Platform {
 	return platform
 }
 
-// commandDigest constructs the digest of the command line.
-func (c *Cmd) commandDigest(ctx context.Context, ds *digest.Store) (digest.Digest, error) {
+// WorkingDirectory returns working_directory for rpb.Command.
+func (c *Cmd) WorkingDirectory() string {
+	dir := c.WorkDir
+	if c.CanonicalizeDir {
+		dir = c.canonicalDir()
+	}
+	if dir == "." {
+		dir = ""
+	}
+	if c.RemoteChroot() {
+		dir = path.JoinRoot(c.WorkspaceRoot, dir)[1:]
+	}
+	return string(dir)
+}
+
+// CommandDigest constructs the digest of the command line.
+func (c *Cmd) CommandDigest(ctx context.Context, ds *blob.Store) (digest.Digest, error) {
 	var outFiles, outDirs []string
-	process := func(res []string, paths ...string) []string {
+	process := func(res []string, paths ...path.Path) []string {
 		for _, out := range paths {
-			rout, err := filepath.Rel(c.WorkDir, out)
+			rout, err := out.Rel(c.WorkDir)
 			if err != nil {
 				clog.Warningf(ctx, "failed to get rel %s,%s: %v", c.WorkDir, out, err)
-				rout = out
+				res = append(res, string(out))
+				continue
 			}
-			res = append(res, filepath.ToSlash(rout))
+			res = append(res, string(rout))
 		}
 		return res
 	}
 
 	outFiles = make([]string, 0, len(c.Outputs)+1+len(c.AuxiliaryLogOutputFiles))
-	outFiles = process(outFiles, c.AllOutputs()...)
+	outFiles = process(outFiles, c.FileOutputsWithDepfile()...)
 	outFiles = process(outFiles, c.AuxiliaryLogOutputFiles...)
 	sort.Strings(outFiles)
 
-	outDirs = make([]string, 0, len(c.AuxiliaryLogOutputDirs))
+	outDirs = process(outDirs, c.OutputDirs...)
 	outDirs = process(outDirs, c.AuxiliaryLogOutputDirs...)
 	sort.Strings(outDirs)
 	args, err := c.remoteArgsWithWrapper()
 	if err != nil {
 		return digest.Digest{}, err
 	}
-	dir := c.WorkDir
-	if c.CanonicalizeDir {
-		dir = c.canonicalDir()
-	}
-	if c.RemoteChroot() {
-		dir = filepath.ToSlash(filepath.Join(c.WorkspaceRoot, dir))[1:]
-	}
 	// out files are cwd relative.
 	command := &rpb.Command{
 		Arguments:        args,
-		WorkingDirectory: filepath.ToSlash(dir),
+		WorkingDirectory: c.WorkingDirectory(),
 		// TODO(b/273152496): `Platform` in `Command` is deprecated. should specify it in `Action`.
 		// https://github.com/bazelbuild/remote-apis/blob/55153ba61dcf6277849562a30bca9fa3906ad9a0/build/bazel/remote/execution/v2/remote_execution.proto#L661-L664
 		// https://github.com/bazelbuild/remote-apis/blob/55153ba61dcf6277849562a30bca9fa3906ad9a0/build/bazel/remote/execution/v2/remote_execution.proto#L519-L521
@@ -774,7 +943,7 @@ func (c *Cmd) commandDigest(ctx context.Context, ds *digest.Store) (digest.Diges
 	}
 	// `OutputFiles` is deprecated. should use `OutputPaths` instead.
 	// https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L592
-	if reapi.UseOutputPaths(c.REAPIVersion) {
+	if c.REAPIVersion.UseOutputPaths() {
 		command.OutputPaths = make([]string, 0, len(outFiles)+len(outDirs))
 		command.OutputPaths = append(command.OutputPaths, outFiles...)
 		command.OutputPaths = append(command.OutputPaths, outDirs...)
@@ -783,20 +952,14 @@ func (c *Cmd) commandDigest(ctx context.Context, ds *digest.Store) (digest.Diges
 		command.OutputFiles = outFiles      //nolint:staticcheck // existing deprecation
 		command.OutputDirectories = outDirs //nolint:staticcheck // existing deprecation
 	}
-	for _, env := range c.Env {
-		k, v, ok := strings.Cut(env, "=")
-		if !ok {
-			continue
-		}
-		command.EnvironmentVariables = append(command.EnvironmentVariables, &rpb.Command_EnvironmentVariable{
-			Name:  k,
-			Value: v,
-		})
-	}
-	sort.Slice(command.EnvironmentVariables, func(i, j int) bool {
-		return command.EnvironmentVariables[i].Name < command.EnvironmentVariables[j].Name
-	})
-	data, err := digest.FromProtoMessage(command)
+	// For remote execution (RBE), c.Env only contains step-level environment variables
+	// (such as macOS SDK/Xcode paths), and c.EnvCacheKeyOmits / c.EnvCacheKeySubstitutions
+	// are nil. For local execution (Builder.runLocal), c.Env, c.EnvCacheKeyOmits, and
+	// c.EnvCacheKeySubstitutions are populated from the "env" config, and rpb.Command is
+	// only constructed to compute cache keys (e.g. two-phase caching lookup key and
+	// Phase 2 action upload), never for remote execution requests.
+	command.EnvironmentVariables = c.EnvVars()
+	data, err := blob.FromProtoMessage(c.HashFS.DigestFunction(), command)
 	if err != nil {
 		return digest.Digest{}, err
 	}
@@ -806,10 +969,95 @@ func (c *Cmd) commandDigest(ctx context.Context, ds *digest.Store) (digest.Diges
 	return data.Digest(), nil
 }
 
+// NormalizeEnvVars returns a map of environment variables that have been normalized
+// using the given substitutions (e.g., replacing the workspace root with "CWD").
+// Any matching prefix in trimPrefixes is removed from the normalized value when the
+// value does not contain a path list separator.
+// The keep function is used to filter environment variables. If keep returns true, the
+// variable is included in the result.
+func NormalizeEnvVars(osVars []string, substitutions map[string]string, trimPrefixes []string, keep func(string) bool) map[string]string {
+	result := make(map[string]string, len(osVars))
+	var replacer *strings.Replacer
+	if len(substitutions) > 0 {
+		keys := make([]string, 0, len(substitutions))
+		for k := range substitutions {
+			if k != "" {
+				keys = append(keys, k)
+			}
+		}
+		slices.SortFunc(keys, func(a, b string) int {
+			if len(a) != len(b) {
+				return len(b) - len(a)
+			}
+			return strings.Compare(a, b)
+		})
+		oldnew := make([]string, 0, len(keys)*2)
+		for _, k := range keys {
+			oldnew = append(oldnew, k, substitutions[k])
+		}
+		if len(oldnew) > 0 {
+			replacer = strings.NewReplacer(oldnew...)
+		}
+	}
+	for _, kv := range osVars {
+		ss := strings.SplitN(kv, "=", 2)
+		if len(ss) < 2 {
+			continue
+		}
+		key, value := ss[0], ss[1]
+		if keep != nil && !keep(key) {
+			continue
+		}
+		if replacer != nil {
+			value = replacer.Replace(value)
+		}
+		// Do not trim path list prefixes (such as $PATH), where entries must remain
+		// distinguishable from relative paths.
+		if len(trimPrefixes) > 0 && !strings.Contains(value, string(os.PathListSeparator)) {
+			for _, p := range trimPrefixes {
+				if after, ok := strings.CutPrefix(value, p); ok {
+					value = after
+					break
+				}
+			}
+		}
+		result[key] = value
+	}
+	return result
+}
+
+// EnvVars returns the sorted, deduplicated, normalized RBE Command_EnvironmentVariable list for the cmd.
+func (c *Cmd) EnvVars() []*rpb.Command_EnvironmentVariable {
+	if len(c.Env) == 0 {
+		return nil
+	}
+	envMap := NormalizeEnvVars(c.Env, c.EnvCacheKeySubstitutions, c.EnvCacheKeyTrimPrefixes, func(key string) bool {
+		return !c.EnvCacheKeyOmits[key]
+	})
+	if len(envMap) == 0 {
+		return nil
+	}
+	vars := make([]*rpb.Command_EnvironmentVariable, 0, len(envMap))
+	for k, v := range envMap {
+		vars = append(vars, &rpb.Command_EnvironmentVariable{
+			Name:  k,
+			Value: v,
+		})
+	}
+	sort.Slice(vars, func(i, j int) bool {
+		return vars[i].Name < vars[j].Name
+	})
+	return vars
+}
+
 // SetActionResult sets action result to the cmd.
 func (c *Cmd) SetActionResult(result *rpb.ActionResult, cached bool) {
 	c.actionResult = result
 	c.cachedResult = cached
+	// A new result must be flattened afresh: without this, a cmd whose cache
+	// probe expanded a result then fell back to execution would record the
+	// fresh result's directory outputs as empty.
+	c.dirOutputsExpanded = false
 }
 
 // ActionResult returns the action result of the cmd.
@@ -830,12 +1078,28 @@ func (c *Cmd) RemoteFallbackResult() (*rpb.ActionResult, error) {
 
 // IsAuxiliary checks if the name is an auxiliary output.
 // name and AuxiliaryLogOutputFiles/Dirs are workspace relative paths.
-func (c *Cmd) IsAuxiliary(name string) bool {
+func (c *Cmd) IsAuxiliary(name path.Path) bool {
 	if slices.Contains(c.AuxiliaryLogOutputFiles, name) {
 		return true
 	}
 	if slices.Contains(c.AuxiliaryLogOutputDirs, name) {
 		return true
+	}
+	return false
+}
+
+// isOutputFile reports whether fname is a declared output or under a declared
+// output directory (c.outfiles holds both from InitOutputs). fname must use
+// forward slashes: Path.Dir (not filepath.Dir) keeps the lookup keys
+// slash-formed on Windows.
+func (c *Cmd) isOutputFile(fname path.Path) bool {
+	if c.outfiles[fname] {
+		return true
+	}
+	for dir := fname.Dir(); dir != "." && dir != "/" && dir != ""; dir = dir.Dir() {
+		if c.outfiles[dir] {
+			return true
+		}
 	}
 	return false
 }
@@ -848,8 +1112,8 @@ func (c *Cmd) entriesFromResult(ctx context.Context, ds hashfs.DataSource, updat
 		if f.Digest == nil {
 			continue
 		}
-		fname := filepath.ToSlash(filepath.Join(c.WorkDir, f.Path))
-		if c.IsAuxiliary(fname) && !c.outfiles[fname] {
+		pname := c.WorkDir.Join(f.Path)
+		if c.IsAuxiliary(pname) && !c.isOutputFile(pname) {
 			continue
 		}
 
@@ -859,10 +1123,10 @@ func (c *Cmd) entriesFromResult(ctx context.Context, ds hashfs.DataSource, updat
 			mode |= 0111
 		}
 		ent := hashfs.UpdateEntry{
-			Name: fname,
+			Name: pname,
 			Entry: &merkletree.Entry{
-				Name:         fname,
-				Data:         digest.NewData(ds.Source(ctx, d, fname), d),
+				Name:         pname,
+				Data:         blob.NewData(ds.Source(ctx, d, string(pname)), d),
 				IsExecutable: f.IsExecutable,
 			},
 			Mode: mode,
@@ -885,7 +1149,7 @@ func (c *Cmd) entriesFromResult(ctx context.Context, ds hashfs.DataSource, updat
 			UpdatedTime: updatedTime,
 			IsChanged:   true,
 		}
-		if !c.outfiles[fname] {
+		if !c.isOutputFile(pname) {
 			// don't set cmdhash
 			additionalEntries = append(additionalEntries, ent)
 			continue
@@ -893,20 +1157,27 @@ func (c *Cmd) entriesFromResult(ctx context.Context, ds hashfs.DataSource, updat
 		ent.CmdHash = c.CmdHash
 		entries = append(entries, ent)
 	}
-	for _, s := range c.actionResult.GetOutputSymlinks() {
+	outputSymlinks := c.actionResult.GetOutputSymlinks()
+	if len(outputSymlinks) == 0 && len(c.actionResult.GetOutputFileSymlinks())+len(c.actionResult.GetOutputDirectorySymlinks()) > 0 { //nolint:staticcheck // existing deprecation
+		outputSymlinks = slices.Concat(
+			c.actionResult.GetOutputFileSymlinks(),      //nolint:staticcheck // existing deprecation
+			c.actionResult.GetOutputDirectorySymlinks(), //nolint:staticcheck // existing deprecation
+		)
+	}
+	for _, s := range outputSymlinks {
 		if s.Target == "" {
 			continue
 		}
-		fname := filepath.ToSlash(filepath.Join(c.WorkDir, s.Path))
-		if c.IsAuxiliary(fname) && !c.outfiles[fname] {
+		pname := c.WorkDir.Join(s.Path)
+		if c.IsAuxiliary(pname) && !c.isOutputFile(pname) {
 			continue
 		}
 
 		mode := fs.FileMode(0644) | fs.ModeSymlink
 		entries = append(entries, hashfs.UpdateEntry{
-			Name: fname,
+			Name: pname,
 			Entry: &merkletree.Entry{
-				Name:   fname,
+				Name:   pname,
 				Target: s.Target,
 			},
 			Mode:        mode,
@@ -917,18 +1188,18 @@ func (c *Cmd) entriesFromResult(ctx context.Context, ds hashfs.DataSource, updat
 			IsChanged:   true,
 		})
 	}
-	for _, d := range c.actionResult.GetOutputDirectories() {
+	for _, dd := range c.actionResult.GetOutputDirectories() {
 		// It just needs to add the directories here because it assumes that they have already been expanded by ninja State.
-		dname := filepath.ToSlash(filepath.Join(c.WorkDir, d.Path))
-		if c.IsAuxiliary(dname) && !c.outfiles[dname] {
+		pname := c.WorkDir.Join(dd.Path)
+		if c.IsAuxiliary(pname) && !c.isOutputFile(pname) {
 			continue
 		}
 
 		mode := fs.FileMode(0755) | fs.ModeDir
 		entries = append(entries, hashfs.UpdateEntry{
-			Name: dname,
+			Name: pname,
 			Entry: &merkletree.Entry{
-				Name: dname,
+				Name: pname,
 			},
 			Mode:        mode,
 			ModTime:     updatedTime,
@@ -950,22 +1221,96 @@ func (c *Cmd) RecordPreOutputs(ctx context.Context) {
 	c.preOutputEntries = c.HashFS.RetrieveUpdateEntries(ctx, c.WorkspaceRoot, c.AllOutputs())
 }
 
+// expandDirOutputs flattens each directory output in the action result in
+// place, fetching its RBE Tree and replacing the bare directory node with the
+// files, symlinks, and subdir nodes it contains, so entriesFromResult records
+// its contents. A fetch/parse failure is returned (not swallowed) so the step
+// fails loudly rather than recording an empty directory.
+func (c *Cmd) expandDirOutputs(ctx context.Context, ds hashfs.DataSource) error {
+	if c.actionResult == nil || len(c.actionResult.GetOutputDirectories()) == 0 {
+		return nil
+	}
+	if c.dirOutputsExpanded {
+		return nil
+	}
+	c.dirOutputsExpanded = true
+	files := c.actionResult.GetOutputFiles()
+	symlinks := c.actionResult.GetOutputSymlinks()
+	if len(symlinks) == 0 && len(c.actionResult.GetOutputFileSymlinks())+len(c.actionResult.GetOutputDirectorySymlinks()) > 0 { //nolint:staticcheck // existing deprecation
+		symlinks = slices.Concat(
+			c.actionResult.GetOutputFileSymlinks(),      //nolint:staticcheck // existing deprecation
+			c.actionResult.GetOutputDirectorySymlinks(), //nolint:staticcheck // existing deprecation
+		)
+	}
+	var dirs []*rpb.OutputDirectory
+	for _, d := range c.actionResult.GetOutputDirectories() {
+		dname := c.WorkDir.Join(d.GetPath())
+		// Auxiliary-only directories are kept for their Tree digest but are
+		// not build graph outputs, so don't expand them. One that is also a
+		// declared output is a real output: expand it.
+		if c.IsAuxiliary(dname) && !c.isOutputFile(dname) {
+			dirs = append(dirs, d)
+			continue
+		}
+		treeDigest := digest.FromProto(d.GetTreeDigest())
+		b, err := blob.DataToBytes(ctx, blob.NewData(ds.Source(ctx, treeDigest, d.GetPath()), treeDigest))
+		if err != nil {
+			return fmt.Errorf("fetch tree for dir output %s %s: %w", d.GetPath(), treeDigest, err)
+		}
+		store := blob.NewStore()
+		root, err := reapi.ParseTree(ctx, c.HashFS.DigestFunction(), b, store)
+		if err != nil {
+			return fmt.Errorf("parse tree for dir output %s %s: %w", d.GetPath(), treeDigest, err)
+		}
+		dfiles, dsymlinks, ddirs := merkletree.Traverse(ctx, c.HashFS.DigestFunction(), d.GetPath(), root, store)
+		// merkletree.Traverse joins with the OS separator; REAPI output paths
+		// (and the hashfs keys they feed) are always forward-slash, so
+		// normalize for Windows.
+		for _, f := range dfiles {
+			f.Path = filepath.ToSlash(f.Path)
+		}
+		for _, s := range dsymlinks {
+			s.Path = filepath.ToSlash(s.Path)
+		}
+		for _, dd := range ddirs {
+			dd.Path = filepath.ToSlash(dd.Path)
+		}
+		files = append(files, dfiles...)
+		symlinks = append(symlinks, dsymlinks...)
+		// Keep the root node and the subdir nodes so entriesFromResult
+		// records a cmdhash entry for the directory and each subdirectory.
+		dirs = append(dirs, d)
+		dirs = append(dirs, ddirs...)
+	}
+	c.actionResult.OutputFiles = files
+	c.actionResult.OutputSymlinks = symlinks
+	c.actionResult.OutputDirectories = dirs
+	return nil
+}
+
 // RecordOutputs records cmd's outputs from action result in hashfs.
 func (c *Cmd) RecordOutputs(ctx context.Context, ds hashfs.DataSource, now time.Time) error {
+	if err := c.expandDirOutputs(ctx, ds); err != nil {
+		return fmt.Errorf("failed to expand directory outputs: %w", err)
+	}
+	// Replace, not merge: drop any previously recorded subtree for each
+	// directory output so a member removed from the new tree does not linger.
+	// HashFS.Update only upserts; the local path avoids stale members by
+	// reading disk truth, so the remote/cache path needs this explicit prune.
+	// ForgetOutputs (not Forget) because a directory output is owned by this
+	// step: Forget is child-preserving and never evicts a directory node, so it
+	// would leave the old members in place.
+	c.HashFS.ForgetOutputs(ctx, c.WorkspaceRoot, c.OutputDirs)
 	entries, additionalEntries := c.entriesFromResult(ctx, ds, now)
 	clog.Infof(ctx, "output entries %d+%d", len(entries), len(additionalEntries))
 	entries = c.computeOutputEntries(entries, now, c.CmdHash)
+	if len(additionalEntries) > 0 {
+		additionalEntries = c.computeOutputEntries(additionalEntries, now, nil)
+		entries = append(entries, additionalEntries...)
+	}
 	err := c.HashFS.Update(ctx, c.WorkspaceRoot, entries)
 	if err != nil {
 		return fmt.Errorf("failed to update hashfs from remote: %w", err)
-	}
-	if len(additionalEntries) == 0 {
-		return nil
-	}
-	additionalEntries = c.computeOutputEntries(additionalEntries, now, nil)
-	err = c.HashFS.Update(ctx, c.WorkspaceRoot, additionalEntries)
-	if err != nil {
-		return fmt.Errorf("failed to update hashfs from remote[additional]: %w", err)
 	}
 	return nil
 }
@@ -983,24 +1328,25 @@ func (c *Cmd) RecordAuxiliaryOutputDigests(ctx context.Context, result *rpb.Acti
 	}
 
 	for _, file := range result.OutputFiles {
-		fname := filepath.ToSlash(filepath.Join(c.WorkDir, file.Path))
+		fname := c.WorkDir.Join(file.Path)
 		if c.IsAuxiliary(fname) {
-			c.AuxiliaryOutputDigests[fname] = digest.FromProto(file.Digest)
+			c.AuxiliaryOutputDigests[string(fname)] = digest.FromProto(file.Digest)
 		}
 	}
 	for _, dir := range result.OutputDirectories {
-		dname := filepath.ToSlash(filepath.Join(c.WorkDir, dir.Path))
+		dname := c.WorkDir.Join(dir.Path)
 		if c.IsAuxiliary(dname) {
-			c.AuxiliaryOutputDigests[dname+"/"] = digest.FromProto(dir.TreeDigest)
+			c.AuxiliaryOutputDigests[string(dname)+"/"] = digest.FromProto(dir.TreeDigest)
 		}
 	}
 }
 
-func retrieveLocalOutputEntries(ctx context.Context, hfs *hashfs.HashFS, root string, inputs []string) []hashfs.UpdateEntry {
-	return hfs.RetrieveUpdateEntriesFromLocal(ctx, root, inputs)
-}
-
-func updateLocalOutputDir(ctx context.Context, hfs *hashfs.HashFS, root, dir string, outputs map[string]hashfs.UpdateEntry) (err error) {
+// updateLocalOutputDir records a locally produced directory output's contents
+// in hashfs, tagging every entry with the producing step's cmdhash. The tag is
+// what makes the subtree survive a state reload as generated output: an
+// untagged directory is dropped by initDir, and an untagged file is reconciled
+// as a source rather than an output.
+func updateLocalOutputDir(ctx context.Context, hfs *hashfs.HashFS, root string, dir path.Path, cmdhash []byte, outputs map[path.Path]hashfs.UpdateEntry) (err error) {
 	started := time.Now()
 	defer func() {
 		if err != nil {
@@ -1010,14 +1356,14 @@ func updateLocalOutputDir(ctx context.Context, hfs *hashfs.HashFS, root, dir str
 		}
 	}()
 
-	entriesFromLocalDir := func(dir string) ([]hashfs.UpdateEntry, error) {
+	entriesFromLocalDir := func(dir path.Path) ([]hashfs.UpdateEntry, error) {
 		dents, err := hfs.ReadDir(ctx, root, dir)
 		if err != nil {
 			return nil, err
 		}
-		names := make([]string, 0, len(dents))
+		names := make([]path.Path, 0, len(dents))
 		for _, dent := range dents {
-			fname := filepath.ToSlash(filepath.Join(dir, dent.Name()))
+			fname := dir.Join(dent.Name())
 			if _, ok := outputs[fname]; ok {
 				continue
 			}
@@ -1046,6 +1392,9 @@ func updateLocalOutputDir(ctx context.Context, hfs *hashfs.HashFS, root, dir str
 	if len(ents) == 0 {
 		return nil
 	}
+	for i := range ents {
+		ents[i].CmdHash = cmdhash
+	}
 	return hfs.Update(ctx, root, ents)
 }
 
@@ -1054,7 +1403,7 @@ func updateLocalOutputDir(ctx context.Context, hfs *hashfs.HashFS, root, dir str
 // by RecordPreOutputs and don't update mtime/is_changed
 // if entry is the same as before.
 func (c *Cmd) computeOutputEntries(entries []hashfs.UpdateEntry, updatedTime time.Time, cmdhash []byte) []hashfs.UpdateEntry {
-	pre := make(map[string]hashfs.UpdateEntry)
+	pre := make(map[path.Path]hashfs.UpdateEntry)
 	if c.Restat || c.RestatContent {
 		// check with previous content recorded by
 		// RecordPreOutputs before execution.
@@ -1063,9 +1412,15 @@ func (c *Cmd) computeOutputEntries(entries []hashfs.UpdateEntry, updatedTime tim
 		}
 	}
 
-	var output string
+	var output path.Path
 	if len(c.Outputs) > 0 {
 		output = c.Outputs[0]
+	} else if len(c.OutputDirs) > 0 {
+		// Dir-only output: attach the edge hash to the declared directory, not
+		// to entries[0] (a flattened child); outputMtime reads the edge hash
+		// from the declared output, and an empty one silently disables
+		// edge-change detection.
+		output = c.OutputDirs[0]
 	}
 	ret := make([]hashfs.UpdateEntry, 0, len(entries))
 	// Set cmdhash, updatedTime.
@@ -1084,9 +1439,7 @@ func (c *Cmd) computeOutputEntries(entries []hashfs.UpdateEntry, updatedTime tim
 		case c.RestatContent:
 			ent.IsChanged = true
 			if pent.Entry != nil && !pent.Entry.Data.IsZero() && ent.Entry != nil && !ent.Entry.Data.IsZero() {
-				// empty file (e.g. stamp file) always
-				// considered as changed
-				ent.IsChanged = pent.Entry.Data.Digest() != ent.Entry.Data.Digest() || ent.Entry.Data.Digest().SizeBytes == 0
+				ent.IsChanged = pent.Entry.Data.Digest() != ent.Entry.Data.Digest()
 			}
 			if ent.IsChanged {
 				ent.ModTime = updatedTime
@@ -1104,58 +1457,57 @@ func (c *Cmd) computeOutputEntries(entries []hashfs.UpdateEntry, updatedTime tim
 
 // RecordOutputsFromLocal records cmd's outputs from local disk in hashfs.
 func (c *Cmd) RecordOutputsFromLocal(ctx context.Context, now time.Time) error {
-	if c.ExecRootInJailDir != "" {
-		// TODO: reconcile output dirs?
-		outputs := slices.Clone(c.Outputs)
-		if c.Depfile != "" && !c.outfiles[c.Depfile] {
-			outputs = append(outputs, c.Depfile)
+	if c.PostProc != nil {
+		err := c.PostProc(ctx, OutermostPaths(c.AllOutputs()))
+		if err != nil {
+			return err
 		}
-		for _, output := range outputs {
-			outputInJail := filepath.Join(c.ExecRootInJailDir, output)
-			outputAbs := filepath.Join(c.WorkspaceRoot, output)
-			if log.V(1) {
-				clog.Infof(ctx, "capture output from jail %q -> %q", outputInJail, outputAbs)
-			}
-			err := os.Rename(outputInJail, outputAbs)
-			if err != nil {
-				return err
-			}
-		}
-
 	}
 	for _, dir := range c.ReconcileOutputdirs {
 		c.HashFS.ForgetMissingsInDir(ctx, c.WorkspaceRoot, dir)
 	}
-	var additionalFiles []string
-	if c.Depfile != "" && !c.outfiles[c.Depfile] {
-		additionalFiles = append(additionalFiles, c.Depfile)
-	}
-	for _, out := range c.Outputs {
+	// AllOutputs includes the depfile, which is never in c.outfiles.
+	var additionalOutputs []path.Path
+	for _, out := range c.AllOutputs() {
 		if !c.outfiles[out] {
-			additionalFiles = append(additionalFiles, out)
+			additionalOutputs = append(additionalOutputs, out)
 		}
 	}
-	if len(additionalFiles) > 0 {
-		sort.Strings(additionalFiles)
-		entries := retrieveLocalOutputEntries(ctx, c.HashFS, c.WorkspaceRoot, additionalFiles)
-		entries = c.computeOutputEntries(entries, now, nil)
-		err := c.HashFS.Update(ctx, c.WorkspaceRoot, entries)
-		if err != nil {
-			return fmt.Errorf("failed to update hashfs from local[additional]: %w", err)
-		}
+	var additionalEntries []hashfs.UpdateEntry
+	if len(additionalOutputs) > 0 {
+		slices.SortFunc(additionalOutputs, func(a, b path.Path) int {
+			if a < b {
+				return -1
+			}
+			if a > b {
+				return 1
+			}
+			return 0
+		})
+		entries := c.HashFS.RetrieveUpdateEntriesFromLocal(ctx, c.WorkspaceRoot, additionalOutputs)
+		additionalEntries = c.computeOutputEntries(entries, now, nil)
 	}
-	var outs []string
+	outs := make([]path.Path, 0, len(c.outfiles))
 	for out := range c.outfiles {
 		outs = append(outs, out)
 	}
-	sort.Strings(outs)
-	entries := retrieveLocalOutputEntries(ctx, c.HashFS, c.WorkspaceRoot, outs)
+	slices.SortFunc(outs, func(a, b path.Path) int {
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	})
+	entries := c.HashFS.RetrieveUpdateEntriesFromLocal(ctx, c.WorkspaceRoot, outs)
 	entries = c.computeOutputEntries(entries, now, c.CmdHash)
+	entries = append(entries, additionalEntries...)
 	err := c.HashFS.Update(ctx, c.WorkspaceRoot, entries)
 	if err != nil {
 		return fmt.Errorf("failed to update hashfs from local: %w", err)
 	}
-	outputs := make(map[string]hashfs.UpdateEntry)
+	outputs := make(map[path.Path]hashfs.UpdateEntry)
 	for _, ent := range entries {
 		outputs[ent.Name] = ent
 	}
@@ -1165,13 +1517,13 @@ func (c *Cmd) RecordOutputsFromLocal(ctx context.Context, now time.Time) error {
 		}
 		// If output is dir, forget non-outputs under dir and retrieve
 		// from local disk.
-		err := updateLocalOutputDir(ctx, c.HashFS, c.WorkspaceRoot, ent.Name, outputs)
+		err := updateLocalOutputDir(ctx, c.HashFS, c.WorkspaceRoot, ent.Name, c.CmdHash, outputs)
 		if err != nil {
 			return fmt.Errorf("failed to update hashfs from local dir %q: %w", ent.Name, err)
 		}
 	}
-	if c.Restat {
-		pre := make(map[string]hashfs.UpdateEntry)
+	if c.Restat || c.RestatContent {
+		pre := make(map[path.Path]hashfs.UpdateEntry)
 		for _, ent := range c.preOutputEntries {
 			pre[ent.Name] = ent
 		}
@@ -1198,16 +1550,26 @@ func (c *Cmd) RecordOutputsFromLocal(ctx context.Context, now time.Time) error {
 				clog.Warningf(ctx, "restat: empty file %q %s->%s", ent.Name, pent.ModTime, ent.ModTime)
 				continue
 			}
-			clog.Warningf(ctx, "restat: changed but not modified %q %s %s->%s", ent.Name, ent.Entry.Data.Digest(), pent.ModTime, ent.ModTime)
+			if c.RestatContent {
+				// Locally written outputs use mtime for restat even
+				// when restat_content is set (computeOutputEntries
+				// checks Restat && IsLocal first). The output is
+				// considered changed here, but would be considered
+				// unchanged if the step had run remotely, so the
+				// results diverge between local and remote execution.
+				clog.Warningf(ctx, "restat_content: local output mtime updated but content unchanged %q %s %s->%s", ent.Name, d, pent.ModTime, ent.ModTime)
+				continue
+			}
+			clog.Warningf(ctx, "restat: changed but not modified %q %s %s->%s", ent.Name, d, pent.ModTime, ent.ModTime)
 		}
 	}
 	return nil
 }
 
 // ResultFromEntries updates result from entries (collected from workspace).
-func ResultFromEntries(ctx context.Context, result *rpb.ActionResult, dir string, entries []merkletree.Entry) {
+func ResultFromEntries(ctx context.Context, fn digest.Function, result *rpb.ActionResult, dir string, entries []merkletree.Entry) {
 	for _, ent := range entries {
-		name, err := filepath.Rel(dir, ent.Name)
+		name, err := filepath.Rel(dir, string(ent.Name))
 		if err != nil {
 			clog.Warningf(ctx, "failed to get rel path %q: %v", ent.Name, err)
 			continue
@@ -1223,7 +1585,7 @@ func ResultFromEntries(ctx context.Context, result *rpb.ActionResult, dir string
 			result.OutputDirectories = append(result.OutputDirectories, &rpb.OutputDirectory{
 				Path: name,
 				// TODO(b/275448031): calculate tree digest from the entry.
-				TreeDigest: digest.Empty.Proto(),
+				TreeDigest: fn.Empty().Proto(),
 			})
 		default:
 			result.OutputFiles = append(result.OutputFiles, &rpb.OutputFile{

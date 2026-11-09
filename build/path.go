@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/path"
 )
 
 // Path manages paths used by the build.
@@ -43,79 +44,94 @@ func (p *Path) Check() error {
 	return nil
 }
 
-// Intern interns the path.
-func (p *Path) Intern(path string) string {
-	return p.intern.Intern(path)
+// Intern interns the path string.
+func (p *Path) Intern(s string) string {
+	return p.intern.Intern(s)
+}
+
+// InternPath interns the path, returning a path.Path that shares storage
+// with other equal paths seen during this build.
+func (p *Path) InternPath(pp path.Path) path.Path {
+	return path.Path(p.intern.Intern(string(pp)))
 }
 
 // MaybeFromRelative attempts to convert base directory relative to workspace path,
 // i.e. workspace root relative path.
 // It logs an error and returns the path as-is if this fails.
-func (p *Path) MaybeFromRelative(ctx context.Context, path string) string {
-	s, err := p.FromRelative(path)
+func (p *Path) MaybeFromRelative(ctx context.Context, s string) string {
+	pp, err := p.FromRelative(s)
 	if err != nil {
-		clog.Warningf(ctx, "Failed to get rel %s, %s: %v", p.WorkspaceRoot, path, err)
-		return path
+		clog.Warningf(ctx, "Failed to get rel %s, %s: %v", p.WorkspaceRoot, s, err)
+		return s
 	}
-	return s
+	return pp
+}
+
+// FromRelativePath is MaybeFromRelative returning a path.Path. Separators are
+// normalized to "/", but ".." is not collapsed: an absolute path outside the
+// workspace may have ".." crossing a symlink that only the OS can resolve.
+func (p *Path) FromRelativePath(ctx context.Context, s string) path.Path {
+	// filepath.ToSlash converts native separators (a no-op on POSIX) without
+	// lexically cleaning "..", unlike path.New.
+	return path.FromClean(filepath.ToSlash(p.MaybeFromRelative(ctx, s)))
 }
 
 // FromRelative converts from base directory relative to workspace path,
 // slash-separated.
 // It keeps absolute path if it is outside of workspace.
-func (p *Path) FromRelative(path string) (string, error) {
-	if path == "" {
+func (p *Path) FromRelative(s string) (string, error) {
+	if s == "" {
 		return "", nil
 	}
-	v, ok := p.m.Load(path)
+	v, ok := p.m.Load(s)
 	if ok {
 		return v.(string), nil
 	}
-	if filepath.IsAbs(path) {
-		rel, err := filepath.Rel(p.WorkspaceRoot, path)
+	if filepath.IsAbs(s) {
+		rel, err := filepath.Rel(p.WorkspaceRoot, s)
 		if err != nil {
 			return "", err
 		}
 		if !filepath.IsLocal(rel) {
-			// use abs path for outside of workspace
-			return path, nil
+			// Absolute paths outside the workspace are returned
+			// byte-identical: callers hand them to tools and OS APIs.
+			return s, nil
 		}
-		rel = filepath.ToSlash(rel)
-		rel = p.intern.Intern(rel)
-		v, _ = p.m.LoadOrStore(path, rel)
+		pp := p.intern.Intern(filepath.ToSlash(rel))
+		v, _ = p.m.LoadOrStore(s, pp)
 		return v.(string), nil
 	}
-	s := filepath.ToSlash(filepath.Join(p.BaseDir, path))
-	s = p.intern.Intern(s)
-	v, _ = p.m.LoadOrStore(path, s)
+	pp := p.intern.Intern(filepath.ToSlash(filepath.Join(p.BaseDir, s)))
+	v, _ = p.m.LoadOrStore(s, pp)
 	return v.(string), nil
 }
 
 // MaybeToRelative converts from workspace path to base directory
 // relative, slash-separated. It keeps absolute path as is.
 // It logs an error and returns the path as-is if this fails.
-func (p *Path) MaybeToRelative(ctx context.Context, path string) string {
-	if path == "" {
+func (p *Path) MaybeToRelative(ctx context.Context, s string) string {
+	if s == "" {
 		return ""
 	}
-	if filepath.IsAbs(path) {
-		return path
+	if filepath.IsAbs(s) {
+		return s
 	}
-	rel, err := filepath.Rel(p.BaseDir, path)
+	rel, err := filepath.Rel(p.BaseDir, s)
 	if err != nil {
-		clog.Warningf(ctx, "Failed to get rel %s, %s: %v", p.BaseDir, path, err)
-		return path
+		clog.Warningf(ctx, "Failed to get rel %s, %s: %v", p.BaseDir, s, err)
+		return s
 	}
-	rel = filepath.ToSlash(rel)
-	return rel
+	// filepath.Rel returns OS-native separators; the contract here is
+	// slash-separated.
+	return filepath.ToSlash(rel)
 }
 
 // AbsFromRelative converts base directory relative to absolute path.
-func (p *Path) AbsFromRelative(path string) string {
-	if filepath.IsAbs(path) {
-		return path
+func (p *Path) AbsFromRelative(s string) string {
+	if filepath.IsAbs(s) {
+		return s
 	}
-	return filepath.Join(p.WorkspaceRoot, p.BaseDir, path)
+	return filepath.Join(p.WorkspaceRoot, p.BaseDir, s)
 }
 
 // AbsBase returns absolute path of base directory.

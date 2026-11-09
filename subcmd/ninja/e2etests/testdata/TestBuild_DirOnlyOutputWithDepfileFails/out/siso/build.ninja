@@ -1,0 +1,18 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# A directory-only edge (trailing-slash output, no file output) that also
+# declares a depfile. There is no file output to key the deps log on, so the
+# build must fail loudly instead of silently dropping the depfile's deps.
+rule gendir
+  command = python3 ../../tools/gendir.py --out_dir=${out_dir} --depfile=${depfile}
+  depfile = ${depfile}
+
+build gen/: gendir | ../../tools/gendir.py
+  out_dir = gen
+  depfile = gen.d
+
+build all: phony gen/
+
+build build.ninja: phony

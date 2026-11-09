@@ -1,0 +1,11 @@
+{{/* Copyright 2026 The Chromium Authors
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file. */}}
+
+{{define "invocation_tabs"}}
+{{/* TODO: we need some sort of "route generator" function because this is brittle. */}}
+<a href="{{.outdirRevBaseURL}}/{{if .useLit}}steps_lit{{else}}steps{{end}}/" class="page-tab {{if or (urlPathHasPrefix .currentURL (printf "%s/steps/" .outdirRevBaseURL)) (urlPathHasPrefix .currentURL (printf "%s/steps_lit/" .outdirRevBaseURL))}}selected{{end}}">Build Steps</a>
+<a href="{{.outdirRevBaseURL}}/{{if .useLit}}details_lit{{else}}details{{end}}/" class="page-tab {{if or (urlPathHasPrefix .currentURL (printf "%s/details/" .outdirRevBaseURL)) (urlPathHasPrefix .currentURL (printf "%s/details_lit/" .outdirRevBaseURL))}}selected{{end}}">Details</a>
+<a href="{{.outdirRevBaseURL}}/{{if .useLit}}logs_lit{{else}}logs{{end}}/" class="page-tab {{if or (urlPathHasPrefix .currentURL (printf "%s/logs/" .outdirRevBaseURL)) (urlPathHasPrefix .currentURL (printf "%s/logs_lit/" .outdirRevBaseURL))}}selected{{end}}">Logs</a>
+<a href="{{.outdirRevBaseURL}}/{{if .useLit}}aggregates_lit{{else}}aggregates{{end}}/" class="page-tab {{if or (urlPathHasPrefix .currentURL (printf "%s/aggregates/" .outdirRevBaseURL)) (urlPathHasPrefix .currentURL (printf "%s/aggregates_lit/" .outdirRevBaseURL))}}selected{{end}}">Performance</a>
+{{end}}

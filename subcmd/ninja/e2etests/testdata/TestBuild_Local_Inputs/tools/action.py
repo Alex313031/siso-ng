@@ -11,14 +11,16 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--out-dir", help="output directory")
   parser.add_argument(
-      "inputs", type=argparse.FileType(), nargs='+', help="input files")
+    "inputs", type=argparse.FileType(), nargs="+", help="input files"
+  )
 
   options = parser.parse_args()
-  for input in options.inputs:
+  for input_file in options.inputs:
     output = os.path.normpath(
-        os.path.join(options.out_dir, "out/siso", input.name))
-    with open(output, mode='w') as w:
-      w.write(input.read())
+      os.path.join(options.out_dir, "out/siso", input_file.name)
+    )
+    with open(output, mode="w") as w:
+      w.write(input_file.read())
 
 
 if __name__ == "__main__":

@@ -8,12 +8,12 @@ import (
 	"errors"
 	"testing"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/reapitest"
 	"go.chromium.org/build/siso/scandeps"
 )
@@ -65,7 +65,7 @@ func TestBuild_ScanDeps_ClangCL_FI(t *testing.T) {
 				OutputFiles: []*rpb.OutputFile{
 					{
 						Path:   "obj/third_party/ffmpeg/m.obj",
-						Digest: digest.Empty.Proto(),
+						Digest: digest.SHA256.Empty().Proto(),
 					},
 				},
 			}, nil
@@ -131,7 +131,7 @@ func TestBuild_ScanDeps_Timeout(t *testing.T) {
 				OutputFiles: []*rpb.OutputFile{
 					{
 						Path:   "obj/third_party/ffmpeg/m.obj",
-						Digest: digest.Empty.Proto(),
+						Digest: digest.SHA256.Empty().Proto(),
 					},
 				},
 			}, nil
@@ -207,7 +207,7 @@ func TestBuild_ScanDeps_StepInputs(t *testing.T) {
 				OutputFiles: []*rpb.OutputFile{
 					{
 						Path:   "obj/base/base.o",
-						Digest: digest.Empty.Proto(),
+						Digest: digest.SHA256.Empty().Proto(),
 					},
 					{
 						Path:   "obj/base/base.o.d",

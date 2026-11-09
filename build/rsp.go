@@ -17,11 +17,12 @@ import (
 
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/ui"
 )
 
 func (b *Builder) setupRSP(ctx context.Context, step *Step) error {
-	rsp := step.cmd.RSPFile
+	rsp := string(step.cmd.RSPFile)
 	if rsp == "" {
 		return nil
 	}
@@ -35,18 +36,18 @@ func (b *Builder) setupRSP(ctx context.Context, step *Step) error {
 		// remove before write to make sure write content to the disk
 		// to avoid chtimes error with "no such file or directory"
 		// when rsp was removed by some other action. b/479933778
-		_, herr := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, rsp)
+		_, herr := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, path.New(rsp))
 		_, lerr := b.hashFS.OS.Lstat(ctx, filepath.Join(step.cmd.WorkspaceRoot, rsp))
 		if herr == nil && errors.Is(lerr, fs.ErrNotExist) {
 			clog.Warningf(ctx, "unexpected rsp remove detected %q", rsp)
-			b.hashFS.Forget(ctx, step.cmd.WorkspaceRoot, []string{rsp})
-			_, herr := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, rsp)
+			b.hashFS.Forget(ctx, step.cmd.WorkspaceRoot, []path.Path{path.Path(rsp)})
+			_, herr := b.hashFS.Stat(ctx, step.cmd.WorkspaceRoot, path.New(rsp))
 			if !errors.Is(herr, fs.ErrNotExist) {
 				clog.Warningf(ctx, "forget, but hashfs detect %q? %v", rsp, herr)
 			}
 		}
 	}
-	err := b.hashFS.WriteFile(ctx, step.cmd.WorkspaceRoot, rsp, content, false, time.Now(), nil, nil)
+	err := b.hashFS.WriteFile(ctx, step.cmd.WorkspaceRoot, path.New(rsp), content, false, time.Now(), nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create rsp %s: %w", rsp, err)
 	}
@@ -55,12 +56,12 @@ func (b *Builder) setupRSP(ctx context.Context, step *Step) error {
 
 func (b *Builder) teardownRSP(ctx context.Context, step *Step) {
 	if b.keepRSP {
-		rsp := step.cmd.RSPFile
+		rsp := string(step.cmd.RSPFile)
 		if rsp != "" {
 			// setupRSP creates rsp file in hashFS memory, but it might not be flushed to disk
 			// if the command was not executed locally (e.g. cache hit).
 			// So we need to explicitly flush it to disk here to keep it.
-			err := b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, []string{rsp})
+			err := b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, []path.Path{path.Path(rsp)})
 			if err != nil {
 				clog.Warningf(ctx, "failed to flush %s: %v", rsp, err)
 				if !errors.Is(err, context.Canceled) {
@@ -70,14 +71,14 @@ func (b *Builder) teardownRSP(ctx context.Context, step *Step) {
 		}
 		return
 	}
-	rsp := step.cmd.RSPFile
+	rsp := string(step.cmd.RSPFile)
 	if rsp == "" {
 		return
 	}
 	if log.V(1) {
 		clog.Infof(ctx, "remove rsp %q", rsp)
 	}
-	err := b.hashFS.Remove(ctx, step.cmd.WorkspaceRoot, rsp)
+	err := b.hashFS.Remove(ctx, step.cmd.WorkspaceRoot, path.New(rsp))
 	if err != nil {
 		clog.Warningf(ctx, "failed to remove %s: %v", rsp, err)
 	}

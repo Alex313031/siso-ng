@@ -17,8 +17,8 @@ def main():
   options = parser.parse_args()
 
   for output in options.outputs:
-    with open(output, 'w') as f:
-      f.write('generate %s from %s' % (output, options.input))
+    with open(output, "w") as f:
+      f.write("generate %s from %s" % (output, options.input))
 
 
 if __name__ == "__main__":

@@ -38,15 +38,39 @@ Use "siso query help [subcommand]" for more information about a subcommand.
 
 func (Command) SetFlags(flagSet *flag.FlagSet) {}
 
+type subcommandEntry struct {
+	cmd   subcommands.Command
+	group string
+}
+
+func subcommandsList() []subcommandEntry {
+	return []subcommandEntry{
+		{cmd: &commandsCommand{}, group: ""},
+		{cmd: &depsCommand{}, group: ""},
+		{cmd: &digraphCommand{}, group: "advanced"},
+		{cmd: &graphCommand{}, group: ""},
+		{cmd: &ideAnalysisCommand{}, group: "advanced"},
+		{cmd: &inputsCommand{}, group: ""},
+		{cmd: &ruleCommand{}, group: ""},
+		{cmd: &targetsCommand{}, group: ""},
+	}
+}
+
+// Subcommands returns the list of subcommands under `query`.
+func Subcommands() []subcommands.Command {
+	entries := subcommandsList()
+	cmds := make([]subcommands.Command, 0, len(entries))
+	for _, entry := range entries {
+		cmds = append(cmds, entry.cmd)
+	}
+	return cmds
+}
+
 func (c Command) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	commander := subcommands.NewCommander(flagSet, c.Name())
-	commander.Register(&commandsCommand{}, "")
-	commander.Register(&depsCommand{}, "")
-	commander.Register(&digraphCommand{}, "advanced")
-	commander.Register(&ideAnalysisCommand{}, "advanced")
-	commander.Register(&inputsCommand{}, "")
-	commander.Register(&ruleCommand{}, "")
-	commander.Register(&targetsCommand{}, "")
+	for _, entry := range subcommandsList() {
+		commander.Register(entry.cmd, entry.group)
+	}
 	commander.Register(commander.HelpCommand(), "command-help")
 	// TODO: add more subcommands?
 	return commander.Execute(ctx)

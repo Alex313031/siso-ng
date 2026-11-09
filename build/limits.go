@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"go.chromium.org/build/siso/o11y/clog"
+	"go.chromium.org/build/siso/reapi"
 	"go.chromium.org/build/siso/subcmd/alex313031"
 	"go.chromium.org/build/siso/ui"
 )
@@ -35,16 +36,20 @@ const (
 // Limits specifies the resource limits used in siso build process.
 // zero limit means default.
 type Limits struct {
-	Step       int
-	Preproc    int
-	ScanDeps   int
-	Local      int
-	FastLocal  int
-	StartLocal int
-	Remote     int
-	REWrap     int
-	Cache      int
-	Thread     int
+	Step          int
+	Preproc       int
+	ScanDeps      int
+	Local         int
+	FastLocal     int
+	StartLocal    int
+	Remote        int
+	REWrap        int
+	Cache         int
+	TwoPhaseCache int
+	// Upload limits the number of CAS upload requests in flight
+	// (reapi.Option.UploadLimit).
+	Upload int
+	Thread int
 }
 
 var (
@@ -69,9 +74,11 @@ func DefaultLimits(ctx context.Context) Limits {
 			Local:     numCPU,
 			FastLocal: limitForFastLocal(numCPU),
 			// TODO(crbug.com/429473708): set reasonable default for StartLocal
-			Remote: limitForRemote(numCPU),
-			REWrap: limitForREWrapper(ctx, numCPU),
-			Cache:  stepLimitFactor * numCPU,
+			Remote:        limitForRemote(numCPU),
+			REWrap:        limitForREWrapper(ctx, numCPU),
+			Cache:         stepLimitFactor * numCPU,
+			TwoPhaseCache: stepLimitFactor * numCPU,
+			Upload:        reapi.DefaultUploadLimit(),
 		}
 		// On many cores machine, it would hit default max thread limit = 10000.
 		// Usually, it would require 1/3 of stepLimit threads (cache miss case?).
@@ -116,6 +123,10 @@ func DefaultLimits(ctx context.Context) Limits {
 				defaultLimits.REWrap = n
 			case "cache":
 				defaultLimits.Cache = n
+			case "two_phase_cache":
+				defaultLimits.TwoPhaseCache = n
+			case "upload":
+				defaultLimits.Upload = n
 			case "thread":
 				defaultLimits.Thread = n
 			default:
@@ -140,13 +151,15 @@ func DefaultLimits(ctx context.Context) Limits {
 func UnitTestLimits(ctx context.Context) Limits {
 	clog.Infof(ctx, "UnitTest mode. limit to 2")
 	return Limits{
-		Step:     2,
-		Preproc:  2,
-		ScanDeps: 2,
-		Local:    2,
-		Remote:   2,
-		REWrap:   2,
-		Cache:    2,
+		Step:          2,
+		Preproc:       2,
+		ScanDeps:      2,
+		Local:         2,
+		Remote:        2,
+		REWrap:        2,
+		Cache:         2,
+		TwoPhaseCache: 2,
+		Upload:        2,
 	}
 }
 

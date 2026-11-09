@@ -9,13 +9,13 @@ import sys
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("input", help="generator input")
-  parser.add_argument("outputs", nargs='*', help="generator output")
+  parser.add_argument("outputs", nargs="*", help="generator output")
   options = parser.parse_args()
 
   with open(options.input) as f:
     data = f.read()
   for output in options.outputs:
-    with open(output, 'w') as f:
+    with open(output, "w") as f:
       f.write(data)
 
 

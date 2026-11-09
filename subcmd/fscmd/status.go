@@ -59,15 +59,6 @@ func (c *statusCommand) run(ctx context.Context) error {
 		return fmt.Errorf("failed to init dir %s: %w", c.outDir, err)
 	}
 
-	hfs, err := hashfs.New(ctx, hashfs.Option{
-		KeepTainted:    true,
-		SetStateLogger: os.Stdout,
-	})
-	if err != nil {
-		return fmt.Errorf("hashfs.New: %w", err)
-	}
-	defer hfs.Close(ctx)
-
 	started := time.Now()
 	st, err := hashfs.Load(ctx, hashfs.Option{
 		StateFile: c.stateFile,
@@ -77,10 +68,15 @@ func (c *statusCommand) run(ctx context.Context) error {
 	}
 	fmt.Printf("load fs state %s\n", time.Since(started))
 
-	err = hfs.SetState(ctx, st)
+	hfs, err := hashfs.NewFromState(ctx, st, hashfs.Option{
+		KeepTainted:    true,
+		SetStateLogger: os.Stdout,
+	})
 	if err != nil {
-		return fmt.Errorf("set state: %w", err)
+		return fmt.Errorf("hashfs state: %w", err)
 	}
+	defer hfs.Close(ctx)
+
 	err = hfs.WaitReady(ctx)
 	if err != nil {
 		return fmt.Errorf("wait ready: %w", err)

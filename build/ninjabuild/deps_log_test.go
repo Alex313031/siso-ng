@@ -5,6 +5,7 @@
 package ninjabuild
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -287,5 +288,112 @@ func TestDepsLog_broken(t *testing.T) {
 	err = dl3.Close()
 	if err != nil {
 		t.Errorf("dl3.Close=%v; want nil error", err)
+	}
+}
+
+func TestRecompact_DroppedPath(t *testing.T) {
+	ctx := t.Context()
+	fname := filepath.Join(t.TempDir(), "mydepslog")
+	createNewDepsLogFile(ctx, fname)
+	dl, err := newDepsLog(ctx, fname)
+	if err != nil {
+		t.Fatalf("newDepsLog(ctx, %q)=_, %v; want nil err", fname, err)
+	}
+	defer func() {
+		if err := dl.Close(); err != nil {
+			t.Errorf("dl.Close()=%v; want nil err", err)
+		}
+	}()
+
+	key1 := DepsLogKey{Target: "out.o", Mtime: time.Unix(1, 0)}
+	key2 := DepsLogKey{Target: "other_out.o", Mtime: time.Unix(2, 0)}
+	if _, err := dl.Record(ctx, key1, []string{"foo.h", "bar.h"}); err != nil {
+		t.Fatalf("dl.Record(out.o)=%v", err)
+	}
+	if _, err := dl.Record(ctx, key2, []string{"foo.h", "baz.h"}); err != nil {
+		t.Fatalf("dl.Record(other_out.o)=%v", err)
+	}
+	// Drop "bar.h" from out.o so "bar.h" is no longer referenced by any entry.
+	key1Updated := DepsLogKey{Target: "out.o", Mtime: time.Unix(3, 0)}
+	if _, err := dl.Record(ctx, key1Updated, []string{"foo.h"}); err != nil {
+		t.Fatalf("dl.Record(out.o updated)=%v", err)
+	}
+	dl.Reset()
+	dl.needsRecompact = true
+	if err := dl.recompactIfNeeded(ctx); err != nil {
+		t.Fatalf("dl.recompactIfNeeded(ctx)=%v; want nil err", err)
+	}
+
+	if _, _, err := dl.RetrievePaths(ctx, "bar.h"); !errors.Is(err, ErrNoDepsLog) {
+		t.Errorf(`dl.RetrievePaths(ctx, "bar.h")=_, _, %v; want %v`, err, ErrNoDepsLog)
+	}
+	if _, _, err := dl.RetrieveIDs(ctx, "bar.h"); !errors.Is(err, ErrNoDepsLog) {
+		t.Errorf(`dl.RetrieveIDs(ctx, "bar.h")=_, _, %v; want %v`, err, ErrNoDepsLog)
+	}
+}
+
+func TestRecord_SnapshotIsolation(t *testing.T) {
+	ctx := t.Context()
+	fname := filepath.Join(t.TempDir(), "mydepslog")
+
+	t.Logf("-- Case 1: Record after newDepsLog (initial load)")
+	createNewDepsLogFile(ctx, fname)
+	dl, err := newDepsLog(ctx, fname)
+	if err != nil {
+		t.Fatalf("newDepsLog(ctx, %q)=_, %v; want nil err", fname, err)
+	}
+	key1 := DepsLogKey{Target: "out.o", Mtime: time.Unix(1, 0)}
+	if _, err := dl.Record(ctx, key1, []string{"foo.h", "bar.h"}); err != nil {
+		t.Fatalf("dl.Record(out.o)=%v", err)
+	}
+	if err := dl.Close(); err != nil {
+		t.Fatalf("dl.Close()=%v", err)
+	}
+
+	dl, err = newDepsLog(ctx, fname)
+	if err != nil {
+		t.Fatalf("newDepsLog(ctx, %q)=_, %v; want nil err", fname, err)
+	}
+	key1Updated := DepsLogKey{Target: "out.o", Mtime: time.Unix(2, 0)}
+	if _, err := dl.Record(ctx, key1Updated, []string{"foo.h"}); err != nil {
+		t.Fatalf("dl.Record(out.o updated)=%v", err)
+	}
+	// Before Reset, RetrievePaths must still return the snapshot from newDepsLog.
+	deps, key, err := dl.RetrievePaths(ctx, "out.o")
+	want := []string{"foo.h", "bar.h"}
+	if !cmp.Equal(deps, want) || !cmp.Equal(key, key1) || err != nil {
+		t.Errorf("before Reset (after load): RetrievePaths(out.o)=%v, %v, %v; want %v, %v, nil", deps, key, err, want, key1)
+	}
+
+	t.Logf("-- Case 2: Record after Reset")
+	dl.Reset()
+	key1Updated2 := DepsLogKey{Target: "out.o", Mtime: time.Unix(3, 0)}
+	if _, err := dl.Record(ctx, key1Updated2, []string{"baz.h"}); err != nil {
+		t.Fatalf("dl.Record(out.o updated 2)=%v", err)
+	}
+	deps, key, err = dl.RetrievePaths(ctx, "out.o")
+	want = []string{"foo.h"}
+	if !cmp.Equal(deps, want) || !cmp.Equal(key, key1Updated) || err != nil {
+		t.Errorf("before Reset (after Reset): RetrievePaths(out.o)=%v, %v, %v; want %v, %v, nil", deps, key, err, want, key1Updated)
+	}
+
+	t.Logf("-- Case 3: Record after recompactIfNeeded")
+	dl.Reset()
+	dl.needsRecompact = true
+	if err := dl.recompactIfNeeded(ctx); err != nil {
+		t.Fatalf("dl.recompactIfNeeded(ctx)=%v", err)
+	}
+	key1Updated3 := DepsLogKey{Target: "out.o", Mtime: time.Unix(4, 0)}
+	if _, err := dl.Record(ctx, key1Updated3, []string{"qux.h"}); err != nil {
+		t.Fatalf("dl.Record(out.o updated 3)=%v", err)
+	}
+	deps, key, err = dl.RetrievePaths(ctx, "out.o")
+	want = []string{"baz.h"}
+	if !cmp.Equal(deps, want) || !cmp.Equal(key, key1Updated2) || err != nil {
+		t.Errorf("before Reset (after recompactIfNeeded): RetrievePaths(out.o)=%v, %v, %v; want %v, %v, nil", deps, key, err, want, key1Updated2)
+	}
+
+	if err := dl.Close(); err != nil {
+		t.Fatalf("dl.Close()=%v", err)
 	}
 }

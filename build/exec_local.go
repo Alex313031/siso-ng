@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"slices"
 	"time"
 
@@ -18,23 +19,43 @@ import (
 
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/path"
 )
 
 func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 	ctx, span := trace.NewSpan(ctx, "exec-local")
 	defer span.Close(nil)
-	clog.Infof(ctx, "exec local %s", step.cmd.Desc)
-
+	if b.allowTwoPhaseCaching(step) {
+		// TODO: no two phase caching when rewrapper is used?
+		ok, err := b.twoPhaseCachingLookup(ctx, step)
+		if ok {
+			return err
+		}
+	}
+	ensureExpanded(ctx, b, step)
+	sandbox, sandboxOption := b.selectSandbox(ctx, step)
+	clog.Infof(ctx, "exec local %s sandbox:%s", step.cmd.Desc, sandbox)
 	step.setPhase(stepInput)
 	err := b.prepareLocalInputs(ctx, step)
 	if err != nil && !experiments.Enabled("ignore-missing-local-inputs", "step %s missing inputs: %v", step, err) {
 		return err
 	}
-	step.cmd.RecordPreOutputs(ctx)
+	if experiments.Enabled("disable-ensure-output-dirs", "") {
+		// disable-ensure-output-dirs doesn't create out dirs during
+		// scheduling, so that it needs to make sure output dirs
+		// before each local exec.
+		err := b.prepareLocalOutdirs(ctx, step)
+		if err != nil {
+			return err
+		}
+	}
+	if err := b.resetDirOutputs(ctx, step); err != nil {
+		return err
+	}
 
 	stateMessage := "local exec"
 	var stateMessagePrefix string
@@ -47,9 +68,8 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 	}
 	phase := stepLocalRun
 	var executor execute.Executor = b.localExec
-	logLocalExec := b.logLocalExec
 
-	switch sandbox, sandboxOption := selectSandbox(ctx, step); sandbox {
+	switch sandbox {
 	case "nsjail":
 		stateMessagePrefix = "nsjail "
 		nsjailExecutor, err := newNSJailExecutor(ctx, b, executor, sandboxOption)
@@ -57,7 +77,6 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 			return fmt.Errorf("unable to perform nsjail: %w", err)
 		}
 		executor = nsjailExecutor
-		logLocalExec = nsjailExecutor.logLocalExec
 		defer func() {
 			if retErr != nil {
 				clog.Warningf(ctx, "failed to run nsjail: %v", retErr)
@@ -73,14 +92,20 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 		if sandboxOption["enforce_depfile_only_promotes"] != "false" {
 			step.enforceDepfileOnlyPromotes = true
 		}
-
+	case "landlock":
+		landlockExecutor := newLandlockExecutor(executor, sandboxOption)
+		executor = landlockExecutor
+		step.metrics.Sandbox = true
+		// enforceDepfileOnlyPromotes defaults to true for an landlock-sandboxed action
+		if sandboxOption["enforce_depfile_only_promotes"] != "false" {
+			step.enforceDepfileOnlyPromotes = true
+		}
 	case "file-access-trace":
 		traceExecutor, err := newFileTraceExecutor(ctx, b, executor)
 		if err != nil {
 			return fmt.Errorf("unable to perform file-access-trace: %w", err)
 		}
 		executor = traceExecutor
-		logLocalExec = traceExecutor.logLocalExec
 		// Normally, file-access-trace doesn't do any enforcement. But it's the more
 		// convenient sandbox to use in tests, so we allow enabling depfile enforcement.
 		if sandboxOption["enforce_depfile_only_promotes"] == "true" {
@@ -89,7 +114,7 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 	case "":
 		// no sandbox. ignore
 	default:
-		clog.Warningf(ctx, "unsupported sandbox %q", sandbox)
+		return fmt.Errorf("unsupported sandbox %q", sandbox)
 	}
 
 	if step.def.Binding("use_remote_exec_wrapper") != "" {
@@ -137,6 +162,12 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 		return err
 	})
 	if !errors.Is(err, context.Canceled) {
+		logLocalExec := b.logLocalExec
+		if le, ok := executor.(interface {
+			logLocalExec(context.Context, *Step, time.Duration) error
+		}); ok {
+			logLocalExec = le.logLocalExec
+		}
 		lerr := logLocalExec(ctx, step, dur)
 		if err == nil {
 			err = lerr
@@ -144,8 +175,14 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 	}
 	// Beyond this point, we should be marking the step done.  Do that as we leave the function.
 	defer func() {
-		step.metrics.RunTime = IntervalMetric(time.Since(started))
-		step.metrics.done(ctx, step, b.start)
+		if !started.IsZero() {
+			span.Add(ctx, trace.SpanData{
+				Name:  spanExecLocalRun,
+				Start: started,
+				End:   time.Now(),
+			})
+		}
+		step.metrics.done(ctx, b, step, b.start)
 	}()
 	if err != nil {
 		return err
@@ -158,15 +195,55 @@ func (b *Builder) execLocal(ctx context.Context, step *Step) (retErr error) {
 	if err != nil {
 		return err
 	}
-	b.cacheWrite(ctx, step)
-	// TODO: check error for cacheWrite?
-	// TODO: record for two phase caching
+	if ctx.Err() == nil {
+		// check allowCacheWrite after tapCanonicalCmd.
+		// step.cmd.Pure may have been set true in updateDeps,
+		// but set it in tapCanonicalizeCmd.
+		if step.metrics.TwoPhaseCachingKey != "" {
+			if experiments.Enabled("expand-phony-trigger-inputs", "") {
+				// ensureExpanded populated step.cmd.Inputs with ExpandedInputs
+				// (including order-only and any over-specified trigger inputs)
+				// to materialize local inputs before execution. Clear it before
+				// tapCanonicalizeCmd (which appends tapData.Reads to cmd.Inputs)
+				// so the Phase 2 Action key records only inputs actually read
+				// during execution.
+				step.cmd.Inputs = nil
+			}
+			err := b.tapCanonicalizeCmd(ctx, step.cmd)
+			if err != nil {
+				if !errors.Is(err, errNoTapData) {
+					clog.Errorf(ctx, "two phase caching: canonicalize cmd %v", err)
+				} else if b.reCacheEnableWrite {
+					clog.Warningf(ctx, "two phase caching: canonicalize cmd %v", err)
+				}
+			} else if b.allowCacheWrite(step) {
+				err := b.cacheWrite(ctx, step)
+				if errors.Is(err, errNoCacheWrite) {
+					clog.Infof(ctx, "two phase cache: write ignored %q: %v", step.metrics.TwoPhaseCachingKey, err)
+				} else if err != nil {
+					clog.Warningf(ctx, "two phase cache: write failed %q: %v", step.metrics.TwoPhaseCachingKey, err)
+				} else {
+					err := b.twoPhaseCaching.Add(ctx, step.metrics.TwoPhaseCachingKey, step)
+					if err != nil {
+						clog.Warningf(ctx, "two phase caching: add %v", err)
+					}
+				}
+			}
+		} else if b.allowCacheWrite(step) {
+			err := b.cacheWrite(ctx, step)
+			if errors.Is(err, errNoCacheWrite) {
+				clog.Infof(ctx, "cache write ignored: %v", err)
+			} else if err != nil {
+				clog.Warningf(ctx, "cache write failed: %v", err)
+			}
+		}
+	}
 	return nil
 	// no need to call b.outputs, as all outputs are already on disk
 	// so no need to flush.
 }
 
-func selectSandbox(ctx context.Context, step *Step) (string, map[string]string) {
+func (b *Builder) selectSandbox(ctx context.Context, step *Step) (string, map[string]string) {
 	sandbox := step.def.Sandbox()
 	if sandbox["backend"] != "" {
 		return sandbox["backend"], sandbox
@@ -192,20 +269,31 @@ func selectSandbox(ctx context.Context, step *Step) (string, map[string]string) 
 	return "file-access-trace", nil
 }
 
+func (b *Builder) allowCacheWrite(step *Step) bool {
+	// Cache write must be enabled
+	if b.reapiclient == nil || !b.reCacheEnableWrite {
+		return false
+	}
+	// step must have pure inputs/outputs
+	if !step.cmd.Pure {
+		return false
+	}
+	// Upload if remotable steps or two phase caching
+	return b.allowRemote(step) || b.allowTwoPhaseCaching(step)
+}
+
+var errNoCacheWrite = errors.New("no cache write")
+
 // Uploads and sets local execution result in RE if builder is trusted
 // Note: currently does not work with layered cache and blocks on digest calculation
 // Note: local step does not fail if cache-write fails but error and metrics are logged
-func (b *Builder) cacheWrite(ctx context.Context, step *Step) {
-	// Cache write must be enabled and step must have pure inputs/outputs
-	if b.reapiclient == nil || !b.reCacheEnableWrite || !step.cmd.Pure {
-		return
+func (b *Builder) cacheWrite(ctx context.Context, step *Step) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", errNoCacheWrite, context.Cause(ctx))
 	}
-
-	// Upload only remotable steps
-	if !b.allowRemote(step) {
-		return
+	if !b.allowCacheWrite(step) {
+		return errNoCacheWrite
 	}
-
 	err := func() error {
 		ctx, span := trace.NewSpan(ctx, "cache-write")
 		defer span.Close(nil)
@@ -216,13 +304,14 @@ func (b *Builder) cacheWrite(ctx context.Context, step *Step) {
 		// Action digests are lazily computed for local so they are not available at this point
 		cmd := step.cmd
 		result, _ := cmd.ActionResult()
-		ds := digest.NewStore()
+		ds := blob.NewStore()
 		actionDigest, err := cmd.Digest(ctx, ds)
 
 		if err != nil {
 			clog.Warningf(ctx, "failed to compute digest for trusted local upload: %v", err)
 			return err
 		}
+		step.metrics.Digest = actionDigest.String()
 
 		var metadata *rpb.ExecutedActionMetadata
 		if md := result.GetExecutionMetadata(); md != nil {
@@ -238,6 +327,11 @@ func (b *Builder) cacheWrite(ctx context.Context, step *Step) {
 			OutputFiles:       result.GetOutputFiles(),
 			OutputSymlinks:    result.GetOutputSymlinks(),
 			OutputDirectories: result.GetOutputDirectories(),
+
+			// deprecated as of v2.1
+			OutputFileSymlinks:      result.GetOutputFileSymlinks(),      //nolint:staticcheck // existing deprecation
+			OutputDirectorySymlinks: result.GetOutputDirectorySymlinks(), //nolint:staticcheck // existing deprecation
+
 			ExitCode:          result.GetExitCode(),
 			StdoutRaw:         result.GetStdoutRaw(),
 			StderrRaw:         result.GetStderrRaw(),
@@ -246,33 +340,32 @@ func (b *Builder) cacheWrite(ctx context.Context, step *Step) {
 			ExecutionMetadata: metadata,
 		}
 
-		// Retrieve and compute output digests from HashFS on the action
-		hashFS := b.hashFS
-		outputEntries, err := hashFS.Entries(ctx, cmd.WorkspaceRoot, cmd.AllOutputs())
-		if err != nil {
-			return err
-		}
-
 		// Convert rawStdout to digest since RE spec v2 prohibits inlining
 		if len(result.GetStdoutRaw()) != 0 && result.GetStdoutDigest() == nil {
-			stdoutDigest := digest.FromBytes("stdout", result.GetStdoutRaw())
+			stdoutDigest := blob.FromBytes(b.hashFS.DigestFunction(), "stdout", result.GetStdoutRaw())
 			result.StdoutDigest = stdoutDigest.Digest().Proto()
+			if log.V(1) {
+				clog.Infof(ctx, "stdout digest %s", stdoutDigest.Digest())
+			}
 			ds.Set(stdoutDigest)
 		}
 		result.StdoutRaw = nil
 
 		// Convert rawStderr to digest since RE spec v2 prohibits inlining
 		if len(result.GetStderrRaw()) != 0 && result.GetStderrDigest() == nil {
-			stderrDigest := digest.FromBytes("stderr", result.GetStderrRaw())
+			stderrDigest := blob.FromBytes(b.hashFS.DigestFunction(), "stderr", result.GetStderrRaw())
 			result.StderrDigest = stderrDigest.Digest().Proto()
+			if log.V(1) {
+				clog.Infof(ctx, "stderr digest %s", stderrDigest.Digest())
+			}
 			ds.Set(stderrDigest)
 		}
 		result.StderrRaw = nil
 
-		// Set the outputs on the result
-		execute.ResultFromEntries(ctx, result, cmd.WorkDir, outputEntries)
-		for _, entry := range outputEntries {
-			ds.Set(entry.Data)
+		// Populate output files (and a real tree per directory output) from
+		// the command's typed outputs, recording their blobs in ds.
+		if err := cmd.SetResultOutputs(ctx, result, ds); err != nil {
+			return fmt.Errorf("set result outputs: %w", err)
 		}
 
 		step.setPhase(phase.wait())
@@ -284,7 +377,12 @@ func (b *Builder) cacheWrite(ctx context.Context, step *Step) {
 				return err
 			}
 			// Now set the action result in RE
-			return b.reapiclient.UpdateActionResult(ctx, actionDigest, result)
+			err := b.reapiclient.UpdateActionResult(ctx, actionDigest, result)
+			if err != nil {
+				clog.Warningf(ctx, "failed to write action result: %v\n%s", err, result)
+				return fmt.Errorf("update action result for %s: %w", actionDigest, err)
+			}
+			return nil
 		})
 		return err
 	}()
@@ -293,8 +391,8 @@ func (b *Builder) cacheWrite(ctx context.Context, step *Step) {
 		b.progressStepCacheWrite(step)
 	} else {
 		step.metrics.CacheWriteErr = true
-		clog.Warningf(ctx, "cache write failed %s: %v", step.cmd.Desc, err)
 	}
+	return err
 }
 
 func (b *Builder) prepareLocalInputs(ctx context.Context, step *Step) error {
@@ -306,9 +404,10 @@ func (b *Builder) prepareLocalInputs(ctx context.Context, step *Step) error {
 	if log.V(1) {
 		clog.Infof(ctx, "prepare-local-inputs %d", len(inputs))
 	}
+	_, mspan := trace.NewSpan(ctx, spanMaterializeInputs)
 	err := b.hashFS.Flush(ctx, step.cmd.WorkspaceRoot, inputs)
+	mspan.Close(nil)
 	clog.Infof(ctx, "prepare-local-inputs %d %s: %v", len(inputs), time.Since(start), err)
-	step.metrics.MaterializeInputsTime = IntervalMetric(time.Since(start))
 	if errors.Is(err, context.Canceled) {
 		return err
 	}
@@ -333,13 +432,50 @@ func (b *Builder) prepareLocalInputs(ctx context.Context, step *Step) error {
 	return err
 }
 
+func (b *Builder) prepareLocalOutdirs(ctx context.Context, step *Step) error {
+	ctx, span := trace.NewSpan(ctx, "prepare-local-outdirs")
+	defer span.Close(nil)
+
+	seen := make(map[path.Path]bool)
+	for _, out := range step.cmd.Outputs {
+		outdir := out.Dir()
+		if seen[outdir] {
+			continue
+		}
+		if fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, outdir); err == nil && fi.IsDir() {
+			seen[outdir] = true
+			continue
+		}
+		clog.Infof(ctx, "prepare outdirs %s", outdir)
+		err := b.hashFS.Mkdir(ctx, b.path.WorkspaceRoot, outdir, nil, nil)
+		if err != nil {
+			return fmt.Errorf("prepare outdir %q: %w", outdir, err)
+		}
+		seen[outdir] = true
+	}
+	return nil
+}
+
+// resetDirOutputs wipes each declared directory output before the command runs,
+// so a rerun with fewer files leaves no stale members. The action recreates the
+// dir itself (siso doesn't), matching the REAPI worker. Call after
+// RecordPreOutputs: it removes the prior tree restat compares against.
+func (b *Builder) resetDirOutputs(ctx context.Context, step *Step) error {
+	for _, dir := range step.cmd.OutputDirs {
+		if err := b.hashFS.ResetDirOutput(ctx, step.cmd.WorkspaceRoot, string(dir)); err != nil {
+			return fmt.Errorf("reset dir output %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // checkLocalOutputs checks if all outputs are on local disk.
 // If not, it returns error.
 // It ignores missing outputs added by siso config.
 func (b *Builder) checkLocalOutputs(ctx context.Context, step *Step) error {
 	ctx, span := trace.NewSpan(ctx, "capture-local-outputs")
 	defer span.Close(nil)
-	span.SetAttr("outputs", len(step.cmd.Outputs))
+	span.SetAttr("outputs", len(step.cmd.Outputs)+len(step.cmd.OutputDirs))
 	result, _ := step.cmd.ActionResult()
 	if result.GetExitCode() != 0 {
 		return nil
@@ -351,10 +487,18 @@ func (b *Builder) checkLocalOutputs(ctx context.Context, step *Step) error {
 
 	defOutputs := step.def.Outputs(ctx)
 
-	for _, out := range step.cmd.Outputs {
-		_, err := step.cmd.HashFS.Stat(ctx, step.cmd.WorkspaceRoot, out)
+	var dirFsys fs.FS
+	if len(step.cmd.OutputDirs) > 0 {
+		dirFsys = step.cmd.HashFS.FileSystem(ctx, step.cmd.WorkspaceRoot)
+	}
+	// Check declared outputs only; the depfile is not declared (updateDeps handles it).
+	for i, out := range step.cmd.DeclaredOutputs() {
+		fi, err := step.cmd.HashFS.Stat(ctx, step.cmd.WorkspaceRoot, out)
 		if err != nil {
-			required := slices.Contains(defOutputs, out)
+			b.targets.Store(string(out), targetState{
+				dirtyErr: err,
+			})
+			required := isRequiredOutput(out, defOutputs)
 			if !required {
 				clog.Warningf(ctx, "ignore missing outputs %s: %v", out, err)
 				continue
@@ -366,10 +510,36 @@ func (b *Builder) checkLocalOutputs(ctx context.Context, step *Step) error {
 			}
 			return fmt.Errorf("missing local outputs %s: %w", out, err)
 		}
+		isDir := i >= len(step.cmd.Outputs)
+		mtime, walkErr := effectiveMtime(dirFsys, string(out), fi.ModTime(), isDir)
+		if walkErr != nil {
+			b.targets.Store(string(out), targetState{
+				dirtyErr: walkErr,
+			})
+			if isRequiredOutput(out, defOutputs) && !experiments.Enabled("ignore-missing-outputs", "") {
+				return fmt.Errorf("walk dir output %s: %w", out, walkErr)
+			}
+			clog.Warningf(ctx, "walk dir output %s: %v", out, walkErr)
+			continue
+		}
+		b.targets.Store(string(out), targetState{
+			mtime:   mtime,
+			changed: fi.IsChanged(),
+		})
 	}
 	// don't set result.OutputFiles etc to lazily calculate digest
 	// for outputs. b/311312613
 	return nil
+}
+
+// isRequiredOutput reports whether out is a declared (required) output. It
+// matches both slash forms since defOutputs keeps a dir target's trailing
+// slash while out (from cmd.AllOutputs) has it stripped.
+func isRequiredOutput(out path.Path, defOutputs []path.Path) bool {
+	if slices.Contains(defOutputs, out) {
+		return true
+	}
+	return slices.Contains(defOutputs, out+"/")
 }
 
 func (b *Builder) logLocalExec(ctx context.Context, step *Step, dur time.Duration) error {
@@ -380,7 +550,7 @@ func (b *Builder) logLocalExec(ctx context.Context, step *Step, dur time.Duratio
 	allOutputs := step.cmd.AllOutputs()
 	var output string
 	if len(allOutputs) > 0 {
-		output = allOutputs[0]
+		output = string(allOutputs[0])
 	}
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, `cmd: %s pure:%t/unknown restat:%t %s

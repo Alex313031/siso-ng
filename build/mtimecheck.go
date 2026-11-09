@@ -10,18 +10,40 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io/fs"
+	"sync"
 	"time"
 
 	log "github.com/golang/glog"
 
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 )
 
 type targetState struct {
 	dirtyErr error
 	mtime    time.Time
 	changed  bool
+}
+
+// targetMap records per-target state during a build, normalizing the key
+// (DirTargetPath) so a directory artifact stored as "gen/" and looked up as
+// "gen" (or vice versa) always meet under the same key.
+type targetMap struct {
+	m sync.Map
+}
+
+func (t *targetMap) Store(target string, st targetState) {
+	t.m.Store(DirTargetPath(target), st)
+}
+
+func (t *targetMap) Load(target string) (targetState, bool) {
+	v, ok := t.m.Load(DirTargetPath(target))
+	if !ok {
+		return targetState{}, false
+	}
+	return v.(targetState), true
 }
 
 // needToRun checks whether step needs to run or not.
@@ -35,7 +57,7 @@ func (b *Builder) needToRun(ctx context.Context, stepDef StepDef, stepManifest *
 			dirtyErr = err
 		}
 		for _, outpath := range stepManifest.outputs {
-			b.targets.Store(outpath, targetState{
+			b.targets.Store(string(outpath), targetState{
 				dirtyErr: dirtyErr,
 				mtime:    mtime,
 			})
@@ -62,7 +84,7 @@ func (b *Builder) checkUpToDate(ctx context.Context, stepDef StepDef, stepManife
 
 	// TODO(b/288419130): make sure it covers all cases as ninja does.
 
-	outname := b.path.MaybeToRelative(ctx, out0)
+	outname := b.path.MaybeToRelative(ctx, string(out0))
 	lastInName := b.path.MaybeToRelative(ctx, lastIn)
 	if err != nil {
 		clog.Infof(ctx, "need %v", err)
@@ -138,8 +160,8 @@ func (b *Builder) checkUpToDate(ctx context.Context, stepDef StepDef, stepManife
 	if depFile != "" {
 		numOuts++
 	}
-	localOutputs := make([]string, 0, numOuts)
-	seen := make(map[string]bool)
+	localOutputs := make([]path.Path, 0, numOuts)
+	seen := make(map[path.Path]bool)
 	for _, outPath := range stepManifest.outputs {
 		if seen[outPath] {
 			continue
@@ -181,14 +203,15 @@ func (b *Builder) checkUpToDate(ctx context.Context, stepDef StepDef, stepManife
 
 // outputMtime returns the oldest modified output, its timestamp and
 // command hash / edge hash that produced the outputs of the step.
-func outputMtime(ctx context.Context, b *Builder, outputs []string, restat bool) (string, time.Time, []byte, []byte) {
+func outputMtime(ctx context.Context, b *Builder, outputs []path.Path, restat bool) (path.Path, time.Time, []byte, []byte) {
 	var oerr error
 	var outmtime time.Time
 	var outcmdhash []byte
 	var edgehash []byte
-	out0 := ""
+	var out0 path.Path
 	for i, outPath := range outputs {
-		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, outPath)
+		statPath := DirTargetPath(string(outPath))
+		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, path.New(statPath))
 		if err != nil {
 			if oerr == nil {
 				out0 = outPath
@@ -214,6 +237,16 @@ func outputMtime(ctx context.Context, b *Builder, outputs []string, restat bool)
 			t = fi.UpdatedTime()
 		} else {
 			t = fi.ModTime()
+		}
+		t, walkErr := effectiveMtime(b.hashFS.FileSystem(ctx, b.path.WorkspaceRoot), statPath, t, IsDirTarget(string(outPath)))
+		if walkErr != nil {
+			// Can't determine the output's mtime: signal not-up-to-date.
+			if oerr == nil {
+				out0 = outPath
+				oerr = walkErr
+			}
+			clog.Warningf(ctx, "walk dir output %s: %v", outPath, walkErr)
+			continue
 		}
 		if outmtime.IsZero() {
 			outmtime = t
@@ -244,17 +277,14 @@ func inputMtime(ctx context.Context, b *Builder, stepDef StepDef) (string, time.
 		return "", inmtime, fmt.Errorf("failed to load deps: %w", err)
 	}
 	var retErr error
-	appendSeq(ins, depsIter)(func(in string) bool {
+	appendSeq(ins, depsIter)(func(in path.Path) bool {
 		var mtime time.Time
 		var changed bool
-		v, ok := b.targets.Load(in)
+		isDir := IsDirTarget(string(in))
+		lookupPath := DirTargetPath(string(in))
+		ts, ok := b.targets.Load(string(in))
 		if ok {
 			// seen/phony target
-			ts, ok := v.(targetState)
-			if !ok {
-				retErr = fmt.Errorf("unexpected value in b.targets for %s: %T", in, v)
-				return false
-			}
 			if ts.dirtyErr != nil {
 				retErr = fmt.Errorf("input %s: %w", in, ts.dirtyErr)
 				return false
@@ -263,7 +293,7 @@ func inputMtime(ctx context.Context, b *Builder, stepDef StepDef) (string, time.
 			changed = ts.changed
 		} else {
 			fsys := b.hashFS.FileSystem(ctx, b.path.WorkspaceRoot)
-			fi, err := fsys.Stat(in)
+			fi, err := fsys.StatMtime(lookupPath)
 			if log.V(1) {
 				clog.Infof(ctx, "input %q -> %v", in, err)
 			}
@@ -285,20 +315,30 @@ func inputMtime(ctx context.Context, b *Builder, stepDef StepDef) (string, time.
 				}
 			}
 			if err != nil {
-				b.targets.Store(in, targetState{
+				b.targets.Store(lookupPath, targetState{
 					dirtyErr: err,
 				})
 				retErr = fmt.Errorf("input %s: %w", in, err)
 				return false
 			}
-			b.targets.Store(in, targetState{
+			emtime, walkErr := effectiveMtime(fsys, lookupPath, mtime, isDir)
+			if walkErr != nil {
+				// Can't determine the input's state: treat as a rebuild reason.
+				b.targets.Store(lookupPath, targetState{
+					dirtyErr: walkErr,
+				})
+				retErr = fmt.Errorf("input %s: %w", in, walkErr)
+				return false
+			}
+			mtime = emtime
+			b.targets.Store(lookupPath, targetState{
 				mtime:   mtime,
 				changed: changed,
 			})
 		}
 		if inmtime.Before(mtime) {
 			inmtime = mtime
-			lastIn = in
+			lastIn = string(in)
 		}
 		if changed {
 			retErr = fmt.Errorf("input %s: %w", in, errDirty)
@@ -312,19 +352,58 @@ func inputMtime(ctx context.Context, b *Builder, stepDef StepDef) (string, time.
 	return lastIn, inmtime, nil
 }
 
-func appendSeq(ins []string, iter func(func(string) bool)) func(yield func(string) bool) {
+// effectiveMtime returns base for a file, or the newest mtime in the tree for
+// a directory artifact (a directory's own mtime ignores deep changes). On a walk
+// error it returns base and the error.
+func effectiveMtime(fsys fs.FS, statPath string, base time.Time, isDir bool) (time.Time, error) {
+	if !isDir {
+		return base, nil
+	}
+	eff, err := dirEffectiveMtime(fsys, statPath)
+	if err != nil {
+		return base, err
+	}
+	if eff.After(base) {
+		return eff, nil
+	}
+	return base, nil
+}
+
+// dirEffectiveMtime walks a directory recursively and returns the maximum mtime across all files and subdirectories.
+func dirEffectiveMtime(fsys fs.FS, dir string) (time.Time, error) {
+	var maxMtime time.Time
+	err := fs.WalkDir(fsys, dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.ModTime().After(maxMtime) {
+			maxMtime = info.ModTime()
+		}
+		return nil
+	})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("walk dir %s: %w", dir, err)
+	}
+	return maxMtime, nil
+}
+
+func appendSeq(ins []path.Path, iter func(func(path.Path) bool)) func(yield func(path.Path) bool) {
 	// ins should be unique inputs.
 	// iter (deps log) should also be unique inputs,
 	// but input in iter may be duplicated with input in ins.
-	seen := make(map[string]bool, len(ins))
-	return func(yield func(string) bool) {
+	seen := make(map[path.Path]bool, len(ins))
+	return func(yield func(path.Path) bool) {
 		for _, in := range ins {
 			seen[in] = true
 			if !yield(in) {
 				return
 			}
 		}
-		iter(func(in string) bool {
+		iter(func(in path.Path) bool {
 			if seen[in] {
 				return true
 			}

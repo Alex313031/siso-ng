@@ -122,22 +122,34 @@ func (t *TermUI) PrintLines(msgs ...string) {
 	if len(msgs) > 0 && msgs[0] == "\n" {
 		msgs = msgs[1:]
 	} else {
-		// Clear the last N lines, where N is number of msgs
-		// that don't start with \n.
+		// Count rows to wipe: every msg up to the first one starting
+		// with "\n", plus the final row.
+		n := len(msgs)
 		for i := range len(msgs) - 1 {
 			if strings.HasPrefix(msgs[i], "\n") {
 				msgs[i] = msgs[i][1:]
+				n = i + 1
 				break
 			}
-			fmt.Fprintf(&buf, "\r\033[K\033[A")
 		}
-		fmt.Fprintf(&buf, "\r\033[K")
+		// Climb + clear in one CSI so terminals don't render the
+		// cursor walking up through each cleared row.
+		if n > 1 {
+			fmt.Fprintf(&buf, "\r\033[%dA\033[J", n-1)
+		} else {
+			fmt.Fprintf(&buf, "\r\033[K")
+		}
 	}
 	for i := range msgs {
 		msgs[i] = t.msg(msgs[i])
 	}
 	writeLinesMaxWidth(&buf, msgs, t.Width())
 	os.Stdout.Write(buf.Bytes())
+}
+
+// IsOneTerminalLine returns true if line fit on one terminal line.
+func (t *TermUI) IsOneTerminalLine(line string) bool {
+	return visibleLen(line) < t.Width()
 }
 
 // NewSpinner returns a terminal-based spinner.

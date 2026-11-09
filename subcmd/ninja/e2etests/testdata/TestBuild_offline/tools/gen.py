@@ -4,25 +4,24 @@
 
 import os
 import sys
-import time
 
-input = None
+input_path = None
 output = None
 for arg in sys.argv:
   print(arg)
-  if arg.startswith('--input='):
-    input = arg[len('--input='):]
-    print('input=' + input)
-  if arg.startswith('--output='):
-    output = arg[len('--output='):]
-    print('output=' + output)
+  if arg.startswith("--input="):
+    input_path = arg[len("--input=") :]
+    print("input=" + input_path)
+  if arg.startswith("--output="):
+    output = arg[len("--output=") :]
+    print("output=" + output)
 
 if not output:
-  print('no output')
+  print("no output")
   sys.exit(1)
 
 with open(output, "w") as w:
-  if input:
-    with open(input) as r:
+  if input_path:
+    with open(input_path) as r:
       w.write(r.read())
-  print(os.path.abspath(output) + ' created')
+  print(os.path.abspath(output) + " created")

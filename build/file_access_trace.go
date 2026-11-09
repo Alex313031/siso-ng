@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	stdpath "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/straceutil"
 )
 
@@ -41,7 +43,7 @@ func newFileTraceExecutor(ctx context.Context, b *Builder, executor execute.Exec
 }
 
 func (f *fileTraceExecutor) Run(ctx context.Context, cmd *execute.Cmd) error {
-	st := straceutil.New(ctx, cmd.ID, cmd.Args, cmd.WorkDir)
+	st := straceutil.New(ctx, cmd.ID, cmd.Args, string(cmd.WorkDir))
 	cmd.StdoutWriter()
 	cmd.StderrWriter()
 	newCmd := &execute.Cmd{}
@@ -93,8 +95,8 @@ func (f *fileTraceExecutor) checkTrace(ctx context.Context, step *Step, dur time
 		command = command[:256] + "..."
 	}
 	// TODO: collect files in precomputed trees too.
-	allInputs := step.cmd.AllInputs()
-	allOutputs := step.cmd.AllOutputs()
+	allInputs := path.Strings(step.cmd.AllInputs())
+	allOutputs := path.Strings(step.cmd.AllOutputs())
 	var output string
 	if len(allOutputs) > 0 {
 		output = allOutputs[0]
@@ -223,11 +225,13 @@ func filesDiff(ctx context.Context, b *Builder, x, opts, y []string, ignorePatte
 		stateUsed
 	)
 	seen := make(map[string]state)
+	// Strip trailing slashes so declared dir targets match the trace's
+	// slash-free relative paths and the directory-coverage walk below.
 	for _, s := range x {
-		seen[s] = stateRequired
+		seen[strings.TrimSuffix(s, "/")] = stateRequired
 	}
 	for _, s := range opts {
-		seen[s] = stateOptional
+		seen[strings.TrimSuffix(s, "/")] = stateOptional
 	}
 	var ignoreRE *regexp.Regexp
 	if ignorePattern != "" {
@@ -264,11 +268,33 @@ func filesDiff(ctx context.Context, b *Builder, x, opts, y []string, ignorePatte
 			platforms = append(platforms, pathname)
 			continue
 		}
+		// filepath.Rel yields OS-native separators, but declared targets and
+		// hashfs keys are forward-slash; normalize so the lookup and the
+		// directory-coverage walk below match on Windows.
+		relname = filepath.ToSlash(relname)
 		if _, ok := seen[relname]; ok {
 			seen[relname] = stateDetected
 			continue
 		}
-		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, relname)
+		// A traced file under a declared directory artifact is expected, not
+		// an extra (the dir is declared as a unit). Mark the covering
+		// directory detected and skip the file.
+		if covered := func() bool {
+			for d := path.New(relname).Dir(); d != "." && d != "/"; d = d.Dir() {
+				s, ok := seen[string(d)]
+				if !ok {
+					continue
+				}
+				if s == stateRequired || s == stateOptional {
+					seen[string(d)] = stateDetected
+				}
+				return true
+			}
+			return false
+		}(); covered {
+			continue
+		}
+		fi, err := b.hashFS.Stat(ctx, b.path.WorkspaceRoot, path.New(relname))
 		if errors.Is(err, os.ErrNotExist) {
 			if log.V(1) {
 				clog.Infof(ctx, "%s: stat %v", name, err)
@@ -285,7 +311,7 @@ func filesDiff(ctx context.Context, b *Builder, x, opts, y []string, ignorePatte
 		adds = append(adds, relname)
 		seen[relname] = stateUsed
 		if target := fi.Target(); target != "" {
-			target := filepath.Join(filepath.Dir(relname), target)
+			target := stdpath.Join(stdpath.Dir(relname), filepath.ToSlash(target))
 			s, ok := seen[target]
 			if ok {
 				if s == stateRequired {

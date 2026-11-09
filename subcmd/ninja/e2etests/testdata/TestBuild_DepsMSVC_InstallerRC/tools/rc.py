@@ -4,7 +4,6 @@
 
 import argparse
 import os
-import shutil
 import sys
 
 
@@ -17,8 +16,8 @@ def main():
   with open(options.inputs) as f:
     for line in f:
       file = line.strip()
-      print('Note: including file: %s' % os.path.abspath(file))
-  with open(options.out, 'w') as f:
+      print("Note: including file: %s" % os.path.abspath(file))
+  with open(options.out, "w") as f:
     f.write(options.inputs)
 
 

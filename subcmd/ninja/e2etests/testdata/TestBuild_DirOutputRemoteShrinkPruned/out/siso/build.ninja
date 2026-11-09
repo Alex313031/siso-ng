@@ -1,0 +1,14 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# A (remote) produces the directory output gendir/ from input. The fake RBE
+# returns {a,b} on the first run and {a} on the second (after input changes), so
+# gendir/ shrinks across builds. With output_local materialization, the stale
+# member gendir/b must be pruned, not left on disk.
+
+rule A
+  command = python3 ../../action.py --input input --outdir gendir
+
+build gendir/: A ../../input
+default gendir/

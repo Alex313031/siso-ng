@@ -27,14 +27,14 @@ import (
 var collectorConfig []byte
 
 type Command struct {
-	authOpts         cred.Options
+	authOpts         func() cred.Options
 	version          string
 	projectID        string
 	collectorAddress string
 	insecure         bool
 }
 
-func Cmd(authOpts cred.Options, version string) *Command {
+func Cmd(authOpts func() cred.Options, version string) *Command {
 	return &Command{
 		authOpts: authOpts,
 		version:  version,
@@ -60,7 +60,7 @@ func (c *Command) SetFlags(flagSet *flag.FlagSet) {
 }
 
 func (c *Command) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	credential, err := cred.New(ctx, "https://logging.googleapis.com/", c.authOpts)
+	credential, err := cred.New(ctx, "https://logging.googleapis.com/", c.authOpts())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return subcommands.ExitFailure

@@ -3,19 +3,17 @@
 # found in the LICENSE file.
 
 import argparse
-import os
-import shutil
 import sys
 
 
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--output", help="output")
-  parser.add_argument("input", nargs='*', help="input")
+  parser.add_argument("input", nargs="*", help="input")
   options = parser.parse_args()
-  with open(options.output, 'w') as f:
+  with open(options.output, "w") as f:
     for fname in options.input:
-      f.write(fname + '\n')
+      f.write(fname + "\n")
 
 
 if __name__ == "__main__":

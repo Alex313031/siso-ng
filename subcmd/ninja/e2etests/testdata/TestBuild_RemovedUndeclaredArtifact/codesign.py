@@ -9,7 +9,7 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--provision", action='store_true')
+  parser.add_argument("--provision", action="store_true")
   parser.add_argument("path")
   options = parser.parse_args()
 

@@ -23,13 +23,11 @@ import (
 // It handles retry, semaphore acquisition, and remote execution,
 // but does NOT download outputs or stdout/stderr.
 //
-// uploadCtx controls CAS input uploads; execCtx controls execution and
-// retry/semaphore. In the non-racing path both are the same context.
-// In racing mode, uploadCtx is the build context (not canceled by
-// race cancellation) so that shared CAS upload operations are not
-// poisoned when the race goroutine's execCtx is canceled.
-func (b *Builder) execRemoteExecute(uploadCtx, execCtx context.Context, step *Step) error {
-	ctx, span := trace.NewSpan(execCtx, "exec-remote-execute")
+// Canceling ctx (e.g. when the local racer wins) makes this return
+// promptly even while CAS input uploads are in flight; the uploads are
+// owned by the reapi client and keep running for other steps.
+func (b *Builder) execRemoteExecute(ctx context.Context, step *Step) error {
+	ctx, span := trace.NewSpan(ctx, "exec-remote-execute")
 	defer span.Close(nil)
 	noFallback := !b.localFallbackEnabled(step)
 	var timeout time.Duration
@@ -40,7 +38,6 @@ func (b *Builder) execRemoteExecute(uploadCtx, execCtx context.Context, step *St
 		// However, this will lose the opportunity to cache long actions.
 		timeout = step.cmd.Timeout * 4
 	}
-	step.cmd.RecordPreOutputs(ctx)
 	clog.Infof(ctx, "exec remote execute %s", step.cmd.Desc)
 	phase := stepRemoteRun
 	var reExecDur time.Duration
@@ -50,17 +47,21 @@ func (b *Builder) execRemoteExecute(uploadCtx, execCtx context.Context, step *St
 	}
 	return retry.DoWithMaxRetries(ctx, maxRetries, func() error {
 		step.setPhase(phase.wait())
+		// When and how long the attempt took.
+		// Stays zero if sema is never entered (e.g. due to cancel)
+		var attemptStart time.Time
+		var attemptDur time.Duration
 		err := b.remoteSema.Do(ctx, step.weight, func(ctx context.Context) error {
 			step.setPhase(phase)
 			if phase == stepRetryRun {
 				step.metrics.RemoteRetry++
 				b.progressStepRetry(step)
 			}
-			reExecStarted := time.Now()
-			b.actionStartedTime(step, reExecStarted)
+			attemptStart = time.Now()
+			b.actionStartedTime(step, attemptStart)
 			clog.Infof(ctx, "step state: remote exec [%s]", phase)
 			phase = stepRetryRun
-			result, cached, err := b.remoteExec.Execute(uploadCtx, ctx, step.cmd)
+			result, cached, err := b.remoteExec.Execute(ctx, step.cmd)
 			step.setPhase(stepOutput)
 			step.metrics.IsRemote = true
 			if !cached {
@@ -73,7 +74,7 @@ func (b *Builder) execRemoteExecute(uploadCtx, execCtx context.Context, step *St
 				step.metrics.RemoteRetry++
 				step.cmd.SkipCacheLookup = true
 				step.setPhase(phase)
-				result, cached, err = b.remoteExec.Execute(uploadCtx, ctx, step.cmd)
+				result, cached, err = b.remoteExec.Execute(ctx, step.cmd)
 				step.setPhase(stepOutput)
 				step.metrics.IsRemote = true
 				if !cached {
@@ -94,8 +95,8 @@ func (b *Builder) execRemoteExecute(uploadCtx, execCtx context.Context, step *St
 				md := result.GetExecutionMetadata()
 				if md != nil {
 					execDur := md.GetWorkerCompletedTimestamp().AsTime().Sub(md.GetWorkerStartTimestamp().AsTime())
-					runDur := time.Since(reExecStarted)
-					sleepDur := execDur - runDur
+					elapsed := time.Since(attemptStart)
+					sleepDur := execDur - elapsed
 					if sleepDur > 0 {
 						clog.Infof(ctx, "simulate cache miss in execRemote: sleep %s", sleepDur)
 						select {
@@ -108,11 +109,17 @@ func (b *Builder) execRemoteExecute(uploadCtx, execCtx context.Context, step *St
 					clog.Warningf(ctx, "simulate cache miss: missing execution metadata in action result")
 				}
 			}
-			step.metrics.RunTime = IntervalMetric(time.Since(reExecStarted))
-			step.metrics.done(ctx, step, b.start)
+			attemptEnd := time.Now()
+			attemptDur = attemptEnd.Sub(attemptStart)
+			span.Add(ctx, trace.SpanData{
+				Name:  spanExecRemoteExecAttempt,
+				Start: attemptStart,
+				End:   attemptEnd,
+			})
+			step.metrics.done(ctx, b, step, b.start)
 			return err
 		})
-		reExecDur += time.Duration(step.metrics.RunTime)
+		reExecDur += attemptDur
 		if code := status.Code(err); noFallback && (code == codes.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded)) && reExecDur < timeout {
 			clog.Warningf(ctx, "exec remote timedout duration=%s timeout=%s: %v", reExecDur, timeout, err)
 			err = status.Errorf(codes.Unavailable, "reapi timedout %v", err)
@@ -166,7 +173,11 @@ func (b *Builder) updateREStat(result *rpb.ActionResult, err error) {
 }
 
 func (b *Builder) execRemote(ctx context.Context, step *Step) error {
-	execErr := b.execRemoteExecute(ctx, ctx, step)
+	execErr := b.execRemoteExecute(ctx, step)
+
+	ctx, span := trace.NewSpan(ctx, spanExecRemoteExecPostProc)
+	defer span.Close(nil)
+
 	downloadErr := b.execRemoteDownload(ctx, step, execErr)
 	if downloadErr != nil {
 		return downloadErr
@@ -180,13 +191,15 @@ func (b *Builder) execRemote(ctx context.Context, step *Step) error {
 }
 
 func (b *Builder) execRemoteCache(ctx context.Context, step *Step) error {
-	ctx, span := trace.NewSpan(ctx, "exec-remote-cache")
+	ctx, span := trace.NewSpan(ctx, spanExecRemoteCache)
 	defer span.Close(nil)
+	var runSpan *trace.Span
 	var start time.Time
 	err := b.cacheSema.Do(ctx, func(ctx context.Context) error {
 		start = time.Now()
-		b.cacheStarted(step)
-		defer b.cacheFinish(step)
+		b.actionStartedSilent(step)
+		ctx, runSpan = trace.NewSpan(ctx, spanExecRemoteCacheCheck)
+		defer runSpan.Close(nil)
 		err := b.cache.GetActionResult(ctx, step.cmd)
 		if err != nil {
 			return err
@@ -214,10 +227,22 @@ func (b *Builder) execRemoteCache(ctx context.Context, step *Step) error {
 	}
 
 	// Beyond this point, we should be marking the step done.  Do that as we leave the function.
-	b.actionStartedTime(step, b.start.Add(time.Duration(step.metrics.CacheStartTime)))
+	// TODO(b/520207778): Refactor actionStartedTime. Better to decide "real start time"
+	// at the end of step so that it's easier to understand how the metrics are decided.
+	// Otherwise, need to manually trace every execution strategy to understand how metrics
+	// are decided for each step which is error-prone.
+	actionStarted := start
+	if runSpan != nil {
+		actionStarted = runSpan.Start()
+	}
+	b.actionStartedTime(step, actionStarted)
 	defer func() {
-		step.metrics.RunTime = IntervalMetric(time.Since(start))
-		step.metrics.done(ctx, step, b.start)
+		span.Add(ctx, trace.SpanData{
+			Name:  spanExecRemoteCacheRun,
+			Start: start,
+			End:   time.Now(),
+		})
+		step.metrics.done(ctx, b, step, b.start)
 	}()
 
 	// need to update deps for cache hit for deps=gcc, msvc.

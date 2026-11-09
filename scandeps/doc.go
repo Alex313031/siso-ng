@@ -3,11 +3,19 @@
 // found in the LICENSE file.
 
 // Package scandeps provides forged C/C++ dependency scanner.
-// Compared with Goma's input processor, it only supports simple
+//
+// Scandeps is used to construct inputs for remote execution,
+// since typical cc/cxx actions don't specify required inputs
+// for remote execution.
+// It is not used to check whether the action needs to
+// re-execute or not. Such dependency information should be
+// provided by the build graph or a depfile.
+//
+// Compared with Goma's input processor, scandeps only supports simple
 // form of C preprocessor directives and uses precomputed subtree
 // for sysroots or complicated include dirs.
 //
-// It only checks the following forms of #include
+// Scandeps only checks the following forms of #include
 //
 //	#include "foo.h"
 //	#include <foo.h>
@@ -19,19 +27,24 @@
 //	#define FOO_H <foo.h>
 //	#define FOO_H OTHER_FOO_H
 //
-// Since it doesn't process `#if` or `#ifdef`, it expands all possible
+// Since scandeps doesn't process `#if` or `#ifdef`, it expands all possible
 // values of macros for `#include FOO_H`.  Using extra inputs is
 // not problem, but may have potential cache miss issues, since
 // there is discrepancy between simple scandeps vs clang's *.d outputs.
 // TODO(b/283341125): fix cache miss issue.
 //
-// It doesn't allow comments nor multiline (\ at the end of line)
+// Scandeps doesn't allow comments nor multiline (\ at the end of line)
 // for the directives.
 //
-// Also it uses input_deps's label for sysroots etc.
+// Also scandeps uses input_deps's label for sysroots etc.
 // if include dir or sysroot dir has label with `:headers`,
 // it adds files of the input_deps instead of scanning files
 // in the dir.  Rather using minimum sets of include dirs,
 // it may use more files, but can use precomputed merkletree
 // to improve performance in digest calculation for action inputs.
+// It won't scan inside sysroot or include dir if it uses
+// `:headers` input_deps for the compilation unit.
+// Missing standard library headers or sysroot files in remote execution
+// indicate missing or misconfigured input_deps/filegroups,
+// not a failure of scandeps scanning.
 package scandeps

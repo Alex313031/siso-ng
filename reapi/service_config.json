@@ -1,0 +1,95 @@
+{
+  "loadBalancingConfig": [
+    {
+      "round_robin": {}
+    }
+  ],
+  "methodConfig": [
+    {
+      "name": [
+        {
+          "service": "build.bazel.remote.execution.v2.Execution"
+        }
+      ],
+      "timeout": "600s",
+      "retryPolicy": {
+        "maxAttempts": 5,
+        "initialBackoff": "1s",
+        "maxBackoff": "120s",
+        "backoffMultiplier": 1.6,
+        "retryableStatusCodes": [
+          "ABORTED",
+          "INTERNAL",
+          "RESOURCE_EXHAUSTED",
+          "UNAVAILABLE",
+          "UNKNOWN"
+        ]
+      },
+      "retryThrottling": {
+        "maxTokens": 10,
+        "tokenRatio": 0.1
+      }
+    },
+    {
+      "name": [
+        {
+          "service": "build.bazel.remote.execution.v2.ActionCache",
+          "method": "GetActionResult"
+        },
+        {
+          "service": "build.bazel.remote.execution.v2.ActionCache",
+          "method": "ListActions"
+        }
+      ],
+      "timeout": "10s",
+      "retryPolicy": {
+        "maxAttempts": 5,
+        "initialBackoff": "0.1s",
+        "maxBackoff": "1s",
+        "backoffMultiplier": 1.6,
+        "retryableStatusCodes": [
+          "ABORTED",
+          "INTERNAL",
+          "RESOURCE_EXHAUSTED",
+          "UNAVAILABLE",
+          "UNKNOWN"
+        ]
+      },
+      "retryThrottling": {
+        "maxTokens": 10,
+        "tokenRatio": 0.1
+      }
+    },
+    {
+      "name": [
+        {
+          "service": "build.bazel.remote.execution.v2.ActionCache"
+        },
+        {
+          "service": "build.bazel.remote.execution.v2.ContentAddressableStorage"
+        },
+        {
+          "service": "build.bazel.remote.execution.v2.Capabilities"
+        }
+      ],
+      "timeout": "300s",
+      "retryPolicy": {
+        "maxAttempts": 5,
+        "initialBackoff": "0.1s",
+        "maxBackoff": "1s",
+        "backoffMultiplier": 1.6,
+        "retryableStatusCodes": [
+          "ABORTED",
+          "INTERNAL",
+          "RESOURCE_EXHAUSTED",
+          "UNAVAILABLE",
+          "UNKNOWN"
+        ]
+      },
+      "retryThrottling": {
+        "maxTokens": 10,
+        "tokenRatio": 0.1
+      }
+    }
+  ]
+}

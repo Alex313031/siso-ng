@@ -11,17 +11,17 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("inputs", nargs='*', help="inputs")
+  parser.add_argument("inputs", nargs="*", help="inputs")
   parser.add_argument("-o", help="output")
   options = parser.parse_args()
 
-  data = ''
-  for input in options.inputs:
-    data += input + '\n'
-    with open(input) as f:
+  data = ""
+  for input_path in options.inputs:
+    data += input_path + "\n"
+    with open(input_path) as f:
       data += f.read()
-      data += '\n'
-  with open(options.o, 'w') as f:
+      data += "\n"
+  with open(options.o, "w") as f:
     f.write(data)
 
 

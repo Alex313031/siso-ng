@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -286,30 +285,6 @@ func loopbackAddr(port int) string {
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	return loopbackAddr(freePorts(t, 1)[0])
-}
-
-// freePorts reserves n distinct free loopback TCP ports and returns them. Every
-// listener is held open until all n are chosen, so the kernel cannot hand the
-// same port out twice; they are then closed for the collector to bind. A port
-// could still be taken in the gap before the collector binds it, but ephemeral
-// ports make that vanishingly unlikely, unlike the fixed ports the daemon
-// defaults to. Only TCP is probed because every collector listener is TCP.
-func freePorts(t *testing.T, n int) []int {
-	t.Helper()
-	listeners := make([]net.Listener, 0, n)
-	ports := make([]int, 0, n)
-	for range n {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("failed to allocate free port: %v", err)
-		}
-		listeners = append(listeners, l)
-		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
-	}
-	for _, l := range listeners {
-		l.Close()
-	}
-	return ports
 }
 
 func waitForHealth(url string, timeout time.Duration) error {

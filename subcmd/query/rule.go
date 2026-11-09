@@ -90,7 +90,7 @@ func (c *ruleCommand) run(ctx context.Context, args []string) error {
 		}
 		edge.Print(os.Stdout)
 		fmt.Printf("# %s is used by the following targets\n", node.Path())
-		for _, edge := range node.OutEdges() {
+		for _, edge := range state.OutEdges(node) {
 			outs := edge.Outputs()
 			if len(outs) == 0 {
 				continue

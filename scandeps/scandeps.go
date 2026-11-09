@@ -18,6 +18,7 @@ import (
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
+	"go.chromium.org/build/siso/path"
 )
 
 // ScanDeps is a simple C/C++ dependency scanner.
@@ -96,6 +97,15 @@ func New(ctx context.Context, hashfs *hashfs.HashFS, opts Options) *ScanDeps {
 	for _, i := range opts.InputsRequiringClangScandeps {
 		s.inputsRequiringClangScandeps[i] = true
 	}
+	// Pre-index ":headers" InputDeps keys by directory so fsview.addDir
+	// avoids the dir+":headers" concatenation per call.
+	headersDirs := make(map[string]struct{})
+	for k := range opts.InputDeps {
+		if dir, ok := strings.CutSuffix(k, ":headers"); ok {
+			headersDirs[dir] = struct{}{}
+		}
+	}
+	s.fs.headersDirs = headersDirs
 	hashfs.Notify(s.fs.update)
 	return s
 }
@@ -107,31 +117,31 @@ type Request struct {
 	Defines map[string]string
 
 	// Sources are source files.
-	Sources []string
+	Sources []path.Path
 
 	// Includes are additional include files (i.e. -include or /FI).
 	// it would be equivalent with `#include "fname"` in source.
-	Includes []string
+	Includes []path.Path
 
 	// Dirs are include directories (search paths) or hmap paths.
-	Dirs []string
+	Dirs []path.Path
 
 	// QuoteDirs are include directories specified by -iquote.
-	QuoteDirs []string
+	QuoteDirs []path.Path
 
 	// Frameworks are framework directories (search paths).
-	Frameworks []string
+	Frameworks []path.Path
 
 	// Sysroots are sysroot directories.
 	// It also includes toolchain root directory.
-	Sysroots []string
+	Sysroots []path.Path
 
 	// To mitigate scanning that does not terminate.
 	Timeout time.Duration
 }
 
 // Scan scans C/C++ source/header files for req to get C/C++ dependencies.
-func (s *ScanDeps) Scan(ctx context.Context, workspaceRoot string, req Request) (_ []string, retErr error) {
+func (s *ScanDeps) Scan(ctx context.Context, workspaceRoot string, req Request) (_ []path.Path, retErr error) {
 	defer func() {
 		if retErr != nil && s.clangScandeps == clangModeErr && !errors.Is(retErr, ErrRequireClangScandeps) {
 			retErr = fmt.Errorf("%w: %v", ErrRequireClangScandeps, retErr)
@@ -146,7 +156,7 @@ func (s *ScanDeps) Scan(ctx context.Context, workspaceRoot string, req Request) 
 	started := time.Now()
 
 	// Assume sysroots use precomputed tree.
-	var precomputedTrees []string
+	var precomputedTrees []path.Path
 	precomputedTrees = append(precomputedTrees, req.Sysroots...)
 	// framework, or some system include dirs may also use precomputed tree
 	// if precomputed tree is defined for the dir (in addDir later).
@@ -166,7 +176,7 @@ func (s *ScanDeps) Scan(ctx context.Context, workspaceRoot string, req Request) 
 		scanner.addInclude(ctx, s)
 	}
 	for _, dir := range req.Dirs {
-		if strings.HasSuffix(dir, ".hmap") && scanner.addHmap(ctx, dir) {
+		if strings.HasSuffix(string(dir), ".hmap") && scanner.addHmap(ctx, dir) {
 			continue
 		}
 		scanner.addDir(ctx, dir)
@@ -248,10 +258,10 @@ func (s *ScanDeps) Scan(ctx context.Context, workspaceRoot string, req Request) 
 			if log.V(1) {
 				clog.Infof(ctx, "include %s -> %s", name, incpath)
 			}
-			if s.inputsRequiringClangScandeps[incpath] {
+			if s.inputsRequiringClangScandeps[string(incpath)] {
 				return nil, ErrRequireClangScandeps
 			}
-			if deps, ok := s.inputDeps[incpath]; ok {
+			if deps, ok := s.inputDeps[string(incpath)]; ok {
 				if log.V(1) {
 					logDeps := deps
 					clog.Infof(ctx, "add inputDeps %q", logDeps)

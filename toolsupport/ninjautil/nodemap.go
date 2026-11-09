@@ -7,7 +7,9 @@ package ninjautil
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"hash/maphash"
+	"math"
 	"sync/atomic"
 
 	"go.chromium.org/build/siso/o11y/clog"
@@ -108,11 +110,16 @@ func (nm *nodeMap) lookup(key string) (*Node, bool) {
 	return nil, false
 }
 
-// freeze freezes bigMap as []*Node, and assign sequence id in *Node.
-func (nm *nodeMap) freeze(ctx context.Context) []*Node {
-	nodes := make([]*Node, 0, nm.n.Load()+1)
+// freeze freezes bigMap as []*Node and assigns sequence ids. It also collects
+// directory-output nodes (paths ending in "/") so callers need not rescan.
+func (nm *nodeMap) freeze(ctx context.Context) (nodes, dirOutputs []*Node, _ error) {
+	numNodes := nm.n.Load()
+	if numNodes >= math.MaxInt32 {
+		return nil, nil, fmt.Errorf("too many nodes: %d", numNodes)
+	}
+	nodes = make([]*Node, 0, numNodes+1)
 	nodes = append(nodes, nil) // 0: invalid target.
-	id := 1
+	var id int32 = 1
 	clog.Infof(ctx, "freeze bigmap")
 	maxDepth := 0
 	numBuckets := 0
@@ -127,11 +134,20 @@ func (nm *nodeMap) freeze(ctx context.Context) []*Node {
 			n.id = id
 			id++
 			nodes = append(nodes, n)
+			// The trailing-slash check rejects almost every node before
+			// the atomic inEdge load. A directory output must be produced by a
+			// real action, so a phony edge (which produces no tree) does not
+			// make a trailing-slash node a directory output.
+			if l := len(n.path); l > 0 && n.path[l-1] == '/' {
+				if e := n.inEdge.Load(); e != nil && !e.IsPhony() {
+					dirOutputs = append(dirOutputs, n)
+				}
+			}
 			n = n.next
 			depth++
 		}
 		maxDepth = max(depth, maxDepth)
 	}
 	clog.Infof(ctx, "nodes=%d buckets=%d (%d%%, max deps=%d) %d%% of %d", len(nodes), numBuckets, numBuckets*100/nodeMapArraySize, maxDepth, len(nodes)*100/nodeMapArraySize, nodeMapArraySize)
-	return nodes
+	return nodes, dirOutputs, nil
 }

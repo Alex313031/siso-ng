@@ -9,9 +9,10 @@ package cachestore
 import (
 	"context"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
-	"go.chromium.org/build/siso/reapi/digest"
+	"go.chromium.org/build/siso/blob"
 )
 
 // CacheStore is an interface of cache store.
@@ -30,5 +31,5 @@ type CacheStore interface {
 	HasContent(context.Context, digest.Digest) bool
 
 	// Source returns digest source for the name identified by the digest.
-	Source(context.Context, digest.Digest, string) digest.Source
+	Source(context.Context, digest.Digest, string) blob.Source
 }

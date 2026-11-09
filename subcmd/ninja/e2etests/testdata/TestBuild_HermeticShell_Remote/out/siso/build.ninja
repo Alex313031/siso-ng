@@ -1,0 +1,8 @@
+rule remote_nontrivial
+  command = cat ${in} > ${out} && echo "nontrivial" >> ${out}
+
+rule remote_trivial
+  command = cp ${in} ${out}
+
+build out_nontrivial: remote_nontrivial ../../in.txt
+build out_trivial: remote_trivial ../../in.txt

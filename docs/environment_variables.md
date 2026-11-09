@@ -114,6 +114,15 @@ Currently [`watchman`](https://facebook.github.io/watchman/) is supported.
 See [build/experiments.go](../build/experiments.go) for available experiment
 features.  The available experiments will change in future versions.
 
+### SISO_WEIGHTS_FILE
+
+`SISO_WEIGHTS_FILE` sets the default value of `-weights_file`, to specify a
+JSON or gzip-compressed JSON (`.gz`) file (relative to workspace root) with
+per-output step weights (`outputs`) and optional action/default fallbacks
+(`rules`, `default`) for critical-path step scheduling (experimental).
+Weights are positive integers representing relative step costs (e.g. estimated
+execution durations).
+
 ## Monitoring
 
 ### SISO_BUILD_ID

@@ -27,21 +27,7 @@ func DefaultCredentialHelper() string {
 		return "mTLS"
 	}
 	if checkIfGoogleCredHelperExists() {
-		// googleCredHelper depends on stubby.
-		_, err := exec.LookPath("stubby")
-		if err == nil {
-			// Make sure it's not a laptop. gLaptop should fall back to luci-auth below.
-			// See also go/glinux-roles.
-			dist, err := os.ReadFile("/etc/lsb-release")
-			if err != nil {
-				ui.Default.Warningf("WARNING: Failed to read /etc/lsb-release. Assuming this is not a laptop. err: %s", err)
-			}
-			if !bytes.Contains(dist, []byte("GOOGLE_ROLE=laptop")) {
-				return googleCredHelper
-			}
-		}
-		// credhelper exists, but stubby doesn't or is not usable on gLaptop.
-		// fallback to luci-auth.
+		return googleCredHelper
 	}
 	path, err := exec.LookPath("luci-auth")
 	if err == nil {
@@ -51,7 +37,46 @@ func DefaultCredentialHelper() string {
 }
 
 func checkIfGoogleCredHelperExists() bool {
+	// googleCredHelper depends on stubby.
+	_, err := exec.LookPath("stubby")
+	if err != nil {
+		return false
+	}
+	// Make sure it's not a laptop. gLaptop should fall back to luci-auth below.
+	// See also go/glinux-roles.
+	dist, err := os.ReadFile("/etc/lsb-release")
+	if err != nil {
+		ui.Default.Warningf("WARNING: Failed to read /etc/lsb-release. Assuming this is not a laptop. err: %s", err)
+	}
+	if bytes.Contains(dist, []byte("GOOGLE_ROLE=laptop")) {
+		// stubby is not usable on gLaptop
+		return false
+	}
 	// workaround for b/360055934
+	// expect loas_check installed on glinux.
+	_, err = exec.LookPath("loas_check")
+	if err != nil {
+		return false
+	}
+	out, err := exec.Command("loas_check", "--show_restrictions").Output()
+	if err != nil {
+		ui.Default.Errorf(`loas_check failed. need to run "gcert"
+or set SISO_CREDENTIAL_HELPER explicitly.
+`)
+		os.Exit(1)
+	}
+	if bytes.Contains(out, []byte("destination_restriction")) {
+		// destination_restriction block exists.
+		// check if permission for srcfs/piper was granted.
+		if !bytes.Contains(out, []byte(`"srcfs"`)) && !bytes.Contains(out, []byte(`"piper"`)) && !bytes.Contains(out, []byte(`"piper-srcfs-dispatcher"`)) {
+			ui.Default.Errorf(`restricted user without srcfs permissions.
+need RPC access: http//go/request-rpc
+or set SISO_CREDENTIAL_HELPER explicitly.
+`)
+			os.Exit(1)
+		}
+	}
+	// no destination_restriction, or have /google/src permission.
 	ch := make(chan bool, 3)
 	for i := range 3 {
 		go func() {
@@ -71,7 +96,9 @@ func checkIfGoogleCredHelperExists() bool {
 	}
 	ui.Default.Errorf(`ERROR: Timeout while accessing /google/src.
 Run "diagnose_me" or you would need RPC access: http://go/request-rpc
+or set SISO_CREDENTIAL_HELPER explicitly.
 `)
+	os.Exit(1)
 	return false
 }
 

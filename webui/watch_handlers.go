@@ -16,15 +16,20 @@ import (
 )
 
 func (s *WebuiServer) handleOutdirWatch(w http.ResponseWriter, r *http.Request) {
-	tmpl, err := s.loadView("_watch.html")
+	tmpl, err := s.loadView("build_watch.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
 	}
 
-	outdirInfo, err := s.getOutdirForRequest(r)
+	series, err := s.invocationSeriesFor(r)
 	if err != nil {
-		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to get outdir: %v", err), w, r)
+		s.renderBuildViewError(http.StatusNotFound, fmt.Sprintf("can't find outdir for %s: %v", r.URL, err), w, r)
+		return
+	}
+	outdirInfo, ok := series.(*outdirInfo)
+	if !ok {
+		s.renderBuildViewError(http.StatusNotFound, "this is not an outdir", w, r)
 		return
 	}
 

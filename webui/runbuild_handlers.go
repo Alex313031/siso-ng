@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,7 +34,7 @@ type runbuildState struct {
 }
 
 func (s *WebuiServer) handleRunbuildGet(w http.ResponseWriter, r *http.Request) {
-	tmpl, err := s.loadView("_run.html")
+	tmpl, err := s.loadView("build_run.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
@@ -59,7 +60,7 @@ func (s *WebuiServer) handleRunbuildPost(w http.ResponseWriter, r *http.Request)
 	}
 
 	// We'll render the same view again, but in a "building" state.
-	tmpl, err := s.loadView("_run.html")
+	tmpl, err := s.loadView("build_run.html")
 	if err != nil {
 		s.renderBuildViewError(http.StatusInternalServerError, fmt.Sprintf("failed to load view: %s", err), w, r)
 		return
@@ -146,11 +147,7 @@ func (s *WebuiServer) handleRunbuildPost(w http.ResponseWriter, r *http.Request)
 				return
 			case <-time.After(100 * time.Millisecond):
 				activeStepsLock.RLock()
-				// TODO: use golang 1.23 maps.Values
-				activeByStarted := make([]runningStepInfo, 0, len(activeSteps))
-				for _, value := range activeSteps {
-					activeByStarted = append(activeByStarted, value)
-				}
+				activeByStarted := slices.Collect(maps.Values(activeSteps))
 				activeStepsLock.RUnlock()
 
 				slices.SortFunc(activeByStarted, func(a, b runningStepInfo) int {

@@ -8,15 +8,15 @@ import sys
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('--input', help='input')
-  parser.add_argument('--output', help='output')
+  parser.add_argument("--input", help="input")
+  parser.add_argument("--output", help="output")
   options = parser.parse_args()
 
-  data = ''
+  data = ""
   with open(options.input) as f:
     data = f.read()
-  with open(options.output, 'w') as f:
-    f.write('input %s' % data)
+  with open(options.output, "w") as f:
+    f.write("input %s" % data)
   return 0
 
 

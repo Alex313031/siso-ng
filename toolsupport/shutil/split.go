@@ -17,13 +17,19 @@ func Split(cmdline string) ([]string, error) {
 	buf := bytes.NewBuffer(make([]byte, 0, len(cmdline)))
 	sb := buf
 	escaped := false
-	var qch rune // 0, '"', '\''
+	var qch byte // 0, '"', '\''
 	inspace := false
 	si := 0
 	cmdline = strings.TrimSpace(cmdline)
-	for i, ch := range cmdline {
+	// Iterate over bytes rather than runes (`for i, ch := range cmdline`) so
+	// byte-escaped multi-byte UTF-8 sequences (e.g. \x5c\xc3\x5c\xb8 from GN)
+	// are unescaped as raw bytes instead of turning isolated high bytes into
+	// utf8.RuneError (\ufffd). All special shell characters handled below are
+	// single-byte ASCII (< 0x80).
+	for i := range len(cmdline) {
+		ch := cmdline[i]
 		if escaped {
-			sb.WriteRune(ch)
+			sb.WriteByte(ch)
 			escaped = false
 			si = i + 1
 			continue
@@ -36,7 +42,7 @@ func Split(cmdline string) ([]string, error) {
 			if qch == ch {
 				qch = 0
 			} else {
-				sb.WriteRune(ch)
+				sb.WriteByte(ch)
 			}
 			si = i + 1
 			continue
@@ -86,7 +92,7 @@ func Split(cmdline string) ([]string, error) {
 			return nil, fmt.Errorf("failed to split: cmdline contains shell metachar %c", ch)
 		default:
 			if !inspace && sb != nil {
-				sb.WriteRune(ch)
+				sb.WriteByte(ch)
 				si = i + 1
 			}
 			inspace = false

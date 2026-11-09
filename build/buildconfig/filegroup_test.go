@@ -7,6 +7,7 @@ package buildconfig
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -25,96 +26,164 @@ func TestFilegroupGlob(t *testing.T) {
 	})
 	fsys := os.DirFS(dir)
 
-	baseGlobSpec := globSpec{
-		dir:      "base",
-		includes: []string{"*.h"},
-	}
-	libgccGlobSpec := globSpec{
-		dir:      "build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu",
-		includes: []string{"*.o", "*.so", "*.a"},
-	}
-	excludeGlobSpec := globSpec{
-		dir:      "build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu",
-		includes: []string{"*"},
-		excludes: []string{"*.a"},
-	}
-
-	for _, tc := range []struct {
-		name     string
-		globSpec globSpec
-		cache    filegroup
-		want     filegroup
-	}{
-		{
-			name:     "base",
-			globSpec: baseGlobSpec,
-			want: filegroup{
-				etag: baseGlobSpec.hash(),
-				files: []string{
+	t.Run("Match", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			globSpec  globSpec
+			wantFiles []string
+		}{
+			{
+				name: "base",
+				globSpec: globSpec{
+					dir:      "base",
+					includes: []string{"*.h"},
+				},
+				wantFiles: []string{
 					"base/base.h",
 					"base/debug/debug.h",
 				},
 			},
-		},
-		{
-			name:     "base-reuse",
-			globSpec: baseGlobSpec,
-			// when hash matches, don't glob but reuse.
-			cache: filegroup{
-				etag: baseGlobSpec.hash(),
-				files: []string{
-					"base/base.h",
-					"base/debug/debug.h",
-					"base/version.h",
+			{
+				name: "libgcc",
+				globSpec: globSpec{
+					dir:      "build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu",
+					includes: []string{"*.o", "*.so", "*.a"},
 				},
-			},
-			want: filegroup{
-				etag: baseGlobSpec.hash(),
-				files: []string{
-					"base/base.h",
-					"base/debug/debug.h",
-					"base/version.h",
-				},
-			},
-		},
-		{
-			name:     "libgcc",
-			globSpec: libgccGlobSpec,
-			want: filegroup{
-				etag: libgccGlobSpec.hash(),
-				files: []string{
+				wantFiles: []string{
 					"build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/10/crtbegin.o",
 					"build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/10/libasan.so",
 					"build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/10/libgcc.a",
 				},
 			},
-		},
-		{
-			name:     "exclude",
-			globSpec: excludeGlobSpec,
-			want: filegroup{
-				etag: excludeGlobSpec.hash(),
-				files: []string{
+			{
+				name: "exclude",
+				globSpec: globSpec{
+					dir:      "build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu",
+					includes: []string{"*"},
+					excludes: []string{"*.a"},
+				},
+				wantFiles: []string{
 					"build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/10/crtbegin.o",
 					"build/linux/debian_bullseye_amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu/10/libasan.so",
 				},
 			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := t.Context()
-			got, err := tc.globSpec.Update(ctx, fsys, tc.cache)
-			if err != nil {
-				t.Fatalf("globSpec.Update(...)=%v, %v; want nil err", got, err)
-			}
-			if diff := cmp.Diff(tc.want.etag, got.etag); diff != "" {
-				t.Errorf("globSpec.Update(...) etags -want +got:\n%s", diff)
-			}
-			if diff := cmp.Diff(tc.want.files, got.files); diff != "" {
-				t.Errorf("globSpec.Update(...) files -want +got:\n%s", diff)
-			}
-		})
-	}
+			{
+				name: "include-with-slash",
+				globSpec: globSpec{
+					dir:      "base",
+					includes: []string{"debug/*.h"},
+				},
+				wantFiles: []string{
+					"base/debug/debug.h",
+				},
+			},
+			{
+				name: "exclude-with-slash",
+				globSpec: globSpec{
+					dir:      "base",
+					includes: []string{"*.h"},
+					excludes: []string{"debug/*"},
+				},
+				wantFiles: []string{
+					"base/base.h",
+				},
+			},
+			{
+				name: "no-match",
+				globSpec: globSpec{
+					dir:      "base",
+					includes: []string{"*.cc"},
+				},
+				wantFiles: nil,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				got, err := tc.globSpec.Update(ctx, fsys, filegroup{})
+				if err != nil {
+					t.Fatalf("globSpec.Update(...) unexpected error: %v", err)
+				}
+				if got.etag != tc.globSpec.hash() {
+					t.Errorf("globSpec.Update(...) etag = %q; want %q", got.etag, tc.globSpec.hash())
+				}
+				if diff := cmp.Diff(tc.wantFiles, got.files); diff != "" {
+					t.Errorf("globSpec.Update(...) files -want +got:\n%s", diff)
+				}
+			})
+		}
+	})
+
+	t.Run("CacheReuse", func(t *testing.T) {
+		spec := globSpec{
+			dir:      "base",
+			includes: []string{"*.h"},
+		}
+		cache := filegroup{
+			etag: spec.hash(),
+			files: []string{
+				"base/base.h",
+				"base/debug/debug.h",
+				"base/version.h",
+			},
+		}
+		got, err := spec.Update(t.Context(), fsys, cache)
+		if err != nil {
+			t.Fatalf("globSpec.Update(...) unexpected error: %v", err)
+		}
+		if diff := cmp.Diff(cache, got, cmp.AllowUnexported(filegroup{})); diff != "" {
+			t.Errorf("globSpec.Update(...) cache diff -want +got:\n%s", diff)
+		}
+	})
+
+	t.Run("AbsDir", func(t *testing.T) {
+		// On Windows, filepath.IsAbs("/base") returns false because it lacks a drive letter,
+		// causing it to fail fs.ValidPath and return early.
+		if runtime.GOOS == "windows" {
+			t.Skip("filepath.IsAbs('/base') returns false on Windows")
+		}
+		spec := globSpec{
+			dir:      "/base",
+			includes: []string{"*.h"},
+		}
+		got, err := spec.Update(t.Context(), fsys, filegroup{})
+		if err != nil {
+			t.Fatalf("globSpec.Update(...) unexpected error: %v", err)
+		}
+		wantFiles := []string{
+			"/base/base.h",
+			"/base/debug/debug.h",
+		}
+		if diff := cmp.Diff(wantFiles, got.files); diff != "" {
+			t.Errorf("globSpec.Update(...) files -want +got:\n%s", diff)
+		}
+	})
+
+	t.Run("InvalidDirOutsideWorkspace", func(t *testing.T) {
+		spec := globSpec{
+			dir:      "../base",
+			includes: []string{"*.h"},
+		}
+		got, err := spec.Update(t.Context(), fsys, filegroup{})
+		if err != nil {
+			t.Fatalf("globSpec.Update(...) unexpected error: %v", err)
+		}
+		if len(got.files) != 0 {
+			t.Errorf("globSpec.Update(...) got files %v; want empty", got.files)
+		}
+	})
+
+	t.Run("NonExistentDir", func(t *testing.T) {
+		spec := globSpec{
+			dir:      "nonexistent",
+			includes: []string{"*.h"},
+		}
+		_, err := spec.Update(t.Context(), fsys, filegroup{})
+		if err == nil {
+			t.Errorf("globSpec.Update(...) got nil error; want non-nil error")
+		}
+	})
 }
 
 func setupFiles(t *testing.T, dir string, files map[string]string) {

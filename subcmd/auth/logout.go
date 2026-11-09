@@ -16,7 +16,7 @@ import (
 )
 
 // LogoutCmd creates new LogoutCommand.
-func LogoutCmd(authOpts cred.Options) *LogoutCommand {
+func LogoutCmd(authOpts func() cred.Options) *LogoutCommand {
 	return &LogoutCommand{
 		authOpts: authOpts,
 	}
@@ -31,19 +31,20 @@ func (*LogoutCommand) Synopsis() string {
 }
 
 func (*LogoutCommand) Usage() string {
-	return "logout from siso system."
+	return "logout from siso system.\n"
 }
 
 // LogoutCommand implements logout subcommand.
 type LogoutCommand struct {
-	authOpts cred.Options
+	authOpts func() cred.Options
 }
 
 func (*LogoutCommand) SetFlags(flagSet *flag.FlagSet) {}
 
 func (c *LogoutCommand) Execute(ctx context.Context, flagSet *flag.FlagSet, _ ...any) subcommands.ExitStatus {
-	fmt.Printf("using %s for auth\n", c.authOpts.Type)
-	err := c.authOpts.Logout(ctx)
+	authOps := c.authOpts()
+	fmt.Printf("using %s for auth\n", authOps.Type)
+	err := authOps.Logout(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return subcommands.ExitFailure

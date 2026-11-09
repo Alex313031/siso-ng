@@ -16,11 +16,13 @@ import (
 	"github.com/google/subcommands"
 	"google.golang.org/protobuf/encoding/prototext"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/execute/localexec"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/o11y/clog"
+	sisopath "go.chromium.org/build/siso/path"
 	"go.chromium.org/build/siso/toolsupport/nsjailutil"
 )
 
@@ -88,19 +90,15 @@ func (c *Command) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	hashFS, err := hashfs.New(ctx, hashfs.Option{})
-	if err != nil {
-		return err
-	}
-	defer hashFS.Close(ctx)
 	fsstate, err := hashfs.Load(ctx, *c.fsopt)
 	if err != nil {
 		return err
 	}
-	err = hashFS.SetState(ctx, fsstate)
+	hashFS, err := hashfs.NewFromState(ctx, fsstate, hashfs.Option{})
 	if err != nil {
 		return err
 	}
+	defer hashFS.Close(ctx)
 
 	var req nsjailutil.Request
 	if c.nsjailReqJSONString == "" {
@@ -123,12 +121,12 @@ func (c *Command) run(ctx context.Context) error {
 	}
 
 	cmd := &execute.Cmd{
-		WorkspaceRoot:     workspaceRoot,
-		WorkDir:           outDir,
-		Inputs:            req.Inputs,
-		Outputs:           req.Outputs,
-		HashFS:            hashFS,
-		ExecRootInJailDir: jail.ExecRoot(),
+		WorkspaceRoot: workspaceRoot,
+		WorkDir:       sisopath.Path(outDir),
+		Inputs:        sisopath.Paths(req.Inputs),
+		Outputs:       sisopath.Paths(req.Outputs),
+		HashFS:        hashFS,
+		PostProc:      jail.PostProc,
 	}
 	cmd.Args, err = jail.Args(ctx, c.cmdline...)
 	if err != nil {
@@ -142,12 +140,11 @@ func (c *Command) run(ctx context.Context) error {
 		return err
 	}
 	result, _ := cmd.ActionResult()
-	outputEntries, err := hashFS.Entries(ctx, cmd.WorkspaceRoot, cmd.AllOutputs())
-	if err != nil {
+	// Populate the result's outputs. The store is throwaway: this debug tool
+	// prints the result, it does not upload the blobs.
+	if err := cmd.SetResultOutputs(ctx, result, blob.NewStore()); err != nil {
 		return err
 	}
-	// Set the outputs on the result
-	execute.ResultFromEntries(ctx, result, cmd.WorkDir, outputEntries)
 
 	buf, err := prototext.MarshalOptions{
 		Multiline: true,

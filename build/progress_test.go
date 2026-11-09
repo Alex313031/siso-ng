@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -25,6 +26,8 @@ type recordingUI struct {
 func (r *recordingUI) PrintLines(msgs ...string) {
 	r.printLines = append(r.printLines, slices.Clone(msgs))
 }
+
+func (*recordingUI) IsOneTerminalLine(string) bool { return true }
 
 func (r *recordingUI) NewSpinner() ui.Spinner {
 	return noopSpinner{}
@@ -265,12 +268,32 @@ func topActiveOffsets(p *progress) []int {
 	return out
 }
 
+// mkTopActiveWithPhase is a helper that returns a stepInfo with a given phase
+// and startTime offset.
+func mkTopActiveWithPhase(offsetSec int, phase stepPhase) *stepInfo {
+	base := time.Unix(1_700_000_000, 0)
+	step := &Step{
+		startTime: base.Add(time.Duration(offsetSec) * time.Second),
+		state:     &stepState{},
+	}
+	step.setPhase(phase)
+	return &stepInfo{
+		step: step,
+	}
+}
+
 // sortTopActives applies the same ordering update() performs at the
 // end of its filter pass, so per insert tests can assert the K
-// oldest in the order render() sees.
+// steps in the order render() sees.
 func sortTopActives(p *progress) {
 	slices.SortFunc(p.topActives, func(a, b *stepInfo) int {
-		return a.step.startTime.Compare(b.step.startTime)
+		if stepActiveLess(a, b) {
+			return -1
+		}
+		if stepActiveLess(b, a) {
+			return 1
+		}
+		return 0
 	})
 }
 
@@ -438,5 +461,128 @@ func TestProgress_NotIsTerminal(t *testing.T) {
 
 	if w := step.getWeightedDuration(); w == 0 {
 		t.Errorf("weighted_duration=0; want non-zero")
+	}
+}
+
+func TestElideStatus(t *testing.T) {
+	for _, tc := range []struct {
+		msg  string
+		want string
+	}{
+		{
+			msg:  "[100/123456] 10.20s pre:0 local:\033[41m653\033[0m remote:\033[41m12345\033[0m cache:0.67% fallback:\033[41m873\033[0m",
+			want: "[100/123456] 10.20s p:0 l:\033[41m653\033[0m r:\033[41m12345\033[0m c:0.67% f:\033[41m873\033[0m",
+		},
+		{
+			msg:  "[200/123456] 1m10.20s pre:0 local:\033[41m653\033[0m remote:\033[41m12345\033[0m cache:0.67% cache-write:10(err:0) fallback:\033[41m873\033[0m",
+			want: "[200/123456] 1m10.20s p:0 l:\033[41m653\033[0m r:\033[41m12345\033[0m c:0.67% cw:10(err:0) f:\033[41m873\033[0m",
+		},
+		{
+			msg:  "[300/123456] 2m10.20s pre:0 local:8\033[41m(+24)\033[0m remote:100\033[41m(+50)\033[0m cache:0.67% fallback:\033[41m873\033[0m",
+			want: "[300/123456] 2m10.20s p:0 l:8\033[41m(+24)\033[0m r:100\033[41m(+50)\033[0m c:0.67% f:\033[41m873\033[0m",
+		},
+	} {
+		got := elideStatus(tc.msg)
+		if got != tc.want {
+			t.Errorf("elideStatus(%q)=%q; want %q\nmsg:\n%s\ngot:\n%s", tc.msg, got, tc.want, tc.msg, got)
+		}
+	}
+}
+
+func TestInsertTopActive_PrioritizesRunningOverWaiting(t *testing.T) {
+	var p progress
+	// First insert 5 wait-local steps (offsets 1 to 5)
+	for offset := 1; offset <= activeItems; offset++ {
+		p.insertTopActive(mkTopActiveWithPhase(offset, stepLocalWait))
+	}
+	// Now insert 3 newer running steps (offsets 10 to 12)
+	for offset := 10; offset <= 12; offset++ {
+		p.insertTopActive(mkTopActiveWithPhase(offset, stepLocalRun))
+	}
+	sortTopActives(&p)
+
+	// We expect 3 running steps (10, 11, 12) prioritized first,
+	// followed by the 2 oldest waiting steps (1, 2).
+	want := []int{10, 11, 12, 1, 2}
+	if got := topActiveOffsets(&p); !slices.Equal(got, want) {
+		t.Errorf("topActives offsets=%v; want %v", got, want)
+	}
+}
+
+func TestStepDisplayDuration_WaitAndRun(t *testing.T) {
+	start := time.Now().Add(-5 * time.Second)
+	step := &Step{
+		startTime: start,
+		state:     &stepState{},
+	}
+	// Step starts
+	step.setPhase(stepStart)
+	if dur := step.displayDuration(); dur < 4*time.Second {
+		t.Errorf("displayDuration in start phase=%v; want >= 4s", dur)
+	}
+
+	// Step enters wait-local
+	step.setPhase(stepLocalWait)
+	// Artificially adjust waitStart to 3 seconds ago to simulate waiting
+	step.state.mu.Lock()
+	step.state.waitStart = time.Now().Add(-3 * time.Second)
+	step.state.mu.Unlock()
+
+	// In wait phase, displayDuration should reflect time spent in waitStart (~3s)
+	// while servDuration excludes wait time (~2s).
+	if d := step.displayDuration(); d < 2500*time.Millisecond || d > 3500*time.Millisecond {
+		t.Errorf("displayDuration in wait-local=%v; want ~3s", d)
+	}
+	if s := step.servDuration(); s < 1500*time.Millisecond || s > 2500*time.Millisecond {
+		t.Errorf("servDuration in wait-local=%v; want ~2s", s)
+	}
+
+	// Step enters local run
+	step.setPhase(stepLocalRun)
+	// Now displayDuration should match servDuration within a small slack
+	diff := step.displayDuration() - step.servDuration()
+	if diff < -time.Millisecond || diff > time.Millisecond {
+		t.Errorf("displayDuration in local run diff with servDuration=%v; want ~0", diff)
+	}
+}
+
+func TestFormatStepRow_WaitPhaseDisplay(t *testing.T) {
+	step := &Step{
+		cmd:       &execute.Cmd{Desc: "CXX foo.obj"},
+		startTime: time.Now().Add(-10 * time.Second),
+		state:     &stepState{},
+	}
+	step.setPhase(stepLocalWait)
+	step.state.mu.Lock()
+	step.state.waitStart = time.Now().Add(-5 * time.Second)
+	step.state.mu.Unlock()
+
+	si := &stepInfo{
+		step: step,
+		desc: step.cmd.Desc,
+	}
+	row := formatStepRow(si)
+	// Row should include duration ("5s") and [wait-local] phase
+	if !strings.Contains(row, "[wait-local]") || !strings.Contains(row, "CXX foo.obj") || !strings.Contains(row, "5s") {
+		t.Errorf("formatStepRow output unexpected: %q", row)
+	}
+}
+
+func TestBuilder_ProgressInfo(t *testing.T) {
+	st := newStats(100)
+	st.s.Done = 30
+	st.s.Skipped = 5
+	b := &Builder{
+		stats: st,
+	}
+	p := b.ProgressInfo()
+	if want := 25; p.Done != want {
+		t.Errorf("p.Done = %d; want %d", p.Done, want)
+	}
+	if want := 95; p.Total != want {
+		t.Errorf("p.Total = %d; want %d", p.Total, want)
+	}
+	if want := 5; p.Skipped != want {
+		t.Errorf("p.Skipped = %d; want %d", p.Skipped, want)
 	}
 }

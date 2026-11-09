@@ -55,7 +55,7 @@ func TestKeepFirstAttempt(t *testing.T) {
 	}{
 		{
 			// The watchdog genuinely interrupted the in-flight call.
-			name:    "our deadline cut the call off",
+			name:    "watchdog_deadline_exceeded",
 			ctx:     firedTimeoutCtx(t, cause),
 			callErr: deadlineErr,
 			want:    false, // fall back to a fresh attempt
@@ -63,7 +63,7 @@ func TestKeepFirstAttempt(t *testing.T) {
 		{
 			// The cache hit returned just as the deadline fired. The
 			// regression: this result must not be discarded.
-			name:    "cache hit raced the deadline",
+			name:    "cache_hit_raced_deadline",
 			ctx:     firedTimeoutCtx(t, cause),
 			callErr: nil,
 			want:    true,
@@ -72,13 +72,13 @@ func TestKeepFirstAttempt(t *testing.T) {
 			// A definitive NotFound returned just as the deadline fired.
 			// Keep it rather than redo the lookup (whose fallback could
 			// itself fail and surface a worse error).
-			name:    "final error raced the deadline",
+			name:    "final_error_raced_deadline",
 			ctx:     firedTimeoutCtx(t, cause),
 			callErr: status.Error(codes.NotFound, "no action result"),
 			want:    true,
 		},
 		{
-			name:    "deadline never fired",
+			name:    "deadline_never_fired",
 			ctx:     liveCtx,
 			callErr: nil,
 			want:    true,
@@ -86,7 +86,7 @@ func TestKeepFirstAttempt(t *testing.T) {
 		{
 			// DeadlineExceeded, but from the parent's deadline, not ours.
 			// Falling back under an already-expired parent is pointless.
-			name:    "parent deadline, not ours",
+			name:    "parent_deadline_exceeded",
 			ctx:     parentExpired,
 			callErr: deadlineErr,
 			want:    true,

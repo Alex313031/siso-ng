@@ -6,15 +6,25 @@ It also provides a replacement for Ninja's `ninja -t browse`.
 
 ## Development philosophy
 
-Siso does not have dedicated web frontend engineers, and it is not intended
-for the web UI to be a substitute for systems such as CI.
+The web UI was historically a minimal Go-rendered webapp to visualize Siso
+build metrics, utilizing HTMX and modern web platform features to
+progressively enhance statically-rendered pages with rich client-side
+interactivity.
 
-As such, the web UI is developed as a server-side rendered webapp, keeping
-external dependencies as minimal as reasonably possible.
+Due to increasing scope and complexity of the web UI, as well as the desire
+to decouple the step metric viewer from Siso's internals, and the increasingly
+clear benefits of being able to run without a backend, as of late 2026 the
+web UI is undergoing a partial rewrite into a client-side webapp.
+
+This therefore *drops* the progressive enhancement philosophy, and will require
+JavaScript to be enabled for full functionality of Siso-only features.
+
+Functionality that serves as a drop-in for Ninja features e.g. the Ninja rule
+browser are currently **out of scope** of this decision.
 
 ### Dependencies
 
-The only two major dependencies at time of writing are:
+The only two major dependencies in the web UI's initial life were:
 
 - **[Material Web Components][mwc]** provides off-the-shelf implementations
   of Material 3 components.
@@ -26,25 +36,24 @@ The only two major dependencies at time of writing are:
   - Custom JS is used to gracefully intercept and handle errors rather than
     forcing full-page refreshes.
 
-### No custom JavaScript (within reason)
+Lit, a lightweight wrapper offering conveniences around the web platform's
+native web components, came as a transitive dependency via Material Web
+Components and thus is adopted for the late 2026 rewrite.
 
-Prefer writing as little custom JavaScript as possible.
+### Avoid inline scripts
 
-Frontend web frameworks add a burden of additional domain-specific expertise.
-Without dedicated web frontend engineers, this adds maintenance overhead that
-this project is not staffed to handle.
+To balance the realities of supporting custom client-side functionality
+in a project not staffed with dedicated web frontend engineers, the initial
+ground rule being set is that client-side only JavaScript being introduced
+*must* be encapsulated via web components.
 
-The modern web platform provides features that support rich client-side
-interactivity with less overhead than historically required:
+Dependencies should be kept as minimal as possible; **strongly** consider
+native web platform features first.
 
-- Popovers can be treated as native to the web platform as part of
-  [Baseline 2025][popover-baseline] and can be utilized without JavaScript.
-- Web Components, such as [Material Web Components][mwc], can be utilized
-  without a bundler and provide many common UI behaviors (e.g. dialogs, tabs,
-  etc.) with custom design, interactivity, and accessibility story out of the
-  box.
+Web components should be treated as "islands" of functionality that compose
+together with clear contracts.
 
-Unavoidable cases of custom JavaScript include:
+Pre-adoption of Lit, these were the justifications for custom JavaScript:
 
 - Real-time events via Server-Sent Events are part of the modern web platform,
   but require custom JavaScript to handle.
@@ -67,6 +76,19 @@ historical reasons to use a web bundler, such as:
 - CSS nesting (including auxiliary features such as the `&` selector),
   one historically common reason to require a build step for CSS preprocessing,
   is available as part of [Baseline 2023][css-nesting-baseline].
+
+### JavaScript tests
+
+Plain JavaScript modules (i.e. not web components) can be unit tested with
+Node's built-in [`node:test`][node-test] runner and `node:assert`, without any
+npm dependencies. Prefer moving logic out of web components and into such
+modules so that it can be tested this way.
+
+- Name test files `*_test.mjs` next to the module under test. The `.mjs`
+  extension keeps them out of the `static/*.js` files embedded by `serve.go`.
+- Run them from this directory with `node --test`.
+- `NODEJS_VERSION` pins the Node version used by CI. The `buildinfra` recipe
+  runs `node --test` in every directory that contains a `NODEJS_VERSION` file.
 
 ## Architecture
 
@@ -105,4 +127,4 @@ attribute determines which of them are responded to.
 [perfetto-deep-linking]: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
 [popover-baseline]: https://web.dev/blog/popover-baseline
 [css-nesting-baseline]: https://web.dev/blog/baseline2023#more-features
-
+[node-test]: https://nodejs.org/api/test.html

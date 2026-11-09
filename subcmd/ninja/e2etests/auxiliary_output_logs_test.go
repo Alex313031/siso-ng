@@ -12,13 +12,14 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/reapitest"
 )
 
@@ -80,22 +81,22 @@ func TestBuild_Auxiliary_Remote(t *testing.T) {
 			setupFiles(t, dir, testDataName, nil)
 
 			outContent := []byte("out-content")
-			outDigest := digest.FromBytes("out.o", outContent)
+			outDigest := blob.FromBytes(digest.SHA256, "out.o", outContent)
 			auxContent := []byte("aux-content")
-			auxDigest := digest.FromBytes("debug.out", auxContent)
+			auxDigest := blob.FromBytes(digest.SHA256, "debug.out", auxContent)
 
 			auxDirFileContent := []byte("aux-dir-file-content")
 			auxTree := &rpb.Tree{Root: &rpb.Directory{
 				Files: []*rpb.FileNode{{
 					Name:   "file",
-					Digest: digest.FromBytes("aux_dir/file", auxDirFileContent).Digest().Proto(),
+					Digest: blob.FromBytes(digest.SHA256, "aux_dir/file", auxDirFileContent).Digest().Proto(),
 				}},
 			}}
 			auxTreeBytes, err := proto.Marshal(auxTree)
 			if err != nil {
 				t.Fatal(err)
 			}
-			auxTreeDigest := digest.FromBytes("aux_dir", auxTreeBytes)
+			auxTreeDigest := blob.FromBytes(digest.SHA256, "aux_dir", auxTreeBytes)
 
 			fakere := &reapitest.Fake{
 				ExecuteFunc: func(re *reapitest.Fake, action *rpb.Action) (*rpb.ActionResult, error) {

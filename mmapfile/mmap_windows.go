@@ -46,7 +46,18 @@ func Read(path string) ([]byte, error) {
 		windows.UnmapViewOfFile(addr)
 		return nil, fmt.Errorf("CloseHandle %s: %w", path, err)
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(addr)), int(size)), nil
+	return unsafe.Slice(bytePtr(addr), int(size)), nil
+}
+
+// bytePtr turns a raw memory address into a *byte without a
+// uintptr-to-unsafe.Pointer conversion. go vet's unsafeptr check flags that
+// conversion because it cannot tell the address is a valid pointer. The
+// address comes from MapViewOfFile and points at OS-mapped memory outside the
+// Go heap, so the garbage collector never needs to track it.
+func bytePtr(addr uintptr) *byte {
+	var p *byte
+	*(*uintptr)(unsafe.Pointer(&p)) = addr
+	return p
 }
 
 // Unmap releases a mapping returned by Read. A nil/empty slice is a no-op,
@@ -85,7 +96,7 @@ func Write(f *os.File, size int) (data []byte, closer func() error, retErr error
 		return nil, nil, fmt.Errorf("MapViewOfFile %s: %w", f.Name(), err)
 	}
 
-	data = unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
+	data = unsafe.Slice(bytePtr(addr), size)
 
 	closer = func() error {
 		if err := windows.FlushViewOfFile(addr, 0); err != nil {

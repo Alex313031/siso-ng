@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"testing"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/reapi/reapitest"
 )
 
@@ -60,7 +60,7 @@ func TestBuild_MissingInputDir(t *testing.T) {
 				OutputFiles: []*rpb.OutputFile{
 					{
 						Path:   "obj/foo/foo.o",
-						Digest: digest.Empty.Proto(),
+						Digest: digest.SHA256.Empty().Proto(),
 					},
 					{
 						Path:   "obj/foo/foo.o.d",

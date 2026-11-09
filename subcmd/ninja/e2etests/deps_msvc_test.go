@@ -13,10 +13,12 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/build"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
-	"go.chromium.org/build/siso/reapi"
+	"go.chromium.org/build/siso/reapi/reapitest"
 )
 
 func TestBuild_DepsMSVC(t *testing.T) {
@@ -105,7 +107,7 @@ func TestBuild_DepsMSVC_fastlocal(t *testing.T) {
 		setupFiles(t, dir, t.Name(), nil)
 		opt, graph, cleanup := setupBuild(ctx, t, dir, hashfs.Option{})
 		defer cleanup()
-		opt.REAPIClient = &reapi.Client{}
+		opt.REAPIClient = reapitest.New(ctx, t, &reapitest.Fake{})
 		opt.Limits = testLimits
 
 		_, err := ninjabuild.Run(ctx, graph, opt, []string{"all"}, ninjabuild.RunNinjaOpts{})
@@ -137,7 +139,7 @@ func TestBuild_DepsMSVC_fastlocal(t *testing.T) {
 		setupFiles(t, dir, t.Name()+"_second", []string{"base/other.h"})
 		opt, graph, cleanup := setupBuild(ctx, t, dir, hashfs.Option{})
 		defer cleanup()
-		opt.REAPIClient = &reapi.Client{}
+		opt.REAPIClient = reapitest.New(ctx, t, &reapitest.Fake{})
 		opt.Limits = testLimits
 
 		_, err := ninjabuild.Run(ctx, graph, opt, []string{"all"}, ninjabuild.RunNinjaOpts{})
@@ -206,7 +208,7 @@ func TestBuild_DepsMSVC_InstallerRC(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m := hashfs.StateMap(st)
+		m := hashfs.StateMap(digest.SHA256, st)
 		_, ok := m[filepath.ToSlash(filepath.Join(dir, fname))]
 		return ok
 	}
@@ -271,7 +273,6 @@ func TestBuild_DepsMSVC_InstallerRC(t *testing.T) {
 	// deps for foo/base.dll should be disappeared
 	want = []string{
 		filepath.ToSlash(filepath.Join(dir, "out/siso/gen/installer/bar/base.dll")),
-		"gen/installer/bar/base.dll",
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("deps gen/installer/packed_files.res -want +got:\n%s", diff)

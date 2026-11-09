@@ -20,12 +20,13 @@ import (
 	"github.com/google/subcommands"
 	"golang.org/x/sync/errgroup"
 
+	"go.chromium.org/build/hashigo/digest"
+
 	"go.chromium.org/build/siso/auth/cred"
 	"go.chromium.org/build/siso/build/ninjabuild"
 	"go.chromium.org/build/siso/hashfs"
 	pb "go.chromium.org/build/siso/hashfs/proto"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
 	"go.chromium.org/build/siso/signals"
 	"go.chromium.org/build/siso/sync/semaphore"
 )
@@ -146,7 +147,11 @@ func (c *flushCommand) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load %s: %w", c.stateFile, err)
 	}
-	stm := hashfs.StateMap(st)
+	err = checkStateDigestFunction(st, client.DigestFunction())
+	if err != nil {
+		return err
+	}
+	stm := hashfs.StateMap(client.DigestFunction(), st)
 
 	for _, fname := range fnames {
 		fmt.Printf("%s ...", fname)
@@ -202,6 +207,26 @@ func (c *flushCommand) run(ctx context.Context) error {
 		}
 	}
 	return c.eg.Wait()
+}
+
+// checkStateDigestFunction returns an error if the fs state was recorded
+// under a different digest function than the client uses. Entries recorded
+// under another function are unfetchable from CAS by this client, so flush
+// would silently report every file as "not found"; fail early with the flag
+// to pass instead. An empty state has nothing to flush, so any recorded
+// function is accepted.
+func checkStateDigestFunction(st *pb.State, clientFn digest.Function) error {
+	if len(st.GetEntries()) == 0 {
+		return nil
+	}
+	stateFn, err := hashfs.StateDigestFunction(st)
+	if err != nil {
+		return err
+	}
+	if stateFn == clientFn {
+		return nil
+	}
+	return fmt.Errorf("fs state was recorded with digest function %s but the client uses %s; pass -reapi_digest_function=%s", stateFn, clientFn, stateFn)
 }
 
 func isDirEnt(ent *pb.Entry) bool {

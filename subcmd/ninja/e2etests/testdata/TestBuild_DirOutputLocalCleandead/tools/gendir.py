@@ -1,0 +1,34 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# gendir writes its input content into an output directory tree. Run
+# locally (no remote rule), so the inner files are recorded in hashfs
+# WITHOUT a cmdhash; only the directory node carries one.
+
+import argparse
+import os
+import sys
+
+
+def main():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--out_dir", required=True)
+  parser.add_argument("inputs", nargs="*")
+  options = parser.parse_args()
+
+  data = ""
+  for input_path in options.inputs:
+    with open(input_path) as f:
+      data += f.read()
+
+  os.makedirs(os.path.join(options.out_dir, "sub"), exist_ok=True)
+  with open(os.path.join(options.out_dir, "data"), "w") as f:
+    f.write(data)
+  with open(os.path.join(options.out_dir, "sub", "nested"), "w") as f:
+    f.write(data)
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

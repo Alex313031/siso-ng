@@ -1,0 +1,20 @@
+# Copyright 2026 The Chromium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+rule gendir
+   command = python3 ../../tools/gendir.py --out_dir=${out_dir} --ext_dir=${ext_dir} ${in}
+
+rule stamp
+   command = python3 ../../tools/stamp.py --out=${out} ${in_dir}
+
+build gen/: gendir ../../base/input | ../../tools/gendir.py
+  out_dir = gen
+  ext_dir = ../../ext
+
+build stamp.out: stamp gen/ | ../../tools/stamp.py
+  in_dir = gen
+
+build all: phony stamp.out
+
+build build.ninja: phony

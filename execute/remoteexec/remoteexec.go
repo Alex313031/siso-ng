@@ -9,20 +9,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"time"
 
 	log "github.com/golang/glog"
 
+	"go.chromium.org/build/hashigo/digest"
 	rpb "go.chromium.org/build/remote-apis/build/bazel/remote/execution/v2"
 
+	"go.chromium.org/build/siso/blob"
 	"go.chromium.org/build/siso/execute"
 	"go.chromium.org/build/siso/o11y/clog"
 	"go.chromium.org/build/siso/o11y/trace"
 	"go.chromium.org/build/siso/reapi"
-	"go.chromium.org/build/siso/reapi/digest"
-	"go.chromium.org/build/siso/reapi/merkletree"
 	_ "go.chromium.org/build/siso/reapi/proto" // for auxiliary metadata
 	"go.chromium.org/build/siso/sync/semaphore"
 )
@@ -46,7 +45,7 @@ func (re *RemoteExec) prepareInputs(ctx context.Context, cmd *execute.Cmd) (dige
 	var actionDigest digest.Digest
 	err := Semaphore.Do(ctx, func(ctx context.Context) error {
 		var err error
-		ds := digest.NewStore()
+		ds := blob.NewStore()
 		actionDigest, err = cmd.Digest(ctx, ds)
 		if err != nil {
 			return err
@@ -61,32 +60,22 @@ func (re *RemoteExec) prepareInputs(ctx context.Context, cmd *execute.Cmd) (dige
 	return actionDigest, err
 }
 
-// Run runs a cmd. uploadCtx is used for CAS input uploads
-// (prepareInputs); execCtx is used for the remote execution RPC.
-// In the non-racing path both contexts are the same. In racing
-// mode, uploadCtx is the build context (survives race cancellation)
-// while execCtx is the race context (canceled when the race decides).
-// This mirrors reclient's approach of using a background context for
-// CAS uploads so that shared upload operations are not poisoned when
-// a racing goroutine's context is canceled.
 // Execute runs the remote command and waits for completion.
 // It does not download outputs or stdout/stderr.
 // It returns the ActionResult, whether it was cached, and any execution error.
-func (re *RemoteExec) Execute(uploadCtx, execCtx context.Context, cmd *execute.Cmd) (*rpb.ActionResult, bool, error) {
-	execCtx, span := trace.NewSpan(execCtx, "remote-exec")
+//
+// Canceling ctx stops waiting for CAS input uploads, but does not cancel
+// the uploads themselves: they run as upload operations owned by the
+// reapi client, shared with other commands that need the same blobs.
+func (re *RemoteExec) Execute(ctx context.Context, cmd *execute.Cmd) (*rpb.ActionResult, bool, error) {
+	ctx, span := trace.NewSpan(ctx, "remote-exec")
 	defer span.Close(nil)
-	actionDigest, err := re.prepareInputs(uploadCtx, cmd)
+	actionDigest, err := re.prepareInputs(ctx, cmd)
 	if err != nil {
 		return nil, false, err
 	}
-	// If the execution context was canceled during upload (e.g.
-	// the race was decided while CAS uploads were finishing),
-	// return early without starting remote execution.
-	if execCtx.Err() != nil {
-		return nil, false, context.Cause(execCtx)
-	}
 
-	cctx, cspan := trace.NewSpan(execCtx, "execute-and-wait")
+	cctx, cspan := trace.NewSpan(ctx, "execute-and-wait")
 	if cmd.Timeout > 0 {
 		var cancel context.CancelFunc
 		cctx, cancel = context.WithTimeoutCause(cctx, cmd.Timeout, fmt.Errorf("remote exec timeout=%v: %w", cmd.Timeout, context.DeadlineExceeded))
@@ -95,34 +84,28 @@ func (re *RemoteExec) Execute(uploadCtx, execCtx context.Context, cmd *execute.C
 	opName, resp, err := re.client.ExecuteAndWait(cctx, &rpb.ExecuteRequest{
 		ActionDigest:    actionDigest.Proto(),
 		SkipCacheLookup: cmd.SkipCacheLookup,
+		DigestFunction:  re.client.DigestFunction().Value(),
 	})
 	cspan.Close(nil)
-	clog.Infof(execCtx, "digest: %s, skipCacheLookup:%t opName: %s", actionDigest, cmd.SkipCacheLookup, opName)
+	clog.Infof(ctx, "digest: %s, skipCacheLookup:%t opName: %s", actionDigest, cmd.SkipCacheLookup, opName)
 	if log.V(1) {
-		clog.Infof(execCtx, "response: %s", resp)
+		clog.Infof(ctx, "response: %s", resp)
 	}
 	if err != nil {
-		clog.Warningf(execCtx, "digest: %s, err: %v", actionDigest, err)
+		clog.Warningf(ctx, "digest: %s, err: %v", actionDigest, err)
 	}
 	result := resp.GetResult()
-	re.recordExecuteMetadata(execCtx, result, resp.GetCachedResult(), span)
+	re.recordExecuteMetadata(ctx, result, resp.GetCachedResult(), span)
 	if result != nil {
 		cmd.SetActionResult(result, resp.GetCachedResult())
 	}
 	return result, resp.GetCachedResult(), err
 }
 
-// Run runs a cmd. uploadCtx is used for CAS input uploads
-// (prepareInputs); execCtx is used for the remote execution RPC.
-// In the non-racing path both contexts are the same. In racing
-// mode, uploadCtx is the build context (survives race cancellation)
-// while execCtx is the race context (canceled when the race decides).
-// This mirrors reclient's approach of using a background context for
-// CAS uploads so that shared upload operations are not poisoned when
-// a racing goroutine's context is canceled.
-func (re *RemoteExec) Run(uploadCtx, execCtx context.Context, cmd *execute.Cmd) error {
-	result, cached, err := re.Execute(uploadCtx, execCtx, cmd)
-	return re.ProcessResult(execCtx, cmd, result, cached, err)
+// Run runs a cmd.
+func (re *RemoteExec) Run(ctx context.Context, cmd *execute.Cmd) error {
+	result, cached, err := re.Execute(ctx, cmd)
+	return re.ProcessResult(ctx, cmd, result, cached, err)
 }
 
 func (re *RemoteExec) recordExecuteMetadata(ctx context.Context, result *rpb.ActionResult, cached bool, span *trace.Span) {
@@ -210,31 +193,9 @@ func (re *RemoteExec) ProcessResult(ctx context.Context, cmd *execute.Cmd, resul
 	// Record auxiliary outputs logs (e.g. crash reports) for debugging.
 	cmd.RecordAuxiliaryOutputDigests(ctx, result)
 
-	files := result.GetOutputFiles()
-	symlinks := result.GetOutputSymlinks()
-	var dirs []*rpb.OutputDirectory
-	for _, d := range result.GetOutputDirectories() {
-		dname := filepath.ToSlash(filepath.Join(cmd.WorkDir, d.GetPath()))
-		// Auxiliary directories don't need to be expanded/flattened.
-		// We only need the Tree digest for logging, and they are not used as inputs for other steps.
-		if cmd.IsAuxiliary(dname) {
-			dirs = append(dirs, d)
-			continue
-		}
-		ds := digest.NewStore()
-		outdir, derr := re.client.FetchTree(ctx, d.GetPath(), digest.FromProto(d.GetTreeDigest()), ds)
-		if derr != nil {
-			clog.Errorf(ctx, "Failed to fetch tree %s %s: %v", d.GetPath(), d.GetTreeDigest(), derr)
-			continue
-		}
-		dfiles, dsymlinks, ddirs := merkletree.Traverse(ctx, d.GetPath(), outdir, ds)
-		files = append(files, dfiles...)
-		symlinks = append(symlinks, dsymlinks...)
-		dirs = append(dirs, ddirs...)
-	}
-	result.OutputFiles = files
-	result.OutputSymlinks = symlinks
-	result.OutputDirectories = dirs
+	// Leave the raw result as-is: a dir output's Tree is flattened when the
+	// result is recorded (cmd.RecordOutputs -> expandDirOutputs), the single
+	// path every result flows through. Expanding here would duplicate that.
 	cmd.SetActionResult(result, cached)
 	if len(result.GetStdoutRaw()) > 0 {
 		cmd.StdoutWriter().Write(result.GetStdoutRaw())

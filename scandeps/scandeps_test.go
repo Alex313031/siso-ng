@@ -9,12 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 
 	"go.chromium.org/build/siso/hashfs"
+	"go.chromium.org/build/siso/path"
 )
 
 // tempDir returns real path of temp dir.
@@ -111,16 +114,16 @@ func TestScanDeps(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{InputDeps: inputDeps})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"apps/apps.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"",
 			"third_party/glog/src",
 			"build/third_party/libc++",
 			"build/third_party/libc++/trunk/include",
 		},
-		Sysroots: []string{
+		Sysroots: []path.Path{
 			"build/linux/debian_bullseye_amd64-sysroot",
 		},
 	}
@@ -130,7 +133,7 @@ func TestScanDeps(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		"apps",
 		"apps/apps.cc",
 		"apps/apps.h",
@@ -145,8 +148,67 @@ func TestScanDeps(t *testing.T) {
 		"third_party/glog/src/glog/export.h",
 		"third_party/glog/src/glog/logging.h",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
+	}
+}
+
+// TestScanDeps_BackslashInclude verifies that an #include path containing a
+// backslash separator or a redundant slash resolves to a clean forward-slash
+// dependency path. Headers generated on Windows contain such paths. A
+// non-normalized path would be placed under a wrong directory in the remote
+// input tree, so the remote compiler could not find the header.
+func TestScanDeps_BackslashInclude(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("backslashes are only path separators on Windows")
+	}
+	ctx := t.Context()
+	dir := tempDir(t)
+
+	for fname, content := range map[string]string{
+		// Mimics a generated header: os.path.join produced the backslash and
+		// string concatenation produced the redundant "//".
+		"gen/forward.h": `
+#include "base//nested\header.h"
+`,
+		"base/nested/header.h": ``,
+		"apps/apps.cc": `
+#include "gen/forward.h"
+`,
+	} {
+		fname := filepath.Join(dir, fname)
+		if err := os.MkdirAll(filepath.Dir(fname), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fname, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hashFS, err := hashfs.New(ctx, hashfs.Option{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanDeps := New(ctx, hashFS, Options{})
+	req := Request{
+		Sources: []path.Path{"apps/apps.cc"},
+		Dirs:    []path.Path{""},
+	}
+	got, err := scanDeps.Scan(ctx, dir, req)
+	if err != nil {
+		t.Fatalf("Scan()=%v; want nil err", err)
+	}
+
+	// The backslash+redundant-slash include must resolve to a clean path.
+	const want = path.Path("base/nested/header.h")
+	if !slices.Contains(got, want) {
+		t.Errorf("scandeps did not resolve backslash include to %q; got %q", want, got)
+	}
+	// No returned dependency may retain a backslash or a redundant slash.
+	for _, p := range got {
+		if strings.ContainsRune(string(p), '\\') || strings.Contains(string(p), "//") {
+			t.Errorf("scandeps returned non-normalized path %q", p)
+		}
 	}
 }
 
@@ -192,10 +254,10 @@ func TestScanDeps_SelfIncludeInCommentAndMacroInclude(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"apps/apps.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"",
 			"third_party/vulkan-deps/vulkan-validation-layers/src/layers/external",
 		},
@@ -205,14 +267,14 @@ func TestScanDeps_SelfIncludeInCommentAndMacroInclude(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		"apps",
 		"apps/apps.cc",
 		"third_party/vulkan-deps/vulkan-validation-layers/src/layers/external",
 		"third_party/vulkan-deps/vulkan-validation-layers/src/layers/external/vma",
 		"third_party/vulkan-deps/vulkan-validation-layers/src/layers/external/vma/vk_mem_alloc.h",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -281,10 +343,10 @@ func TestScanDeps_IncludeByDifferentMacroValue(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"third_party/harfbuzz-ng/src/src/hb-subset.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"",
 			"third_party/harfbuzz-ng/src/src",
 		},
@@ -294,7 +356,7 @@ func TestScanDeps_IncludeByDifferentMacroValue(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		"third_party/harfbuzz-ng/src/src",
 		"third_party/harfbuzz-ng/src/src/hb-subset.cc",
 		"third_party/harfbuzz-ng/src/src/hb-ot-post-table.hh",
@@ -303,7 +365,7 @@ func TestScanDeps_IncludeByDifferentMacroValue(t *testing.T) {
 		"third_party/harfbuzz-ng/src/src/hb-ot-post-macroman.hh",
 		"third_party/harfbuzz-ng/src/src/hb-ot-cff1-std-str.hh",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -349,14 +411,14 @@ func TestScanDeps_Framework(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"app/app.mm",
 		},
-		Dirs: []string{},
-		Frameworks: []string{
+		Dirs: []path.Path{},
+		Frameworks: []path.Path{
 			"out/siso",
 		},
-		Sysroots: []string{},
+		Sysroots: []path.Path{},
 	}
 	got, err := scanDeps.Scan(ctx, dir, req)
 	if err != nil {
@@ -365,7 +427,7 @@ func TestScanDeps_Framework(t *testing.T) {
 
 	// symlink to dir (Foo.framework/Headers) and real dir
 	// for the symlink (Foo.framework/Versions/Current/Headers).
-	want := []string{
+	want := []path.Path{
 		"app",
 		"app/app.mm",
 		"out/siso",
@@ -375,7 +437,7 @@ func TestScanDeps_Framework(t *testing.T) {
 		"out/siso/Foo.framework/Versions/A/Headers",
 		"out/siso/Foo.framework/Versions/Current",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -384,7 +446,7 @@ func TestScanDeps_IQuoteDirs(t *testing.T) {
 	tests := []struct {
 		name  string
 		files map[string]string
-		want  []string
+		want  []path.Path
 	}{
 		{
 			name: "DoubleQuoteInclude",
@@ -399,7 +461,7 @@ func TestScanDeps_IQuoteDirs(t *testing.T) {
 				"iquote2/header.h": `
 `,
 			},
-			want: []string{
+			want: []path.Path{
 				".",
 				"a.cc",
 				"i",
@@ -419,7 +481,7 @@ func TestScanDeps_IQuoteDirs(t *testing.T) {
 				"iquote/header.h": `
 `,
 			},
-			want: []string{
+			want: []path.Path{
 				".",
 				"a.cc",
 				"i",
@@ -439,7 +501,7 @@ func TestScanDeps_IQuoteDirs(t *testing.T) {
 #include <header.h>
 `,
 			},
-			want: []string{
+			want: []path.Path{
 				".",
 				"a.cc",
 				"i",
@@ -474,13 +536,13 @@ func TestScanDeps_IQuoteDirs(t *testing.T) {
 			scanDeps := New(ctx, hashFS, Options{})
 
 			req := Request{
-				Sources: []string{
+				Sources: []path.Path{
 					"a.cc",
 				},
-				Dirs: []string{
+				Dirs: []path.Path{
 					"i",
 				},
-				QuoteDirs: []string{
+				QuoteDirs: []path.Path{
 					"iquote",
 					"iquote2",
 				},
@@ -491,7 +553,7 @@ func TestScanDeps_IQuoteDirs(t *testing.T) {
 				t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 			}
 
-			if diff := cmp.Diff(tt.want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+			if diff := cmp.Diff(tt.want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 				t.Errorf("scandeps diff -want +got:\n%s", diff)
 			}
 		})
@@ -539,21 +601,21 @@ func TestScanDeps_AbsPath(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"app/app.mm",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"",
 			"out/siso/gen",
 		},
-		Sysroots: []string{},
+		Sysroots: []path.Path{},
 	}
 	got, err := scanDeps.Scan(ctx, dir, req)
 	if err != nil {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		".",
 		"app",
 		"app/app.mm",
@@ -563,7 +625,7 @@ func TestScanDeps_AbsPath(t *testing.T) {
 		"out/siso/gen",
 		"out/siso/gen/popup_swift.h",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -628,15 +690,15 @@ func TestScanDeps_SymlinkDir(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{InputDeps: inputDeps})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"symlink_to_code/logging.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"",
 			"build/third_party/libc++",
 			"build/third_party/libc++/trunk/include",
 		},
-		Sysroots: []string{
+		Sysroots: []path.Path{
 			"build/linux/debian_bullseye_amd64-sysroot",
 		},
 	}
@@ -649,13 +711,13 @@ func TestScanDeps_SymlinkDir(t *testing.T) {
 	// symlink_to_code is symlink but to outside of workspace.
 	// hashfs Entries will resolve it as real one (i.e. directory)
 	// when it goes outside of workspace.
-	want := []string{
+	want := []path.Path{
 		"base",
 		"base/logging.h",
 		"symlink_to_code",
 		"symlink_to_code/logging.cc",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -706,13 +768,13 @@ func TestScanDeps_SymlinkIntermediateDir(t *testing.T) {
 	}
 	scanDeps := New(ctx, hashFS, Options{InputDeps: inputDeps})
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"src/source.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"include_vndk",
 		},
-		Sysroots: []string{
+		Sysroots: []path.Path{
 			"prebuilts/clang/host/linux-x86/clang-r563880:headers",
 			"prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot:headers",
 		},
@@ -722,7 +784,7 @@ func TestScanDeps_SymlinkIntermediateDir(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		"include/android",
 		"include_vndk",
 		"include_vndk/android",
@@ -730,7 +792,7 @@ func TestScanDeps_SymlinkIntermediateDir(t *testing.T) {
 		"src",
 		"src/source.cc",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -788,13 +850,13 @@ func TestScanDeps_SymlinkDirSymlinkIntermediateDir(t *testing.T) {
 	}
 	scanDeps := New(ctx, hashFS, Options{InputDeps: inputDeps})
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"src/source.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"system/core/include",
 		},
-		Sysroots: []string{
+		Sysroots: []path.Path{
 			"prebuilts/clang/host/linux-x86/clang-r563880:headers",
 			"prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot:headers",
 		},
@@ -804,7 +866,7 @@ func TestScanDeps_SymlinkDirSymlinkIntermediateDir(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		"src",
 		"src/source.cc",
 		"system/core/include",
@@ -815,7 +877,7 @@ func TestScanDeps_SymlinkDirSymlinkIntermediateDir(t *testing.T) {
 		"system/core/libutils/include/utils",
 		"system/core/libutils/include/utils/Errors.h",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -866,13 +928,13 @@ func TestScanDeps_SymlinkFile(t *testing.T) {
 	}
 	scanDeps := New(ctx, hashFS, Options{InputDeps: inputDeps})
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"src/source.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"include_vndk",
 		},
-		Sysroots: []string{
+		Sysroots: []path.Path{
 			"prebuilts/clang/host/linux-x86/clang-r563880:headers",
 			"prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot:headers",
 		},
@@ -882,7 +944,7 @@ func TestScanDeps_SymlinkFile(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		"include/log/log_id.h",
 		"include_vndk",
 		"include_vndk/log",
@@ -890,7 +952,7 @@ func TestScanDeps_SymlinkFile(t *testing.T) {
 		"src",
 		"src/source.cc",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 
@@ -926,13 +988,13 @@ func TestScanDeps_MacroDefinedIncludeFlag(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{InputDeps: inputDeps})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"foo.cc",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			".",
 		},
-		Includes: []string{
+		Includes: []path.Path{
 			"config.h",
 		},
 	}
@@ -940,14 +1002,14 @@ func TestScanDeps_MacroDefinedIncludeFlag(t *testing.T) {
 	if err != nil {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
-	want := []string{
+	want := []path.Path{
 		".",
 		"config.h",
 		"cores",
 		"cores/rgxcore_71.2.2448.1212.h",
 		"foo.cc",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }
@@ -986,13 +1048,13 @@ func TestScanDeps_PrematurePopDir(t *testing.T) {
 	scanDeps := New(ctx, hashFS, Options{})
 
 	req := Request{
-		Sources: []string{
+		Sources: []path.Path{
 			"apps/apps.cc",
 		},
-		Includes: []string{
+		Includes: []path.Path{
 			"redirect.h",
 		},
-		Dirs: []string{
+		Dirs: []path.Path{
 			"",
 			"OOPClasses",
 		},
@@ -1003,7 +1065,7 @@ func TestScanDeps_PrematurePopDir(t *testing.T) {
 		t.Errorf("scandeps()=%v, %v; want nil err", got, err)
 	}
 
-	want := []string{
+	want := []path.Path{
 		".",
 		"apps",
 		"apps/apps.cc",
@@ -1013,7 +1075,7 @@ func TestScanDeps_PrematurePopDir(t *testing.T) {
 		"OOPClasses",
 		"OOPClasses/check.h",
 	}
-	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b path.Path) bool { return a < b })); diff != "" {
 		t.Errorf("scandeps diff -want +got:\n%s", diff)
 	}
 }

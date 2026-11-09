@@ -116,6 +116,17 @@ func TestSplit(t *testing.T) {
 				"out/soong/.intermediates/external/libchrome/libmojo_mojom_downgraded_files/gen/ipc",
 			},
 		},
+		{
+			// GN escapes every byte >= 0x80 with a backslash in PosixNinjaFork mode.
+			// E.g. "Sørensen-Dice" (\xc3\xb8) becomes "S\<0xc3>\<0xb8>rensen-Dice" (\x5c\xc3\x5c\xb8).
+			cmdline: "python3 ../../build/rust/rustc_wrapper.py --env-var CARGO_PKG_DESCRIPTION=levenshtein\\ and\\ S\\\xc3\\\xb8rensen-Dice.",
+			want: []string{
+				"python3",
+				"../../build/rust/rustc_wrapper.py",
+				"--env-var",
+				"CARGO_PKG_DESCRIPTION=levenshtein and Sørensen-Dice.",
+			},
+		},
 	} {
 		args, err := Split(tc.cmdline)
 		if err != nil {

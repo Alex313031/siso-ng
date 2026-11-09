@@ -18,13 +18,21 @@ import (
 
 // experiment id -> hint for the experiment (to check more details).
 var knownExperiments = map[string]string{
+	// adaptive-flush replaces the static FlushSemaphore with the
+	// adaptive Gradient2 flush admission gate (resource.Network).
+	"adaptive-flush": "use the adaptive Gradient2 flush admission gate instead of the static flush semaphore",
+	// adaptive-flush-trace additionally writes the gate's debug
+	// artifacts (siso_network_gate.csv + /tmp/siso_flush_gate.txt).
+	"adaptive-flush-trace":        "write the adaptive flush gate debug trace (network_gate.csv + flush gate dump)",
 	"allow-unexpected-rsp-remove": "",
 	"allow-fallback-high":         "",
 	"allow-fallback-low":          "",
-	// check-deps checks deps (e.g. *.d) has source or direct/indirect deps only.
-	"check-deps":                  "",
+	// TODO(b/575621006): remove once restat_content is the default
+	// for restat=true remote rules.
+	"auto-restat-content":         "(set restat_content=false on a rule to opt out)",
+	"disable-ensure-output-dirs":  "",
+	"expand-phony-trigger-inputs": "",
 	"fail-on-stdouterr":           "",
-	"fail-on-bad-deps":            "",
 	"fallback-on-exec-error":      "",
 	"fast-deps":                   "",
 	"file-access-trace":           "",
@@ -47,6 +55,8 @@ var knownExperiments = map[string]string{
 	"prepare-header-only":          "",
 	"racing":                       "",
 	"simulate-remote-cache-misses": "",
+
+	"two-phase-caching": "",
 }
 
 type experimentFeature struct {
