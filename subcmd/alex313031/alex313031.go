@@ -1,20 +1,20 @@
 package alex313031
 
-var use_custom_ng bool = true;
+var use_custom_ng bool = true
 
-func IsNG() (bool) {
-  var retval bool = use_custom_ng
-  return retval
+func IsNG() bool {
+	var retval bool = use_custom_ng
+	return retval
 }
 
 func init() {
-  IsNG()
+	IsNG()
 }
 
-func GetExecutableName() (string) {
-  if IsNG() {
-    return "siso-ng"
-  } else {
-    return "siso"
-  }
+func GetExecutableName() string {
+	if IsNG() {
+		return "siso-ng"
+	} else {
+		return "siso"
+	}
 }

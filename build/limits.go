@@ -133,11 +133,11 @@ func DefaultLimits(ctx context.Context) Limits {
 				clog.Warningf(ctx, "unknown limits name %q", k)
 				continue
 			}
-			if (!alex313031.IsNG()) {
+			if !alex313031.IsNG() {
 				ui.Default.Infof("%s", ui.SGR(ui.Yellow, fmt.Sprintf("Env variable SISO_LIMITS = %s=%d\n", k, n)))
 			}
 		}
-		if (alex313031.IsNG()) {
+		if alex313031.IsNG() {
 			ui.Default.Infof("SISO_LIMITS = %s\n", overrides)
 		}
 	})

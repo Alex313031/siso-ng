@@ -175,12 +175,12 @@ func (c *Command) setup(ctx context.Context) (buildPath *build.Path, doneLock fu
 	if c.offline {
 		c.enableOfflineMode(ctx)
 	} else {
-		if (alex313031.IsNG()) {
+		if alex313031.IsNG() {
 			ui.Default.Infof("%s", ui.SGR(ui.Bold, "Online Mode\n"))
 		}
 	}
 
-	if (alex313031.IsNG()) {
+	if alex313031.IsNG() {
 		ui.Default.Infof("%s", ui.SGR(ui.Blue, "\"NG\" build config\n"))
 	}
 
@@ -218,6 +218,7 @@ func (c *Command) setup(ctx context.Context) (buildPath *build.Path, doneLock fu
 }
 
 var is_local_compile bool = false
+
 func (c *Command) computeLimits(ctx context.Context) build.Limits {
 	// compute default limits based on fstype of work dir (e.g. artfs),
 	// not of workspace.

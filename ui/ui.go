@@ -195,7 +195,7 @@ const (
 
 var sgrEscSeq = map[SGRCode]string{
 	Bold:          "\033[1m",
-	Red:           "\033[1,31m",
+	Red:           "\033[1;31m",
 	Green:         "\033[32m",
 	Blue:          "\033[96m",
 	Yellow:        "\033[33m",
