@@ -20,7 +20,7 @@ die()  { yell "${RED}$* ${c0}"; exit 1; }
 try() { "$@" || die "${RED}Failed $*"; }
 
 SCRIPTNAME=$(basename "$0")
-SCRIPTVER="1.1.1"
+SCRIPTVER="1.2.0"
 
 export HERE=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
@@ -82,6 +82,9 @@ BuildSiso() {
     printf "${CYA}Building Siso-ng for Linux x64... ${c0}\n"
     target_arch="amd64"
     GoBuild "${target_arch}" "linux" "${RELDIR}/${bin_base}" "siso-ng_linux"
+    printf "${CYA}Building Siso-ng for Linux arm64... ${c0}\n"
+    target_arch="arm64"
+    GoBuild "${target_arch}" "linux" "${RELDIR}/${bin_base}" "siso-ng_linux"
     printf "${CYA}Linux build completed. ${c0}\n"
   fi
   if [ "$WANT_TARGET" == "win" ] || [ "$WANT_TARGET" == "all" ]; then
@@ -92,6 +95,15 @@ BuildSiso() {
     target_arch="386"
     GoBuild "${target_arch}" "windows" "${RELDIR}/${bin_base}.exe" "siso-ng_win"
     printf "${CYA}Windows build completed. ${c0}\n"
+  fi
+  # Separate from --win because Windows on ARM needs the stock Go toolchain.
+  # go-legacy-win7 only matters for Windows 7/8, which never ran on arm64, so
+  # that fork has nothing to offer here and shouldn't be used for it.
+  if [ "$WANT_TARGET" == "win-arm" ] || [ "$WANT_TARGET" == "all" ]; then
+    printf "${CYA}Building Siso-ng for Windows on ARM... ${c0}\n"
+    target_arch="arm64"
+    GoBuild "${target_arch}" "windows" "${RELDIR}/${bin_base}.exe" "siso-ng_win"
+    printf "${CYA}Windows on ARM build completed. ${c0}\n"
   fi
   if [ "$WANT_TARGET" == "mac" ] || [ "$WANT_TARGET" == "all" ]; then
     printf "${CYA}Building Siso-ng for MacOS arm64... ${c0}\n"
@@ -104,6 +116,9 @@ BuildSiso() {
   fi
 }
 
+# show_help [exit_code]; defaults to 0 so an explicit --help still succeeds.
+# Callers on an error path pass 1, otherwise a bad target would exit 0 and let
+# a typo'd flag pass for a successful build.
 show_help() {
   cat <<EOF
 Usage:
@@ -117,16 +132,18 @@ Options:
   -c, --clean   Remove build artifacts
   -f, --force   Force rebuild
   --deps        Install build dependencies
-  -a, --all     Build Siso-ng for all three platforms
-  -l, --linux   Build Siso-ng for Linux
-  -w, --win     Build Siso-ng for Windows
-  -m, --mac     Build Siso-ng for MacOS
+  -a, --all     Build Siso-ng for all platforms
+  -l, --linux   Build Siso-ng for Linux (x64 and arm64)
+  -w, --win     Build Siso-ng for Windows (x86 and x64)
+      --win-arm Build Siso-ng for Windows on ARM (needs the stock Go
+                toolchain, not go-legacy-win7)
+  -m, --mac     Build Siso-ng for MacOS (x64 and arm64)
   -d, --debug   Make a debug build
   -v, --verbose Verbose build output
 
 EOF
 
-  exit 0
+  exit "${1:-0}"
 }
 
 show_version() {
@@ -187,6 +204,9 @@ while :; do
     -w|--win)
         WANT_TARGET="win"
         ;;
+    --win-arm)
+        WANT_TARGET="win-arm"
+        ;;
     -m|--mac)
         WANT_TARGET="mac"
         ;;
@@ -207,13 +227,13 @@ while :; do
 done
 
 case "$WANT_TARGET" in
-  linux|win|mac|all)
+  linux|win|win-arm|mac|all)
       try BuildSiso "siso-ng"
       printf "${GRE}Build(s) completed. Build artifacts are in ${bold}${RELDIR} ${c0}\n"
       ;;
   *)
       yell "${RED}Unsupported build target. \n${c0}"
-      show_help
+      show_help 1
       ;;
 esac
 

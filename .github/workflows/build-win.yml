@@ -6,34 +6,55 @@ on:
 
 jobs:
   build:
-    name: Build Win32 & Win64
+    name: Build Win32, Win64 & ARM64
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # Never let Go swap in a toolchain we did not install. Without this, a go
+      # directive in go.mod newer than the installed toolchain makes Go silently
+      # download the official one, which for the x86/x64 builds below would
+      # produce a siso-ng.exe with no win7 support.
+      GOTOOLCHAIN: local
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Stock Go builds the arm64 target. Windows on ARM is Windows 10 and
+      # newer only, so the win7 patches buy nothing there and that fork does
+      # not target arm64. This is the default `go` on PATH for the job.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+
+      # Installed but deliberately kept out of PATH/GOROOT for the job, so it
+      # applies only to the x86/x64 step that opts into it below.
       - name: Set up Go (go-legacy-win7)
         env:
           GO_LEGACY_VERSION: '1.27.3-1'
         run: |
           GO_TARBALL="go-legacy-win7-${GO_LEGACY_VERSION}.linux_amd64.tar.gz"
           GO_URL="https://github.com/thongtech/go-legacy-win7/releases/download/v${GO_LEGACY_VERSION}/${GO_TARBALL}"
-          curl -fsSL -o "${GO_TARBALL}" "${GO_URL}"
+          # GitHub release downloads have been returning sporadic 504s, so
+          # retry with backoff instead of failing the whole build on one.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+              -o "${GO_TARBALL}" "${GO_URL}"
           sudo tar -C /usr/local -xzf "${GO_TARBALL}"
           rm -f "${GO_TARBALL}"
-          echo "GOROOT=/usr/local/go-legacy-win7" >> "$GITHUB_ENV"
-          echo "GOPATH=$HOME/go" >> "$GITHUB_ENV"
-          # Pin to the toolchain we just installed. Without this, a go directive
-          # in go.mod newer than GO_LEGACY_VERSION makes Go silently download the
-          # official toolchain, which would build a binary without win7 support.
-          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
-          echo "/usr/local/go-legacy-win7/bin" >> "$GITHUB_PATH"
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
           /usr/local/go-legacy-win7/bin/go version
 
-      - name: Cross-compile siso-ng.exe
-        run: ./build.sh -w
+      - name: Cross-compile siso-ng.exe for x86 & x64 (win7-compatible)
+        env:
+          GOROOT: /usr/local/go-legacy-win7
+        run: |
+          export PATH="/usr/local/go-legacy-win7/bin:$PATH"
+          go version
+          ./build.sh -w
+
+      - name: Cross-compile siso-ng.exe for arm64
+        run: |
+          go version
+          ./build.sh --win-arm
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       linux:
-        description: 'Build Linux (amd64)'
+        description: 'Build Linux (x64/arm64)'
         type: boolean
         default: true
       windows:
-        description: 'Build Windows (32/64-bit)'
+        description: 'Build Windows (32/64-bit/ARM64)'
         type: boolean
         default: true
       macos:
